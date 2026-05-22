@@ -18,15 +18,17 @@ For architecture context, see `docs/architecture.md`.
 
 **Done when:** the scientist takes a Trp-cage convergence task, runs OpenMM, computes block-averaged RMSD with autocorrelation analysis, decides "extend" or "stop", and the decision is correct on a planted under-converged trajectory.
 
-## Milestone 2 — Real diagnostics + memory
+## Milestone 2 — Memory layer + resume from disk
 
-**Goal:** the scientist remembers across rounds.
+**Goal:** the scientist remembers across rounds and survives restarts.
 
-- Full `diagnostics/` module with structured report bundle
-- SQLite memory layer (`memory/`)
-- Round summaries persisted between rounds
+- SQLite memory layer (`memory/store.py`) — per-campaign DB, `campaigns` + `rounds` tables
+- OpenMM checkpoint save/load wired through the adapter
+- `run_campaign` resume-aware: detects existing rounds, validates config, loads the last checkpoint, continues
 
-**Done when:** a multi-round campaign survives an interruption (kill the process, restart it) and resumes with the full prior hypothesis ledger and findings log intact.
+**Done when:** a multi-round campaign survives a between-round kill — restart on the same `work_dir` picks up at round k+1 without redoing rounds 1..k, and the findings log (per-round diagnostic report + decision) is intact.
+
+*Deferred from this milestone:* hypothesis ledger persistence. Pushed to M4 when `reasoning/` lands and there's something to write to it. The `scientist.decide` signature already accepts an inert `hypothesis_ledger` arg.
 
 ## Milestone 3 — Adapter integration
 

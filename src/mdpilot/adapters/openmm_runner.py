@@ -123,3 +123,18 @@ def run_steps(
         if reporter is not None:
             simulation.reporters.remove(reporter)
     return dcd_path
+
+
+def save_checkpoint(simulation: app.Simulation, path: Path) -> Path:
+    """Write an OpenMM binary checkpoint (positions, velocities, RNG state)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(simulation.context.createCheckpoint())
+    return path
+
+
+def load_checkpoint(simulation: app.Simulation, path: Path) -> None:
+    """Restore a checkpoint into an existing Simulation built from the same system."""
+    with open(path, "rb") as f:
+        simulation.context.loadCheckpoint(f.read())
