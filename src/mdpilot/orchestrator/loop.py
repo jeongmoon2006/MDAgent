@@ -116,6 +116,8 @@ def run_campaign(
         start_round = 1
         n_steps = initial_steps
 
+    ledger_notes: list[store.LedgerNote] = list(store.list_ledger_notes(work_dir))
+
     traj_ext = adapter.trajectory_extension
     for round_idx in range(start_round, max_rounds + 1):
         dcd = rounds_dir / f"round_{round_idx:03d}{traj_ext}"
@@ -126,7 +128,11 @@ def run_campaign(
         )
         report = make_report(dcd, top_pdb)
         prior_summaries = [_compact_prior(r) for r in rounds]
-        decision = decide(report, prior_round_summaries=prior_summaries)
+        decision = decide(
+            report,
+            prior_round_summaries=prior_summaries,
+            hypothesis_ledger=[f"R{n.round_index}: {n.text}" for n in ledger_notes],
+        )
 
         ckpt = adapter.save_checkpoint(rounds_dir / f"round_{round_idx:03d}.chk")
         summary_path = rounds_dir / f"round_{round_idx:03d}.json"
@@ -142,6 +148,13 @@ def run_campaign(
             reason=decision.reason,
             extra_ns=decision.extra_ns,
         )
+        if decision.ledger_note:
+            store.append_ledger_note(
+                work_dir, round_index=round_idx, text=decision.ledger_note
+            )
+            ledger_notes.append(
+                store.LedgerNote(round_index=round_idx, text=decision.ledger_note)
+            )
         rounds.append(RoundResult(round_idx, n_steps, dcd, summary_path, report, decision))
 
         if decision.decision == "stop":

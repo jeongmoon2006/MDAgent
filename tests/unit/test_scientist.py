@@ -79,3 +79,55 @@ def test_decide_raises_when_no_tool_use_in_response() -> None:
 
     with pytest.raises(RuntimeError, match="no record_decision tool_use"):
         decide({}, client=_BrokenClient())
+
+
+def test_decide_extracts_ledger_note_when_present() -> None:
+    fake = _FakeClient(
+        tool_input={
+            "decision": "extend",
+            "reason": "ess=3",
+            "extra_ns": 1.0,
+            "ledger_note": "trajectory appears stuck in metastable basin",
+        }
+    )
+    result = decide({"ess": 3}, client=fake)
+    assert result.ledger_note == "trajectory appears stuck in metastable basin"
+
+
+def test_decide_handles_null_ledger_note() -> None:
+    fake = _FakeClient(
+        tool_input={
+            "decision": "extend",
+            "reason": "ess=8",
+            "extra_ns": 0.5,
+            "ledger_note": None,
+        }
+    )
+    result = decide({"ess": 8}, client=fake)
+    assert result.ledger_note is None
+
+
+def test_decision_tool_schema_includes_ledger_note() -> None:
+    from mdpilot.orchestrator.scientist import _DECISION_TOOL
+
+    props = _DECISION_TOOL["input_schema"]["properties"]
+    assert "ledger_note" in props
+    assert props["ledger_note"]["type"] == ["string", "null"]
+    assert "ledger_note" in _DECISION_TOOL["input_schema"]["required"]
+
+
+def test_decide_passes_hypothesis_ledger_in_user_message() -> None:
+    fake = _FakeClient(
+        tool_input={"decision": "extend", "reason": "x", "extra_ns": 0.5, "ledger_note": None}
+    )
+    decide(
+        {"ess": 3},
+        hypothesis_ledger=[
+            "R1: trajectory stuck on initial basin",
+            "R2: low ESS expected if torsion is slow",
+        ],
+        client=fake,
+    )
+    user_text = fake.last_request["messages"][0]["content"]
+    assert "R1: trajectory stuck on initial basin" in user_text
+    assert "R2: low ESS expected if torsion is slow" in user_text

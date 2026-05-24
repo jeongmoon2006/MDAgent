@@ -1,6 +1,6 @@
 """SQLite-backed campaign state for resume-from-disk.
 
-One SQLite file per campaign at ``<work_dir>/state.db``. Two tables:
+One SQLite file per campaign at ``<work_dir>/state.db``. Three tables:
 
 - ``campaign`` — singleton row (id = 1) holding the immutable run config.
   Re-opening with a different config raises so a half-finished campaign
@@ -9,9 +9,14 @@ One SQLite file per campaign at ``<work_dir>/state.db``. Two tables:
   of a row is the source of truth for "this round is done". The matching
   OpenMM checkpoint must be written *before* the row is inserted so we
   never see a row without a usable resume point.
+- ``ledger`` — the hypothesis ledger. Append-only structured notes the
+  scientist writes during decide() to track persistent observations
+  across rounds (e.g. "vanilla MD will not fold chignolin in 100 ns",
+  "phi torsion is the slow coordinate"). Multiple notes per round
+  allowed; the next decide call is shown all prior notes as context.
 
 Trajectories and checkpoints stay on the filesystem; this DB only stores
-their paths plus the compact diagnostic report and decision.
+their paths plus the compact diagnostic report, decision, and ledger.
 """
 
 from __future__ import annotations
@@ -44,6 +49,13 @@ CREATE TABLE IF NOT EXISTS rounds (
     extra_ns REAL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -57,6 +69,12 @@ class RoundRow:
     decision: str
     reason: str
     extra_ns: float | None
+
+
+@dataclass(frozen=True)
+class LedgerNote:
+    round_index: int
+    text: str
 
 
 def db_path(work_dir: Path) -> Path:
@@ -176,6 +194,31 @@ def get_last_round(work_dir: Path) -> RoundRow | None:
     """Return the highest-indexed completed round, or None if none exist."""
     rounds = list_rounds(work_dir)
     return rounds[-1] if rounds else None
+
+
+def append_ledger_note(
+    work_dir: Path,
+    *,
+    round_index: int,
+    text: str,
+) -> None:
+    """Add one hypothesis-ledger note. Multiple notes per round are allowed."""
+    with _connect(work_dir) as conn:
+        conn.execute(
+            "INSERT INTO ledger (round_index, text, created_at) VALUES (?, ?, ?)",
+            (round_index, text, _now_iso()),
+        )
+
+
+def list_ledger_notes(work_dir: Path) -> list[LedgerNote]:
+    """Return all ledger notes ordered by insertion order (id ASC)."""
+    if not db_path(work_dir).exists():
+        return []
+    with _connect(work_dir) as conn:
+        cursor = conn.execute(
+            "SELECT round_index, text FROM ledger ORDER BY id ASC"
+        )
+        return [LedgerNote(round_index=r[0], text=r[1]) for r in cursor.fetchall()]
 
 
 def _now_iso() -> str:

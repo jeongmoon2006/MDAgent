@@ -36,9 +36,13 @@ molecular dynamics simulations.
 
 Your single responsibility per round: decide whether the trajectory observable \
 has converged enough to stop, or whether the simulation should be extended. \
-You receive a structured diagnostic report (block-averaging plus integrated \
-autocorrelation time on RMSD-from-first-frame for protein CA atoms) and a \
-ledger of prior round summaries.
+You receive three structured inputs per round:
+
+1. `diagnostic_report` — this round's numbers (block-averaging + integrated \
+autocorrelation time on the observable).
+2. `prior_round_summaries` — lean view of past rounds (decision + key numbers).
+3. `hypothesis_ledger` — text notes you wrote in previous rounds about \
+persistent observations or open hypotheses. This is your across-round memory.
 
 Decision rule:
 - plateau_reached=true AND well_sampled=true AND ess>=50 → stop
@@ -52,6 +56,14 @@ The two `statistical_inefficiency_*` fields (block-averaging, autocorrelation) \
 should agree if the diagnostic is reliable; flag large disagreement (>2x) in \
 `reason`. Cite the specific numbers that drove your call — one or two \
 sentences, no preamble.
+
+For `ledger_note`: use it to record observations worth carrying across rounds. \
+Examples: a hypothesis about the slow coordinate, a reason for an unusual \
+choice, a sub-state you noticed in the trajectory, a rate-based estimate of \
+remaining timescales. **Skip (pass null)** when nothing new is worth \
+recording — most rounds in a routine extend-extend-stop sequence don't need \
+a note. The ledger is for *insight*, not commentary on the decision (which \
+already lives in `reason`).
 
 You MUST call the `record_decision` tool. Do not respond in plain text.
 """
@@ -83,8 +95,17 @@ _DECISION_TOOL = {
                     "nanoseconds. Null when decision is 'stop'."
                 ),
             },
+            "ledger_note": {
+                "type": ["string", "null"],
+                "description": (
+                    "Optional hypothesis-ledger note — a persistent observation or "
+                    "hypothesis worth carrying across rounds. Null when nothing new "
+                    "is worth recording. See the system prompt for guidance on what "
+                    "belongs here vs in `reason`."
+                ),
+            },
         },
-        "required": ["decision", "reason", "extra_ns"],
+        "required": ["decision", "reason", "extra_ns", "ledger_note"],
         "additionalProperties": False,
     },
 }
@@ -95,6 +116,7 @@ class Decision:
     decision: Literal["extend", "stop"]
     reason: str
     extra_ns: float | None
+    ledger_note: str | None = None
 
 
 def decide(
@@ -139,6 +161,7 @@ def decide(
                 decision=data["decision"],
                 reason=data["reason"],
                 extra_ns=data["extra_ns"],
+                ledger_note=data.get("ledger_note"),
             )
     raise RuntimeError(
         f"scientist: response contained no record_decision tool_use "

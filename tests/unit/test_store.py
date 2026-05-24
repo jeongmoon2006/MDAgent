@@ -127,3 +127,31 @@ def test_invalid_decision_rejected_by_check_constraint(tmp_path: Path) -> None:
 
 def test_list_rounds_empty_when_no_db(tmp_path: Path) -> None:
     assert store.list_rounds(tmp_path) == []
+
+
+def test_ledger_empty_when_no_db(tmp_path: Path) -> None:
+    assert store.list_ledger_notes(tmp_path) == []
+
+
+def test_append_and_list_ledger_notes_in_order(tmp_path: Path) -> None:
+    store.init_campaign(tmp_path, _config())
+    store.append_ledger_note(tmp_path, round_index=1, text="trajectory still relaxing")
+    store.append_ledger_note(tmp_path, round_index=2, text="ess plateauing low")
+    store.append_ledger_note(tmp_path, round_index=2, text="possible slow torsion")
+
+    notes = store.list_ledger_notes(tmp_path)
+    assert [(n.round_index, n.text) for n in notes] == [
+        (1, "trajectory still relaxing"),
+        (2, "ess plateauing low"),
+        (2, "possible slow torsion"),
+    ]
+
+
+def test_ledger_independent_of_rounds_table(tmp_path: Path) -> None:
+    """Ledger notes can reference round indices that don't yet exist in the
+    rounds table (e.g. a note recorded before the round row is inserted, or
+    a hypothetical-future note). No FK constraint is enforced."""
+    store.init_campaign(tmp_path, _config())
+    store.append_ledger_note(tmp_path, round_index=99, text="future-hypothesis stub")
+    notes = store.list_ledger_notes(tmp_path)
+    assert len(notes) == 1 and notes[0].round_index == 99
