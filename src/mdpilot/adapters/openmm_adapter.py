@@ -49,6 +49,10 @@ class OpenMMAdapter:
         self._topology_path = self._work_dir / "topology.pdb"
 
     @property
+    def trajectory_extension(self) -> str:
+        return ".dcd"
+
+    @property
     def topology_path(self) -> Path:
         return self._topology_path
 

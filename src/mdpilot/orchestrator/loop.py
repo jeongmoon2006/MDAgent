@@ -114,8 +114,9 @@ def run_campaign(
         start_round = 1
         n_steps = initial_steps
 
+    traj_ext = adapter.trajectory_extension
     for round_idx in range(start_round, max_rounds + 1):
-        dcd = rounds_dir / f"round_{round_idx:03d}.dcd"
+        dcd = rounds_dir / f"round_{round_idx:03d}{traj_ext}"
         adapter.run_steps(
             n_steps,
             trajectory_path=dcd,

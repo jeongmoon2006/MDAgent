@@ -81,7 +81,7 @@ Never use natural language as an API between components. Subagents return struct
 
 These encode design decisions, not aesthetic preferences. Override only with written justification in the commit message.
 
-- **Do not rebuild MDCrow's setup tooling.** Setup, parameterization, and initial execution are delegated via `adapters/`. MDPilot's contribution is the outer loop.
+- **Do not rebuild MDCrow's *agent layer*.** What MDCrow contributes is an LLM that orchestrates setup tools (PDBFixer, OpenMM Modeller, `gmx` commands, etc.) from natural-language prompts. *That* is the thing not to rebuild. Calling those underlying libraries deterministically from an adapter — given a structured system spec, not a prompt — is fine and is how `adapters/` works today (see `openmm_adapter.py`, `gromacs_adapter.py`). If a future use case needs natural-language setup, integrating MDCrow then is a deliberate decision, not a default. Recorded as D5 in `docs/activity-log.md` (2026-05-23).
 - **Do not build a multi-agent system** with persistent agents communicating in natural language. The scientist is one agent; subagents are ephemeral function calls.
 - **Do not put raw simulation logs, trajectories, or large files into the agent's context.** Tools return compact structured summaries plus filesystem paths.
 - **Do not lock to one MD engine.** Adapters exist so the scientist doesn't care whether OpenMM or GROMACS ran the simulation.

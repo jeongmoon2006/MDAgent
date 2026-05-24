@@ -30,14 +30,18 @@ For architecture context, see `docs/architecture.md`.
 
 *Deferred from this milestone:* hypothesis ledger persistence. Pushed to M4 when `reasoning/` lands and there's something to write to it. The `scientist.decide` signature already accepts an inert `hypothesis_ledger` arg.
 
-## Milestone 3 — Adapter integration
+## Milestone 3 — Adapter independence (engine swap without scientist changes)
 
-**Goal:** stop hardcoding setup; delegate to existing tooling.
+**Goal:** the scientist and loop work with any MD engine that implements the `MDAdapter` Protocol.
 
-- `adapters/mdcrow_adapter.py` — delegate protein setup
-- `adapters/gromacs_runner.py` — cross-engine execution
+- `adapters/base.py` — `MDAdapter` Protocol (engine contract)
+- `adapters/openmm_adapter.py` — OpenMM implementation
+- `adapters/gromacs_adapter.py` — GROMACS implementation (subprocess to `gmx`)
+- Cross-engine integration test exercising the loop through both adapters
 
-**Done when:** the same Trp-cage benchmark task runs through either MDCrow→OpenMM or direct→GROMACS without touching the scientist code.
+**Done when:** the same Trp-cage benchmark task runs through either OpenMM or GROMACS without changes to `scientist.py` or `loop.py`.
+
+*Scope amended from the original roadmap:* MDCrow integration deferred indefinitely. Integrating an LLM-orchestrated setup agent would conflict with the "no multi-agent natural-language dialogue" anti-goal; calling the underlying setup libraries deterministically from adapters honors the spirit of "don't rebuild MDCrow." Revisit only when a campaign needs natural-language setup the scientist itself can't generate structured. Recorded as D5 in `docs/activity-log.md`.
 
 ## Milestone 4 — Sampling strategy decisions
 

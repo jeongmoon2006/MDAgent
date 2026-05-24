@@ -30,6 +30,16 @@ class MDAdapter(Protocol):
     """Stateful per-campaign handle to an MD engine."""
 
     @property
+    def trajectory_extension(self) -> str:
+        """File extension (including leading dot) for trajectories this
+        adapter writes, e.g. ".dcd" for OpenMM, ".xtc" for GROMACS.
+
+        The loop uses this to build trajectory paths; mdtraj infers the
+        reader from the extension.
+        """
+        ...
+
+    @property
     def topology_path(self) -> Path:
         """PDB topology consistent with trajectories produced by run_steps.
 
