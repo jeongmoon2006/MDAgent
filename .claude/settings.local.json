@@ -34,7 +34,12 @@
       "Bash(gh auth *)",
       "Bash(git commit *)",
       "Bash(git rm *)",
-      "Bash(gmx mdrun *)"
+      "Bash(gmx mdrun *)",
+      "Bash(python -c \"import openmmplumed; print\\(openmmplumed.__file__\\)\")",
+      "Bash(python3 -c \"import openmmplumed; print\\(openmmplumed.__file__\\)\")",
+      "Bash(python3 -m pytest tests/unit -x -q)",
+      "Bash(.venv/bin/pytest tests/unit -x -q)",
+      "Bash(.venv/bin/pip show *)"
     ]
   }
 }
