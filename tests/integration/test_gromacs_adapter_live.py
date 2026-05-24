@@ -36,6 +36,20 @@ def test_setup_run_checkpoint_resume(tmp_path: Path) -> None:
     assert n_protein > 100  # Trp-cage has ~300 atoms heavy + hydrogens
     assert top.n_atoms > n_protein  # solvent present
 
+    # F2 idempotency: a second start() on the same work_dir must short-circuit
+    # to the cached setup files (em.gro mtime unchanged) — proves we are not
+    # paying pdb2gmx → solvate → genion → minimize on every restart.
+    em_gro = tmp_path / "setup" / "em.gro"
+    assert em_gro.exists()
+    mtime_before = em_gro.stat().st_mtime_ns
+    adapter2 = GROMACSAdapter(work_dir=tmp_path, seed=42)
+    adapter2.prepare()
+    adapter2.start()
+    assert em_gro.stat().st_mtime_ns == mtime_before, (
+        "second start() rebuilt em.gro — F2 cache short-circuit not hit"
+    )
+    assert adapter2.topology_path.exists()
+
     rounds_dir = tmp_path / "rounds"
     rounds_dir.mkdir()
 

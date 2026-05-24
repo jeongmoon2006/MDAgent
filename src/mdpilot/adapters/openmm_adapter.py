@@ -2,15 +2,23 @@
 
 Trp-cage in TIP3P + 0.15 M NaCl, AMBER14, LangevinMiddle integrator. The
 system parameters are hardcoded here for now; engine-agnostic SystemSpec
-arrives in a follow-up step of M3 (when GROMACS lands and we need
-parameters to flow into both adapters from one place).
+arrives later when arbitrary-system support lands.
+
+F2 fix: `start()` is idempotent. On the first call we run the full
+Modeller / solvate / createSystem / minimize pipeline, then serialize
+the resulting `System` and post-minimization `State` to `<work_dir>/cache/`.
+On subsequent calls (e.g. process restart for resume) we detect the
+cache and skip straight to constructing a `Simulation` from it. The
+expensive part (minimization on a few-thousand-atom solvated system) no
+longer runs every time `run_campaign` is invoked.
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
-from openmm import LangevinMiddleIntegrator, Platform, app, unit
+from openmm import LangevinMiddleIntegrator, Platform, XmlSerializer, app, unit
 from pdbfixer import PDBFixer
 
 _PDB_ID = "1L2Y"
@@ -75,6 +83,36 @@ class OpenMMAdapter:
     def start(self) -> None:
         if self._pdb_path is None:
             raise RuntimeError("OpenMMAdapter.start() called before prepare()")
+        cache_dir = self._work_dir / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        system_xml = cache_dir / "system.xml"
+        state_xml = cache_dir / "initial_state.xml"
+        cached_topology = cache_dir / "topology.pdb"
+
+        if system_xml.exists() and state_xml.exists() and cached_topology.exists():
+            self._start_from_cache(system_xml, state_xml, cached_topology)
+            return
+
+        self._start_fresh_and_cache(system_xml, state_xml, cached_topology)
+
+    def _start_from_cache(
+        self, system_xml: Path, state_xml: Path, cached_topology: Path
+    ) -> None:
+        pdb = app.PDBFile(str(cached_topology))
+        system = XmlSerializer.deserialize(system_xml.read_text())
+        integrator = self._make_integrator()
+        platform = Platform.getPlatformByName("CPU")
+        sim = app.Simulation(pdb.topology, system, integrator, platform)
+        state = XmlSerializer.deserialize(state_xml.read_text())
+        sim.context.setState(state)
+        self._sim = sim
+        self._topology_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(cached_topology, self._topology_path)
+
+    def _start_fresh_and_cache(
+        self, system_xml: Path, state_xml: Path, cached_topology: Path
+    ) -> None:
+        assert self._pdb_path is not None
         pdb = app.PDBFile(str(self._pdb_path))
         forcefield = app.ForceField(*_FORCEFIELD_FILES)
         modeller = app.Modeller(pdb.topology, pdb.positions)
@@ -90,21 +128,37 @@ class OpenMMAdapter:
             nonbondedCutoff=_NONBONDED_CUTOFF_NM * unit.nanometer,
             constraints=app.HBonds,
         )
-        integrator = LangevinMiddleIntegrator(
-            _TEMPERATURE_K * unit.kelvin,
-            _FRICTION_PER_PS / unit.picosecond,
-            _TIMESTEP_FS * unit.femtosecond,
-        )
-        integrator.setRandomNumberSeed(self._seed)
+        integrator = self._make_integrator()
         platform = Platform.getPlatformByName("CPU")
         sim = app.Simulation(modeller.topology, system, integrator, platform)
         sim.context.setPositions(modeller.positions)
         sim.minimizeEnergy()
         self._sim = sim
 
+        # Cache for next time
+        system_xml.write_text(XmlSerializer.serialize(system))
+        state = sim.context.getState(
+            getPositions=True, getVelocities=True, enforcePeriodicBox=True
+        )
+        state_xml.write_text(XmlSerializer.serialize(state))
+        self._write_topology(sim, cached_topology)
         self._topology_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(cached_topology, self._topology_path)
+
+    def _make_integrator(self) -> LangevinMiddleIntegrator:
+        integrator = LangevinMiddleIntegrator(
+            _TEMPERATURE_K * unit.kelvin,
+            _FRICTION_PER_PS / unit.picosecond,
+            _TIMESTEP_FS * unit.femtosecond,
+        )
+        integrator.setRandomNumberSeed(self._seed)
+        return integrator
+
+    @staticmethod
+    def _write_topology(sim: app.Simulation, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
-        with open(self._topology_path, "w") as f:
+        with open(path, "w") as f:
             app.PDBFile.writeFile(sim.topology, state.getPositions(), f, keepIds=True)
 
     def run_steps(

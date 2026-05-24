@@ -172,10 +172,23 @@ class GROMACSAdapter:
         self._pdb_path = out
 
     def start(self) -> None:
-        """Run pdb2gmx → editconf → solvate → genion → minimize. Write topology.pdb."""
+        """Run pdb2gmx → editconf → solvate → genion → minimize. Write topology.pdb.
+
+        Idempotent (F2): if the post-minimization outputs already exist in
+        `setup/`, skip the whole pipeline and just rebind to them. This is
+        what makes resume cheap — the per-restart cost drops from
+        "rerun minimization" to "stat a few files."
+        """
         if self._pdb_path is None:
             raise RuntimeError("GROMACSAdapter.start() called before prepare()")
         self._setup_dir.mkdir(parents=True, exist_ok=True)
+
+        if self._is_setup_cached():
+            self._top_path = self._setup_dir / "topol.top"
+            self._last_gro = self._setup_dir / "em.gro"
+            self._last_cpt = None
+            self._started = True
+            return
 
         # pdb2gmx: parameterize + add hydrogens consistent with chosen FF
         _run_gmx(
@@ -356,3 +369,13 @@ class GROMACSAdapter:
     def _next_tag(self) -> str:
         existing = sorted(self._setup_dir.glob("round_*.tpr"))
         return f"{len(existing) + 1:03d}"
+
+    def _is_setup_cached(self) -> bool:
+        return all(
+            p.exists()
+            for p in (
+                self._setup_dir / "topol.top",
+                self._setup_dir / "em.gro",
+                self._topology_path,
+            )
+        )
