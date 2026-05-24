@@ -4,12 +4,16 @@ This is the state machine described in `docs/architecture.md`. The LLM is
 called exactly once per round (in `scientist.decide`); everything else is
 deterministic Python.
 
-Persistence (Milestone 2): per-campaign SQLite at `<work_dir>/state.db` is
-the source of truth for completed rounds; an OpenMM checkpoint per round
-captures the state needed to continue. Commit order is `save_checkpoint`
-THEN `store.append_round` — a crash between leaves the checkpoint
-dangling (harmless) and the round absent, so restart re-runs it. The
-per-round JSON file is kept alongside SQLite for human inspection.
+Engine independence (M3): the loop talks to MD engines exclusively through
+the `MDAdapter` Protocol. Swap the adapter to change engines; nothing in
+this file or in `scientist.py` needs to know.
+
+Persistence (M2): per-campaign SQLite at `<work_dir>/state.db` is the
+source of truth for completed rounds; the adapter's checkpoint captures
+the state needed to continue. Commit order is `save_checkpoint` THEN
+`store.append_round` — a crash between leaves the checkpoint dangling
+(harmless) and the round absent, so restart re-runs it. The per-round
+JSON file is kept alongside SQLite for human inspection.
 """
 
 from __future__ import annotations
@@ -21,19 +25,13 @@ from typing import Any, Literal, cast
 
 import numpy as np
 
-from mdpilot.adapters.openmm_runner import (
-    build_simulation,
-    load_checkpoint,
-    prepare_trpcage_pdb,
-    run_steps,
-    save_checkpoint,
-    write_topology_pdb,
-)
+from mdpilot.adapters.base import MDAdapter
+from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.diagnostics.report import make_report
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import Decision, decide
 
-_TIMESTEP_FS = 2.0  # matches openmm_runner._TIMESTEP_FS
+_TIMESTEP_FS = 2.0  # matches the OpenMM adapter's integrator timestep
 _STEPS_PER_NS = int(1_000_000.0 / _TIMESTEP_FS)  # 500_000 steps/ns at 2 fs
 
 StopReason = Literal["scientist_said_stop", "max_rounds_reached"]
@@ -59,6 +57,7 @@ class CampaignResult:
 def run_campaign(
     work_dir: Path,
     *,
+    adapter: MDAdapter | None = None,
     initial_steps: int = 25_000,         # 50 ps default at 2 fs
     max_rounds: int = 10,
     max_extra_ns: float = 2.0,
@@ -67,6 +66,9 @@ def run_campaign(
     equilibration_steps: int = 0,
 ) -> CampaignResult:
     """Run the closed loop, resuming from `work_dir/state.db` if it exists.
+
+    `adapter` defaults to `OpenMMAdapter(work_dir=work_dir, seed=seed)`.
+    Pass a different `MDAdapter` to run through another engine.
 
     `max_rounds` and `max_extra_ns` are loop-control bounds and may differ
     between invocations; the physics-bound params (seed, initial_steps,
@@ -90,9 +92,11 @@ def run_campaign(
     if rounds and rounds[-1].decision.decision == "stop":
         return CampaignResult(work_dir, tuple(rounds), "scientist_said_stop")
 
-    pdb = prepare_trpcage_pdb(work_dir / "inputs")
-    sim = build_simulation(pdb, seed=seed)
-    top_pdb = write_topology_pdb(sim, work_dir / "topology.pdb")
+    if adapter is None:
+        adapter = OpenMMAdapter(work_dir=work_dir, seed=seed)
+    adapter.prepare()
+    adapter.start()
+    top_pdb = adapter.topology_path
 
     if prior_rows:
         last = prior_rows[-1]
@@ -101,23 +105,27 @@ def run_campaign(
                 f"round {last.round_index} in {work_dir} has no readable "
                 f"checkpoint; cannot resume"
             )
-        load_checkpoint(sim, last.checkpoint_path)
+        adapter.load_checkpoint(last.checkpoint_path)
         start_round = last.round_index + 1
         n_steps = max(int((last.extra_ns or 0.5) * _STEPS_PER_NS), 1)
     else:
         if equilibration_steps > 0:
-            run_steps(sim, equilibration_steps, dcd_path=None)
+            adapter.run_steps(equilibration_steps)
         start_round = 1
         n_steps = initial_steps
 
     for round_idx in range(start_round, max_rounds + 1):
         dcd = rounds_dir / f"round_{round_idx:03d}.dcd"
-        run_steps(sim, n_steps, dcd_path=dcd, report_interval_steps=report_interval_steps)
+        adapter.run_steps(
+            n_steps,
+            trajectory_path=dcd,
+            report_interval_steps=report_interval_steps,
+        )
         report = make_report(dcd, top_pdb)
         prior_summaries = [_compact_prior(r) for r in rounds]
         decision = decide(report, prior_round_summaries=prior_summaries)
 
-        ckpt = save_checkpoint(sim, rounds_dir / f"round_{round_idx:03d}.chk")
+        ckpt = adapter.save_checkpoint(rounds_dir / f"round_{round_idx:03d}.chk")
         summary_path = rounds_dir / f"round_{round_idx:03d}.json"
         _persist_round_json(summary_path, round_idx, n_steps, dcd, report, decision)
         store.append_round(

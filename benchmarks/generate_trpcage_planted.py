@@ -18,15 +18,9 @@ import argparse
 import time
 from pathlib import Path
 
-from mdpilot.adapters.openmm_runner import (
-    build_simulation,
-    prepare_trpcage_pdb,
-    run_steps,
-    write_topology_pdb,
-)
+from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 
 _DATA_DIR = Path("benchmarks/data/trpcage")
-_TOPOLOGY = _DATA_DIR / "topology.pdb"
 
 # 2 fs timestep ⇒ 500 steps/ps, 500_000 steps/ns
 _UNDER_STEPS = 25_000          # 50 ps
@@ -34,11 +28,11 @@ _CONVERGED_EQ_STEPS = 50_000   # 100 ps NVT discard
 _CONVERGED_PROD_STEPS = 2_500_000  # 5 ns
 
 
-def _build(seed: int):
-    pdb = prepare_trpcage_pdb(_DATA_DIR)
-    sim = build_simulation(pdb, seed=seed)
-    write_topology_pdb(sim, _TOPOLOGY)
-    return sim
+def _build(seed: int) -> OpenMMAdapter:
+    adapter = OpenMMAdapter(work_dir=_DATA_DIR, seed=seed)
+    adapter.prepare()
+    adapter.start()
+    return adapter
 
 
 def gen_under(seed: int = 100) -> Path:
@@ -47,10 +41,10 @@ def gen_under(seed: int = 100) -> Path:
         print(f"[under] {out} already exists, skipping")
         return out
     t0 = time.time()
-    sim = _build(seed)
+    adapter = _build(seed)
     print(f"[under] built in {time.time()-t0:.1f}s; running {_UNDER_STEPS} steps (50 ps)...")
     t0 = time.time()
-    run_steps(sim, _UNDER_STEPS, dcd_path=out, report_interval_steps=500)
+    adapter.run_steps(_UNDER_STEPS, trajectory_path=out, report_interval_steps=500)
     print(f"[under] done in {time.time()-t0:.1f}s -> {out}")
     return out
 
@@ -61,14 +55,14 @@ def gen_converged(seed: int = 200) -> Path:
         print(f"[converged] {out} already exists, skipping")
         return out
     t0 = time.time()
-    sim = _build(seed)
+    adapter = _build(seed)
     print(f"[converged] built in {time.time()-t0:.1f}s; equilibrating {_CONVERGED_EQ_STEPS} steps (100 ps)...")
     t0 = time.time()
-    run_steps(sim, _CONVERGED_EQ_STEPS, dcd_path=None)
+    adapter.run_steps(_CONVERGED_EQ_STEPS)
     print(f"[converged] equilibration done in {time.time()-t0:.1f}s")
     print(f"[converged] running production {_CONVERGED_PROD_STEPS} steps (5 ns) -- expect ~9 hours on CPU...")
     t0 = time.time()
-    run_steps(sim, _CONVERGED_PROD_STEPS, dcd_path=out, report_interval_steps=500)
+    adapter.run_steps(_CONVERGED_PROD_STEPS, trajectory_path=out, report_interval_steps=500)
     print(f"[converged] done in {time.time()-t0:.1f}s -> {out}")
     return out
 

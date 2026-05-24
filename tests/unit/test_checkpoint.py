@@ -15,7 +15,7 @@ from openmm import Platform, System, VerletIntegrator, Vec3
 from openmm.app import Element, Simulation, Topology
 from openmm.unit import amu, nanometer, picosecond
 
-from mdpilot.adapters.openmm_runner import load_checkpoint, save_checkpoint
+from mdpilot.adapters.openmm_adapter import load_checkpoint, save_checkpoint
 
 
 def _toy_simulation() -> Simulation:

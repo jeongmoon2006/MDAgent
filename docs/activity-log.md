@@ -36,6 +36,11 @@ Hypothesis ledger was **deferred** from M2 to M4. The `scientist.decide` signatu
 
 Lives in `src/mdpilot/memory/store.py`; resume wiring in `orchestrator/loop.py`; checkpoint helpers in `adapters/openmm_runner.py`.
 
+### F2 — Resume currently pays the full setup tax (2026-05-23)
+The M2 live resume test passed but took **3h 26m** wall time for 2 rounds × 5000 steps on this machine. Bottleneck: `build_simulation` (solvate + energy-minimize the ~few-thousand-atom system) runs on every `run_campaign` invocation, including resume — even though `load_checkpoint` immediately overwrites the resulting positions/velocities/RNG state. Minimization on resume is therefore wasted work.
+
+Not a correctness issue; M2's between-round-kill guarantee holds. Becomes painful when resume frequency rises — most likely M5 (Slurm walltime overruns, autonomous extension). Fix at that point: cache the solvated System + serialized starting state on first init; on resume, rebuild only the `Simulation` shell and `load_checkpoint`, skip solvate+minimize.
+
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
 - Do not build a persistent multi-agent system; subagents are ephemeral function calls returning structured artifacts, not prose.
@@ -46,6 +51,12 @@ Lives in `src/mdpilot/memory/store.py`; resume wiring in `orchestrator/loop.py`;
 ---
 
 ## 2. Session journal
+
+### 2026-05-23 — M2 live test green, perf observation captured
+- `tests/integration/test_resume_live.py` passed: round-1 DCD byte-hash unchanged across the two invocations, round 2 ran, both rounds in SQLite. M2 is verified end-to-end.
+- Wall time was 3h 26m — far above the "few minutes" expectation. Root cause + deferred fix captured as F2 above (skip redundant solvate+minimize on resume, address in M5).
+- M2 work still sits as one local commit `c30c5db`; push remains the user's manual step.
+- **Open / next:** push c30c5db; then scope M3 (MDCrow adapter for protein setup + GROMACS runner).
 
 ### 2026-05-22 — Milestone 2 landed (SQLite memory + checkpoint resume)
 - Scoped M2 with the user: SQLite + filesystem (not pure-JSON), hypothesis ledger deferred to M4 (decisions captured as D4 above).

@@ -107,12 +107,12 @@ mdpilot/
 │   │   ├── markov_state.py            # MSM construction from ensemble
 │   │   └── pose_clustering.py
 │   │
-│   ├── adapters/                      # talk to existing setup agents/engines
-│   │   ├── mdcrow_adapter.py          # delegate protein setup
-│   │   ├── dynamate_adapter.py        # delegate protein-ligand prep
-│   │   ├── openmm_runner.py           # direct execution path
-│   │   ├── gromacs_runner.py
-│   │   └── plumed_writer.py           # generate PLUMED input files
+│   ├── adapters/                      # MD engines behind the MDAdapter Protocol
+│   │   ├── base.py                    # MDAdapter Protocol (engine contract)
+│   │   ├── openmm_adapter.py          # OpenMM implementation
+│   │   ├── gromacs_adapter.py         # GROMACS implementation (M3)
+│   │   ├── mdcrow_adapter.py          # optional natural-language setup (deferred)
+│   │   └── plumed_writer.py           # generate PLUMED input files (M4)
 │   │
 │   ├── execution/                     # HPC-aware run management
 │   │   ├── slurm.py
