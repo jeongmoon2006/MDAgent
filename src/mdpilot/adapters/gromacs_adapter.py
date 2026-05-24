@@ -26,7 +26,8 @@ from pathlib import Path
 from openmm import app
 from pdbfixer import PDBFixer
 
-_PDB_ID = "1L2Y"
+from mdpilot.adapters.system_spec import SystemSpec
+
 _FORCEFIELD = "amber99sb-ildn"
 _WATER_MODEL = "tip3p"
 _BOX_TYPE = "cubic"
@@ -133,11 +134,16 @@ def _run_gmx(
 
 
 class GROMACSAdapter:
-    """MDAdapter: subprocess-driven GROMACS execution of solvated Trp-cage."""
+    """MDAdapter: subprocess-driven GROMACS execution. System chosen by
+    SystemSpec; the forcefield/water/integrator choices stay hardcoded
+    (amber99sb-ildn, TIP3P, sd at 300 K, 2 fs)."""
 
-    def __init__(self, *, work_dir: Path, seed: int = 42):
+    def __init__(
+        self, *, work_dir: Path, seed: int = 42, spec: SystemSpec | None = None
+    ):
         self._work_dir = Path(work_dir)
         self._seed = seed
+        self._spec = spec if spec is not None else SystemSpec.trpcage()
         self._setup_dir = self._work_dir / "setup"
         self._inputs_dir = self._work_dir / "inputs"
         self._topology_path = self._work_dir / "topology.pdb"
@@ -148,6 +154,10 @@ class GROMACSAdapter:
         self._started = False
 
     @property
+    def spec(self) -> SystemSpec:
+        return self._spec
+
+    @property
     def trajectory_extension(self) -> str:
         return ".xtc"
 
@@ -156,13 +166,17 @@ class GROMACSAdapter:
         return self._topology_path
 
     def prepare(self) -> None:
-        """Download 1L2Y via PDBFixer, fix it, cache to inputs/. Idempotent."""
+        """Fetch/fix structure via PDBFixer, cache to inputs/. Idempotent."""
         self._inputs_dir.mkdir(parents=True, exist_ok=True)
-        out = self._inputs_dir / f"{_PDB_ID}_fixed.pdb"
+        out = self._inputs_dir / f"{self._spec_tag()}_fixed.pdb"
         if out.exists():
             self._pdb_path = out
             return
-        fixer = PDBFixer(pdbid=_PDB_ID)
+        if self._spec.pdb_id is not None:
+            fixer = PDBFixer(pdbid=self._spec.pdb_id)
+        else:
+            assert self._spec.structure_path is not None
+            fixer = PDBFixer(filename=str(self._spec.structure_path))
         fixer.findMissingResidues()
         fixer.findMissingAtoms()
         fixer.addMissingAtoms()
@@ -170,6 +184,13 @@ class GROMACSAdapter:
         with open(out, "w") as f:
             app.PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
         self._pdb_path = out
+
+    def _spec_tag(self) -> str:
+        """Filename-safe identifier for the spec, used to namespace cached files."""
+        if self._spec.pdb_id is not None:
+            return self._spec.pdb_id
+        assert self._spec.structure_path is not None
+        return self._spec.structure_path.stem
 
     def start(self) -> None:
         """Run pdb2gmx → editconf → solvate → genion → minimize. Write topology.pdb.

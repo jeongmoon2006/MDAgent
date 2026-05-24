@@ -21,7 +21,8 @@ from pathlib import Path
 from openmm import LangevinMiddleIntegrator, Platform, XmlSerializer, app, unit
 from pdbfixer import PDBFixer
 
-_PDB_ID = "1L2Y"
+from mdpilot.adapters.system_spec import SystemSpec
+
 _FORCEFIELD_FILES = ("amber14-all.xml", "amber14/tip3p.xml")
 _PADDING_NM = 1.0
 _SALT_M = 0.15
@@ -47,14 +48,23 @@ def load_checkpoint(simulation: app.Simulation, path: Path) -> None:
 
 
 class OpenMMAdapter:
-    """MDAdapter: direct OpenMM execution of Trp-cage in solvent."""
+    """MDAdapter: direct OpenMM execution. System chosen by SystemSpec; the
+    integrator/forcefield/box/ions choices are still hardcoded (AMBER14,
+    TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs)."""
 
-    def __init__(self, *, work_dir: Path, seed: int = 42):
+    def __init__(
+        self, *, work_dir: Path, seed: int = 42, spec: SystemSpec | None = None
+    ):
         self._work_dir = Path(work_dir)
         self._seed = seed
+        self._spec = spec if spec is not None else SystemSpec.trpcage()
         self._pdb_path: Path | None = None
         self._sim: app.Simulation | None = None
         self._topology_path = self._work_dir / "topology.pdb"
+
+    @property
+    def spec(self) -> SystemSpec:
+        return self._spec
 
     @property
     def trajectory_extension(self) -> str:
@@ -67,11 +77,15 @@ class OpenMMAdapter:
     def prepare(self) -> None:
         inputs = self._work_dir / "inputs"
         inputs.mkdir(parents=True, exist_ok=True)
-        out = inputs / f"{_PDB_ID}_fixed.pdb"
+        out = inputs / f"{self._spec_tag()}_fixed.pdb"
         if out.exists():
             self._pdb_path = out
             return
-        fixer = PDBFixer(pdbid=_PDB_ID)
+        if self._spec.pdb_id is not None:
+            fixer = PDBFixer(pdbid=self._spec.pdb_id)
+        else:
+            assert self._spec.structure_path is not None
+            fixer = PDBFixer(filename=str(self._spec.structure_path))
         fixer.findMissingResidues()
         fixer.findMissingAtoms()
         fixer.addMissingAtoms()
@@ -79,6 +93,13 @@ class OpenMMAdapter:
         with open(out, "w") as f:
             app.PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
         self._pdb_path = out
+
+    def _spec_tag(self) -> str:
+        """Filename-safe identifier for the spec, used to namespace cached files."""
+        if self._spec.pdb_id is not None:
+            return self._spec.pdb_id
+        assert self._spec.structure_path is not None
+        return self._spec.structure_path.stem
 
     def start(self) -> None:
         if self._pdb_path is None:

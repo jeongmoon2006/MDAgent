@@ -24,10 +24,22 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from mdpilot.adapters.system_spec import SystemSpec
+
 
 @runtime_checkable
 class MDAdapter(Protocol):
     """Stateful per-campaign handle to an MD engine."""
+
+    @property
+    def spec(self) -> SystemSpec:
+        """The physical system this adapter was constructed for.
+
+        The loop includes this in the SQLite campaign config so a resume
+        attempt with a different system gets rejected by the
+        config-mismatch guard.
+        """
+        ...
 
     @property
     def trajectory_extension(self) -> str:

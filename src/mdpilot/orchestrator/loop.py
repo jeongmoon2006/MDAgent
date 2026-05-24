@@ -79,11 +79,15 @@ def run_campaign(
     rounds_dir = work_dir / "rounds"
     rounds_dir.mkdir(parents=True, exist_ok=True)
 
+    if adapter is None:
+        adapter = OpenMMAdapter(work_dir=work_dir, seed=seed)
+
     config = {
         "seed": seed,
         "initial_steps": initial_steps,
         "report_interval_steps": report_interval_steps,
         "equilibration_steps": equilibration_steps,
+        "system_spec": adapter.spec.to_dict(),
     }
     store.init_campaign(work_dir, config)
     prior_rows = store.list_rounds(work_dir)
@@ -92,8 +96,6 @@ def run_campaign(
     if rounds and rounds[-1].decision.decision == "stop":
         return CampaignResult(work_dir, tuple(rounds), "scientist_said_stop")
 
-    if adapter is None:
-        adapter = OpenMMAdapter(work_dir=work_dir, seed=seed)
     adapter.prepare()
     adapter.start()
     top_pdb = adapter.topology_path
