@@ -11,6 +11,13 @@ On subsequent calls (e.g. process restart for resume) we detect the
 cache and skip straight to constructing a `Simulation` from it. The
 expensive part (minimization on a few-thousand-atom solvated system) no
 longer runs every time `run_campaign` is invoked.
+
+PLUMED hook: `plumed_input` (str) is intentionally *not* part of the
+cache. The cache stays bias-agnostic; the runtime Simulation is built
+from the cached vanilla System plus a freshly-attached PlumedForce
+each `start()`. Re-supplying or changing `plumed_input` on resume
+therefore just works — no cache invalidation. `openmmplumed` is a
+guarded import: required only when `plumed_input` is set.
 """
 
 from __future__ import annotations
@@ -47,17 +54,49 @@ def load_checkpoint(simulation: app.Simulation, path: Path) -> None:
         simulation.context.loadCheckpoint(f.read())
 
 
+def _prepare_plumed_force(plumed_input: str, work_dir: Path):
+    """Write `plumed.dat` to ``work_dir`` and return an ``openmmplumed.PlumedForce``.
+
+    The disk write happens *before* the import attempt so the audit
+    artifact survives on disk even when ``openmmplumed`` is missing —
+    useful for inspecting what we were about to run.
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "plumed.dat").write_text(plumed_input)
+    try:
+        from openmmplumed import PlumedForce
+    except ImportError as e:
+        raise RuntimeError(
+            "OpenMMAdapter was constructed with plumed_input, but "
+            "`openmmplumed` is not importable. Install it (pip install "
+            "openmmplumed) and ensure a PLUMED runtime is on PATH."
+        ) from e
+    return PlumedForce(plumed_input)
+
+
 class OpenMMAdapter:
     """MDAdapter: direct OpenMM execution. System chosen by SystemSpec; the
     integrator/forcefield/box/ions choices are still hardcoded (AMBER14,
-    TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs)."""
+    TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs).
+
+    ``plumed_input`` (optional): a plumed.dat-format string. When set, a
+    `PlumedForce` is attached to the runtime System on every ``start()``;
+    the cache stays vanilla so resume with a different bias just works.
+    """
 
     def __init__(
-        self, *, work_dir: Path, seed: int = 42, spec: SystemSpec | None = None
+        self,
+        *,
+        work_dir: Path,
+        seed: int = 42,
+        spec: SystemSpec | None = None,
+        plumed_input: str | None = None,
     ):
         self._work_dir = Path(work_dir)
         self._seed = seed
         self._spec = spec if spec is not None else SystemSpec.trpcage()
+        self._plumed_input = plumed_input
         self._pdb_path: Path | None = None
         self._sim: app.Simulation | None = None
         self._topology_path = self._work_dir / "topology.pdb"
@@ -110,29 +149,19 @@ class OpenMMAdapter:
         state_xml = cache_dir / "initial_state.xml"
         cached_topology = cache_dir / "topology.pdb"
 
-        if system_xml.exists() and state_xml.exists() and cached_topology.exists():
-            self._start_from_cache(system_xml, state_xml, cached_topology)
-            return
+        if not (system_xml.exists() and state_xml.exists() and cached_topology.exists()):
+            self._setup_and_cache_vanilla(system_xml, state_xml, cached_topology)
 
-        self._start_fresh_and_cache(system_xml, state_xml, cached_topology)
+        self._build_runtime_simulation(system_xml, state_xml, cached_topology)
 
-    def _start_from_cache(
+    def _setup_and_cache_vanilla(
         self, system_xml: Path, state_xml: Path, cached_topology: Path
     ) -> None:
-        pdb = app.PDBFile(str(cached_topology))
-        system = XmlSerializer.deserialize(system_xml.read_text())
-        integrator = self._make_integrator()
-        platform = Platform.getPlatformByName("CPU")
-        sim = app.Simulation(pdb.topology, system, integrator, platform)
-        state = XmlSerializer.deserialize(state_xml.read_text())
-        sim.context.setState(state)
-        self._sim = sim
-        self._topology_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(cached_topology, self._topology_path)
-
-    def _start_fresh_and_cache(
-        self, system_xml: Path, state_xml: Path, cached_topology: Path
-    ) -> None:
+        """First-time setup: build the vanilla (no-bias) System, minimize,
+        cache. The throwaway minimization Simulation is discarded; the
+        runtime Simulation is rebuilt from cache in
+        `_build_runtime_simulation` so the bias-injection path is the
+        same on first call and on every resume."""
         assert self._pdb_path is not None
         pdb = app.PDBFile(str(self._pdb_path))
         forcefield = app.ForceField(*_FORCEFIELD_FILES)
@@ -154,15 +183,28 @@ class OpenMMAdapter:
         sim = app.Simulation(modeller.topology, system, integrator, platform)
         sim.context.setPositions(modeller.positions)
         sim.minimizeEnergy()
-        self._sim = sim
 
-        # Cache for next time
         system_xml.write_text(XmlSerializer.serialize(system))
         state = sim.context.getState(
             getPositions=True, getVelocities=True, enforcePeriodicBox=True
         )
         state_xml.write_text(XmlSerializer.serialize(state))
         self._write_topology(sim, cached_topology)
+
+    def _build_runtime_simulation(
+        self, system_xml: Path, state_xml: Path, cached_topology: Path
+    ) -> None:
+        pdb = app.PDBFile(str(cached_topology))
+        system = XmlSerializer.deserialize(system_xml.read_text())
+        if self._plumed_input is not None:
+            force = _prepare_plumed_force(self._plumed_input, self._work_dir)
+            system.addForce(force)
+        integrator = self._make_integrator()
+        platform = Platform.getPlatformByName("CPU")
+        sim = app.Simulation(pdb.topology, system, integrator, platform)
+        state = XmlSerializer.deserialize(state_xml.read_text())
+        sim.context.setState(state)
+        self._sim = sim
         self._topology_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(cached_topology, self._topology_path)
 

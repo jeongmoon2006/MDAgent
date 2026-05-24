@@ -86,6 +86,14 @@ GROMACS side verified live (`test_gromacs_adapter_live.py` extended with em.gro 
 
 ## 2. Session journal
 
+### 2026-05-25 — OpenMM adapter PLUMED hook (M4 sub-step)
+- `OpenMMAdapter.__init__` grows an optional `plumed_input: str | None`. When non-None, a `PlumedForce(plumed_input)` is attached to the runtime System inside `start()` via a guarded `from openmmplumed import PlumedForce`; absence raises a clear `RuntimeError` naming `openmmplumed` and the pip install command. `plumed.dat` is written to `<work_dir>/plumed.dat` *before* the import attempt so the audit artifact survives the error.
+- Refactored `start()` to collapse the two prior paths (`_start_from_cache` / `_start_fresh_and_cache`) into `_setup_and_cache_vanilla` + `_build_runtime_simulation`. The cache stays **bias-agnostic**: vanilla System + post-minimization State only. The runtime Simulation is rebuilt from the cache on every `start()` and the plumed force is freshly injected each time. Consequence: re-supplying or changing `plumed_input` on resume just works — no cache invalidation needed, no openmmplumed serialization dependency.
+- Cost of the refactor on the vanilla (no-plumed) path: first `start()` now does an extra serialize-and-deserialize round trip after minimization (~ms on a few-thousand-atom system). Identical behavior on resume.
+- 4 new unit tests in `tests/unit/test_openmm_plumed_hook.py`: (1) plumed.dat written even when `openmmplumed` is missing, (2) error message names `openmmplumed` and `pip install`, (3) success path via injected stub module returns the right force, (4) deep work_dir is created.
+- 67 unit tests green (was 63). Live "bias actually acts on dynamics" is still deferred to AWS (D6 step 5).
+- **Open / next:** scientist multi-tool refactor — the scientist needs a way to choose between vanilla and biased rounds (and, when biased, propose CVs + bias params for `plumed_writer`). This is the conceptually richest part of M4; will likely need a planning conversation first.
+
 ### 2026-05-24 (late night) — PLUMED writer (M4 sub-step, PLUMED-agnostic build)
 - Tried `sudo apt install plumed plumed-dev`; package not found in this WSL Ubuntu's apt sources (likely universe repo not enabled). Decided **not** to fight apt: instead, build the PLUMED-using code in a PLUMED-runtime-agnostic way and defer the bias-actually-acts smoke test to AWS (D6 step 5), where the environment is controlled.
 - New `src/mdpilot/adapters/plumed_writer.py`: pure text generation, zero runtime PLUMED required. Typed `DistanceCV` / `TorsionCV` (0-based atom indices in code, 1-based in output — matches the rest of the codebase). Bias dataclasses `MetadynamicsBias` and `HarmonicRestraint`. `PlumedInput` composite validates CV-label references and unique CV labels, then renders the full plumed.dat text including header comments and a PRINT directive.
