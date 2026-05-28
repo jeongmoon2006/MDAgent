@@ -39,7 +39,8 @@
       "Bash(python3 -c \"import openmmplumed; print\\(openmmplumed.__file__\\)\")",
       "Bash(python3 -m pytest tests/unit -x -q)",
       "Bash(.venv/bin/pytest tests/unit -x -q)",
-      "Bash(.venv/bin/pip show *)"
+      "Bash(.venv/bin/pip show *)",
+      "Bash(python -m pytest tests/unit/test_exploration.py -q)"
     ]
   }
 }
