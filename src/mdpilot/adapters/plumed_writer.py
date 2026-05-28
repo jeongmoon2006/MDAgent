@@ -49,7 +49,29 @@ class TorsionCV:
         return f"{self.label}: TORSION ATOMS={idx}"
 
 
-CV = Union[DistanceCV, TorsionCV]
+@dataclass(frozen=True)
+class GyrationCV:
+    """Radius of gyration of an atom group (0-based atom indices).
+
+    PLUMED's ``GYRATION TYPE=RADIUS`` action. Useful as a global compaction /
+    folding order parameter — small Rg is compact/folded, large Rg is extended.
+    """
+
+    label: str
+    atoms: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.atoms) < 2:
+            raise ValueError(
+                f"GyrationCV: need at least 2 atoms (got {len(self.atoms)})"
+            )
+
+    def render(self) -> str:
+        idx = ",".join(str(a + 1) for a in self.atoms)
+        return f"{self.label}: GYRATION TYPE=RADIUS ATOMS={idx}"
+
+
+CV = Union[DistanceCV, TorsionCV, GyrationCV]
 
 
 @dataclass(frozen=True)

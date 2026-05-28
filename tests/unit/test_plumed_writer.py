@@ -10,6 +10,7 @@ import pytest
 
 from mdpilot.adapters.plumed_writer import (
     DistanceCV,
+    GyrationCV,
     HarmonicRestraint,
     MetadynamicsBias,
     PlumedInput,
@@ -27,6 +28,16 @@ def test_distance_cv_emits_1based_atoms() -> None:
 def test_torsion_cv_emits_1based_atoms() -> None:
     cv = TorsionCV(label="phi", atoms=(0, 1, 2, 3))
     assert cv.render() == "phi: TORSION ATOMS=1,2,3,4"
+
+
+def test_gyration_cv_emits_1based_atoms() -> None:
+    cv = GyrationCV(label="rg", atoms=(0, 1, 4, 5))
+    assert cv.render() == "rg: GYRATION TYPE=RADIUS ATOMS=1,2,5,6"
+
+
+def test_gyration_cv_rejects_under_two_atoms() -> None:
+    with pytest.raises(ValueError, match="at least 2 atoms"):
+        GyrationCV(label="rg", atoms=(3,))
 
 
 # ---------- Metadynamics ----------
