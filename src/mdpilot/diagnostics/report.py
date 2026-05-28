@@ -17,6 +17,7 @@ import numpy as np
 
 from mdpilot.diagnostics.autocorrelation import autocorrelation
 from mdpilot.diagnostics.block_averaging import block_average
+from mdpilot.diagnostics.exploration import exploration
 
 _MIN_FRAMES_FOR_STATISTICS = 8
 
@@ -76,12 +77,17 @@ def _summarize(
             statistical_inefficiency_block=None,
             statistical_inefficiency_autocorr=None,
             tau_int_frames=None,
+            bimodality_coefficient=None,
+            n_basins=None,
+            minor_basin_occupancy=None,
+            exploring=None,
             note=f"too few frames (n={n} < {_MIN_FRAMES_FOR_STATISTICS}) for statistics",
         )
         return base
 
     block = block_average(observable)
     autocorr = autocorrelation(observable)
+    explore = exploration(observable)
     base.update(
         mean=block.mean,
         sem_blocked=block.sem,
@@ -92,6 +98,10 @@ def _summarize(
         tau_int_frames=autocorr.tau_int,
         ess=autocorr.ess,
         well_sampled=autocorr.well_sampled,
+        bimodality_coefficient=explore.bimodality_coefficient,
+        n_basins=explore.n_basins,
+        minor_basin_occupancy=explore.minor_basin_occupancy,
+        exploring=explore.exploring,
     )
     return base
 

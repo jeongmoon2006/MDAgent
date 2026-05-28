@@ -34,6 +34,7 @@ def test_summarize_under_eight_frames_degrades_gracefully(tmp_path: Path) -> Non
     assert report["n_frames"] == 3
     assert report["plateau_reached"] is False
     assert report["well_sampled"] is False
+    assert report["exploring"] is None  # key present even when statistics skipped
     assert "too few frames" in report["note"]
 
 
@@ -65,6 +66,8 @@ def test_summarize_long_iid_series_flags_well_sampled(tmp_path: Path) -> None:
     assert report["well_sampled"] is True
     assert report["plateau_reached"] is True
     assert report["ess"] > 1000
+    assert report["exploring"] is False  # unimodal single basin
+    assert report["n_basins"] == 1
 
 
 def test_to_json_is_compact_and_deterministic(tmp_path: Path) -> None:
