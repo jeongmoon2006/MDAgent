@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from mdpilot.orchestrator.scientist import Decision, decide
+from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
 
 
 class _FakeClient:
@@ -58,7 +58,7 @@ def test_decide_request_shape() -> None:
     )
     req = fake.last_request
     assert req is not None
-    assert req["model"] == "claude-haiku-4-5"
+    assert req["model"] == "claude-sonnet-4-6"  # M4 bump from Haiku
     assert req["tool_choice"] == {"type": "tool", "name": "record_decision"}
     assert req["tools"][0]["name"] == "record_decision"
     assert req["tools"][0]["strict"] is True
@@ -131,3 +131,102 @@ def test_decide_passes_hypothesis_ledger_in_user_message() -> None:
     user_text = fake.last_request["messages"][0]["content"]
     assert "R1: trajectory stuck on initial basin" in user_text
     assert "R2: low ESS expected if torsion is slow" in user_text
+
+
+# ---------- M4: switch_to_metad + task_expectation ----------
+
+def test_decide_extracts_switch_to_metad_with_proposal() -> None:
+    fake = _FakeClient(
+        tool_input={
+            "decision": "switch_to_metad",
+            "reason": "pinned, exploring=False; task wants fold/unfold; budget can't reach µs",
+            "extra_ns": None,
+            "ledger_note": "Rg is the natural folding coordinate for this hairpin",
+            "metad_proposal": {
+                "cv_type": "gyration",
+                "selections": ["backbone and resSeq 1 to 10"],
+                "label": "rg_back",
+            },
+        }
+    )
+    result = decide({"exploring": False, "n_basins": 1}, client=fake)
+    assert result.decision == "switch_to_metad"
+    assert result.extra_ns is None
+    assert result.metad_proposal == MetadProposal(
+        cv_type="gyration",
+        selections=("backbone and resSeq 1 to 10",),
+        label="rg_back",
+    )
+
+
+def test_decide_task_expectation_appears_in_user_message() -> None:
+    fake = _FakeClient(
+        tool_input={
+            "decision": "extend",
+            "reason": "x",
+            "extra_ns": 0.5,
+            "ledger_note": None,
+            "metad_proposal": None,
+        }
+    )
+    decide(
+        {"exploring": True},
+        task_expectation="expect fold/unfold transition; ~µs; budget 50 ns",
+        client=fake,
+    )
+    user_text = fake.last_request["messages"][0]["content"]
+    assert "fold/unfold transition" in user_text
+    assert "budget 50 ns" in user_text
+
+
+def test_decide_rejects_switch_without_proposal() -> None:
+    fake = _FakeClient(
+        tool_input={
+            "decision": "switch_to_metad",
+            "reason": "vanilla inadequate",
+            "extra_ns": None,
+            "ledger_note": None,
+            "metad_proposal": None,
+        }
+    )
+    with pytest.raises(RuntimeError, match="metad_proposal is null"):
+        decide({}, client=fake)
+
+
+def test_decide_rejects_proposal_with_non_switch_decision() -> None:
+    fake = _FakeClient(
+        tool_input={
+            "decision": "extend",
+            "reason": "ess low",
+            "extra_ns": 1.0,
+            "ledger_note": None,
+            "metad_proposal": {
+                "cv_type": "distance",
+                "selections": ["name CA and resSeq 1", "name CA and resSeq 10"],
+                "label": "d",
+            },
+        }
+    )
+    with pytest.raises(RuntimeError, match="must be null"):
+        decide({}, client=fake)
+
+
+def test_decision_tool_schema_includes_metad_proposal() -> None:
+    from mdpilot.orchestrator.scientist import _DECISION_TOOL
+
+    props = _DECISION_TOOL["input_schema"]["properties"]
+    assert "metad_proposal" in props
+    assert props["metad_proposal"]["type"] == ["object", "null"]
+    assert props["decision"]["enum"] == ["extend", "stop", "switch_to_metad"]
+    assert "metad_proposal" in _DECISION_TOOL["input_schema"]["required"]
+    sub = props["metad_proposal"]["properties"]
+    assert sub["cv_type"]["enum"] == ["distance", "torsion", "gyration"]
+
+
+def test_metad_proposal_round_trips_through_dict() -> None:
+    mp = MetadProposal(
+        cv_type="distance",
+        selections=("name CA and resSeq 1", "name CA and resSeq 10"),
+        label="d_term",
+    )
+    assert MetadProposal.from_dict(mp.to_dict()) == mp

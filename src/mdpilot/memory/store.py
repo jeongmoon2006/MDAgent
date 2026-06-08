@@ -44,9 +44,10 @@ CREATE TABLE IF NOT EXISTS rounds (
     dcd_path TEXT NOT NULL,
     checkpoint_path TEXT,
     report_json TEXT NOT NULL,
-    decision TEXT NOT NULL CHECK (decision IN ('extend', 'stop')),
+    decision TEXT NOT NULL CHECK (decision IN ('extend', 'stop', 'switch_to_metad')),
     reason TEXT NOT NULL,
     extra_ns REAL,
+    metad_proposal_json TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -69,6 +70,7 @@ class RoundRow:
     decision: str
     reason: str
     extra_ns: float | None
+    metad_proposal: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,7 @@ def init_campaign(work_dir: Path, config: dict[str, Any]) -> None:
     config_json = json.dumps(config, sort_keys=True)
     with _connect(work_dir) as conn:
         conn.executescript(_SCHEMA)
+        _migrate_rounds_for_metad(conn)
         row = conn.execute("SELECT config_json FROM campaign WHERE id = 1").fetchone()
         if row is None:
             conn.execute(
@@ -139,15 +142,22 @@ def append_round(
     decision: str,
     reason: str,
     extra_ns: float | None,
+    metad_proposal: dict[str, Any] | None = None,
 ) -> None:
-    """Insert one completed round. Round_index must be unique within a campaign."""
+    """Insert one completed round. Round_index must be unique within a campaign.
+
+    ``metad_proposal`` is the structured CV proposal when ``decision`` is
+    ``switch_to_metad`` (and None otherwise); persisted as a JSON blob so the
+    loop can reconstruct it on resume.
+    """
     with _connect(work_dir) as conn:
         conn.execute(
             """
             INSERT INTO rounds (
                 round_index, n_steps, dcd_path, checkpoint_path,
-                report_json, decision, reason, extra_ns, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                report_json, decision, reason, extra_ns,
+                metad_proposal_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 round_index,
@@ -158,6 +168,7 @@ def append_round(
                 decision,
                 reason,
                 extra_ns,
+                json.dumps(metad_proposal, sort_keys=True) if metad_proposal else None,
                 _now_iso(),
             ),
         )
@@ -171,7 +182,7 @@ def list_rounds(work_dir: Path) -> list[RoundRow]:
         cursor = conn.execute(
             """
             SELECT round_index, n_steps, dcd_path, checkpoint_path,
-                   report_json, decision, reason, extra_ns
+                   report_json, decision, reason, extra_ns, metad_proposal_json
             FROM rounds ORDER BY round_index ASC
             """
         )
@@ -185,6 +196,7 @@ def list_rounds(work_dir: Path) -> list[RoundRow]:
                 decision=r[5],
                 reason=r[6],
                 extra_ns=r[7],
+                metad_proposal=json.loads(r[8]) if r[8] else None,
             )
             for r in cursor.fetchall()
         ]
@@ -219,6 +231,48 @@ def list_ledger_notes(work_dir: Path) -> list[LedgerNote]:
             "SELECT round_index, text FROM ledger ORDER BY id ASC"
         )
         return [LedgerNote(round_index=r[0], text=r[1]) for r in cursor.fetchall()]
+
+
+def _migrate_rounds_for_metad(conn: sqlite3.Connection) -> None:
+    """Bring pre-M4 ``rounds`` tables up to the metaD-aware schema.
+
+    Two things change: the ``decision`` CHECK constraint widens to include
+    ``switch_to_metad``, and a nullable ``metad_proposal_json`` column appears.
+    SQLite cannot ``ALTER`` a CHECK constraint in place, so we rename-create-
+    copy-drop. Idempotent: a no-op when the column already exists.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(rounds)").fetchall()}
+    if not cols or "metad_proposal_json" in cols:
+        return
+    conn.executescript(
+        """
+        BEGIN;
+        ALTER TABLE rounds RENAME TO rounds_pre_m4;
+        CREATE TABLE rounds (
+            round_index INTEGER PRIMARY KEY,
+            n_steps INTEGER NOT NULL,
+            dcd_path TEXT NOT NULL,
+            checkpoint_path TEXT,
+            report_json TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (decision IN ('extend', 'stop', 'switch_to_metad')),
+            reason TEXT NOT NULL,
+            extra_ns REAL,
+            metad_proposal_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO rounds (
+            round_index, n_steps, dcd_path, checkpoint_path,
+            report_json, decision, reason, extra_ns,
+            metad_proposal_json, created_at
+        )
+        SELECT round_index, n_steps, dcd_path, checkpoint_path,
+               report_json, decision, reason, extra_ns,
+               NULL, created_at
+        FROM rounds_pre_m4;
+        DROP TABLE rounds_pre_m4;
+        COMMIT;
+        """
+    )
 
 
 def _now_iso() -> str:

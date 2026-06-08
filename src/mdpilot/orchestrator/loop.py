@@ -29,12 +29,14 @@ from mdpilot.adapters.base import MDAdapter
 from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.diagnostics.report import make_report
 from mdpilot.memory import store
-from mdpilot.orchestrator.scientist import Decision, decide
+from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
 
 _TIMESTEP_FS = 2.0  # matches the OpenMM adapter's integrator timestep
 _STEPS_PER_NS = int(1_000_000.0 / _TIMESTEP_FS)  # 500_000 steps/ns at 2 fs
 
-StopReason = Literal["scientist_said_stop", "max_rounds_reached"]
+StopReason = Literal[
+    "scientist_said_stop", "max_rounds_reached", "switch_to_metad_requested"
+]
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ def run_campaign(
     seed: int = 42,
     report_interval_steps: int = 500,    # 1 ps/frame at 2 fs
     equilibration_steps: int = 0,
+    task_expectation: str | None = None,
 ) -> CampaignResult:
     """Run the closed loop, resuming from `work_dir/state.db` if it exists.
 
@@ -74,6 +77,12 @@ def run_campaign(
     between invocations; the physics-bound params (seed, initial_steps,
     report_interval_steps, equilibration_steps) are locked at first init
     and a mismatch on resume raises.
+
+    `task_expectation` is free-form campaign-level guidance threaded into
+    every `decide()` call — what the trajectory must accomplish, the
+    characteristic timescale, the compute budget. Required for campaigns
+    where the scientist may need to choose `switch_to_metad`; otherwise the
+    LLM has no basis to judge "the budget cannot reach the transition."
     """
     work_dir = Path(work_dir)
     rounds_dir = work_dir / "rounds"
@@ -95,6 +104,10 @@ def run_campaign(
 
     if rounds and rounds[-1].decision.decision == "stop":
         return CampaignResult(work_dir, tuple(rounds), "scientist_said_stop")
+    if rounds and rounds[-1].decision.decision == "switch_to_metad":
+        return CampaignResult(
+            work_dir, tuple(rounds), "switch_to_metad_requested"
+        )
 
     adapter.prepare()
     adapter.start()
@@ -132,6 +145,7 @@ def run_campaign(
             report,
             prior_round_summaries=prior_summaries,
             hypothesis_ledger=[f"R{n.round_index}: {n.text}" for n in ledger_notes],
+            task_expectation=task_expectation,
         )
 
         ckpt = adapter.save_checkpoint(rounds_dir / f"round_{round_idx:03d}.chk")
@@ -147,6 +161,9 @@ def run_campaign(
             decision=decision.decision,
             reason=decision.reason,
             extra_ns=decision.extra_ns,
+            metad_proposal=(
+                decision.metad_proposal.to_dict() if decision.metad_proposal else None
+            ),
         )
         if decision.ledger_note:
             store.append_ledger_note(
@@ -159,6 +176,10 @@ def run_campaign(
 
         if decision.decision == "stop":
             return CampaignResult(work_dir, tuple(rounds), "scientist_said_stop")
+        if decision.decision == "switch_to_metad":
+            return CampaignResult(
+                work_dir, tuple(rounds), "switch_to_metad_requested"
+            )
         extra_ns = min(decision.extra_ns or 0.5, max_extra_ns)
         n_steps = max(int(extra_ns * _STEPS_PER_NS), 1)
 
@@ -166,6 +187,9 @@ def run_campaign(
 
 
 def _row_to_result(row: store.RoundRow) -> RoundResult:
+    metad = (
+        MetadProposal.from_dict(row.metad_proposal) if row.metad_proposal else None
+    )
     return RoundResult(
         index=row.round_index,
         n_steps=row.n_steps,
@@ -173,9 +197,12 @@ def _row_to_result(row: store.RoundRow) -> RoundResult:
         summary_path=row.dcd_path.with_suffix(".json"),
         report=row.report,
         decision=Decision(
-            decision=cast(Literal["extend", "stop"], row.decision),
+            decision=cast(
+                Literal["extend", "stop", "switch_to_metad"], row.decision
+            ),
             reason=row.reason,
             extra_ns=row.extra_ns,
+            metad_proposal=metad,
         ),
     )
 
@@ -210,6 +237,9 @@ def _persist_round_json(
             "decision": decision.decision,
             "reason": decision.reason,
             "extra_ns": decision.extra_ns,
+            "metad_proposal": (
+                decision.metad_proposal.to_dict() if decision.metad_proposal else None
+            ),
         },
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))

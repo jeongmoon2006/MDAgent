@@ -34,6 +34,52 @@ def _full_config(cfg: dict) -> dict:
     }
 
 
+def test_resume_with_prior_switch_to_metad_returns_without_running_openmm(
+    tmp_path: Path,
+) -> None:
+    """A campaign whose last round said 'switch_to_metad' is terminal under
+    the vanilla loop — the actual switch to enhanced sampling is the loop's
+    next-step (step 4). The round + proposal must survive the round-trip."""
+    cfg = _config_kwargs()
+    store.init_campaign(tmp_path, _full_config(cfg))
+    store.append_round(
+        tmp_path,
+        round_index=1,
+        n_steps=5_000,
+        dcd_path=tmp_path / "rounds/round_001.dcd",
+        checkpoint_path=tmp_path / "rounds/round_001.chk",
+        report={
+            "trajectory_length_ns": 0.01,
+            "ess": 3.0,
+            "plateau_reached": True,
+            "well_sampled": False,
+            "exploring": False,
+            "n_basins": 1,
+        },
+        decision="switch_to_metad",
+        reason="pinned + task wants µs fold; budget short",
+        extra_ns=None,
+        metad_proposal={
+            "cv_type": "gyration",
+            "selections": ["backbone and resSeq 1 to 10"],
+            "label": "rg_back",
+        },
+    )
+
+    result = run_campaign(work_dir=tmp_path, max_rounds=5, **cfg)
+
+    assert result.stop_reason == "switch_to_metad_requested"
+    assert len(result.rounds) == 1
+    rd = result.rounds[0].decision
+    assert rd.decision == "switch_to_metad"
+    assert rd.extra_ns is None
+    assert rd.metad_proposal is not None
+    assert rd.metad_proposal.cv_type == "gyration"
+    assert rd.metad_proposal.label == "rg_back"
+    # Nothing OpenMM-side ran:
+    assert not (tmp_path / "topology.pdb").exists()
+
+
 def test_resume_with_prior_stop_returns_without_running_openmm(tmp_path: Path) -> None:
     cfg = _config_kwargs()
     store.init_campaign(tmp_path, _full_config(cfg))
