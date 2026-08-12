@@ -86,7 +86,7 @@ def _stub_collaborators(monkeypatch, decisions: list[Decision]) -> list[str]:
     monkeypatch.setattr(loop_mod, "decide", lambda *a, **k: queue.pop(0))
     built: list[str] = []
 
-    def fake_build(proposal, traj, top):  # noqa: ANN001
+    def fake_build(proposal, traj, top, output_dir):  # noqa: ANN001
         text = "PLUMED-TEXT\n"
         built.append(text)
         return text

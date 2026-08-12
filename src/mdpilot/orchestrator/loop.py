@@ -291,10 +291,13 @@ def _pivot_to_metad(
 
     Renders plumed.dat from the proposal + the CV's fluctuation on
     `source_trajectory`, writes it to `plumed_dat_path` (the authoritative
-    audit artifact), then builds and starts the biased adapter.
+    audit artifact), then builds and starts the biased adapter. PLUMED's own
+    outputs (HILLS, COLVAR) are directed alongside plumed.dat.
     """
-    plumed_input = _build_plumed_input(proposal, source_trajectory, topology_path)
     plumed_dat_path.parent.mkdir(parents=True, exist_ok=True)
+    plumed_input = _build_plumed_input(
+        proposal, source_trajectory, topology_path, plumed_dat_path.parent
+    )
     plumed_dat_path.write_text(plumed_input)
     biased = factory(plumed_input)
     biased.prepare()
@@ -303,9 +306,18 @@ def _pivot_to_metad(
 
 
 def _build_plumed_input(
-    proposal: MetadProposal, trajectory_path: Path, topology_path: Path
+    proposal: MetadProposal,
+    trajectory_path: Path,
+    topology_path: Path,
+    output_dir: Path,
 ) -> str:
-    """Proposal → resolved CV → sized bias → rendered plumed.dat text."""
+    """Proposal → resolved CV → sized bias → rendered plumed.dat text.
+
+    `output_dir` is where PLUMED writes HILLS and COLVAR. It has to be
+    absolute and campaign-local: PLUMED resolves relative FILE= paths against
+    the process working directory, so the deposited bias would otherwise land
+    outside the campaign entirely.
+    """
     topology = md.load_topology(str(topology_path))
     cv = design_cv(
         CVProposal(
@@ -318,7 +330,9 @@ def _build_plumed_input(
     bias = design_bias(
         cv, trajectory_path, topology_path, temperature_k=_METAD_TEMPERATURE_K
     )
-    return PlumedInput(cvs=(cv,), bias=bias).render()
+    return PlumedInput(
+        cvs=(cv,), bias=bias, output_dir=Path(output_dir).resolve()
+    ).render()
 
 
 def _require_checkpoint(row: store.RoundRow) -> None:

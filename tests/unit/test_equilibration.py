@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from openmm import unit
 
+import mdpilot.adapters.openmm_adapter as oa
 from mdpilot.adapters.gromacs_adapter import (
     _MD_MDP_TEMPLATE,
     _NPT_MDP_TEMPLATE,
@@ -153,6 +154,52 @@ def test_production_mdp_cold_start_override_still_matches() -> None:
 
     assert "gen-vel              = no" in mdp
     assert "continuation         = yes" in mdp
+
+
+# ---------- OpenMM: platform selection ----------
+
+def test_resolve_platform_prefers_gpu_over_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oa, "_registered_platforms", lambda: {"CPU", "CUDA"})
+    monkeypatch.setattr(oa, "_platform_is_usable", lambda name: True)
+    assert oa.resolve_platform.__wrapped__() == "CUDA"
+
+
+def test_resolve_platform_falls_back_when_gpu_registered_but_broken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CUDA_ERROR_UNSUPPORTED_PTX_VERSION case: CUDA registers fine and
+    then fails at kernel load. Selecting on registration alone would hand back
+    a platform that dies mid-campaign."""
+    monkeypatch.setattr(oa, "_registered_platforms", lambda: {"CPU", "CUDA"})
+    monkeypatch.setattr(oa, "_platform_is_usable", lambda name: name != "CUDA")
+    assert oa.resolve_platform.__wrapped__() == "CPU"
+
+
+def test_resolve_platform_returns_cpu_when_nothing_probes_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oa, "_registered_platforms", lambda: {"CPU", "CUDA"})
+    monkeypatch.setattr(oa, "_platform_is_usable", lambda name: False)
+    assert oa.resolve_platform.__wrapped__() == "CPU"
+
+
+def test_explicit_platform_is_not_overridden(tmp_path: Path) -> None:
+    adapter = OpenMMAdapter(work_dir=tmp_path, platform="Reference")
+    assert adapter.platform_name == "Reference"
+
+
+def test_gpu_platforms_request_mixed_precision() -> None:
+    """Single precision (the OpenMM GPU default) would make a GPU run quietly
+    less accurate than the CPU run it replaces."""
+    assert oa._precision_properties("CUDA") == {"Precision": "mixed"}
+    assert oa._precision_properties("OpenCL") == {"Precision": "mixed"}
+    assert oa._precision_properties("CPU") == {}
+
+
+def test_bogus_platform_probes_as_unusable() -> None:
+    assert oa._platform_is_usable("NoSuchPlatform") is False
 
 
 # ---------- GROMACS: setup staging ----------

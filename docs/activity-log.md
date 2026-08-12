@@ -85,6 +85,20 @@ Production is now NPT from an equilibrated start, so **new runs are not drawn fr
 
 Deliberately not regenerated in this session: 9 h of CPU is a poor trade before the M4 live work, which will want chignolin fixtures anyway.
 
+### F4 — `SIGMA = spread/3` needs a trajectory that has actually sampled the basin (2026-08-11)
+Measured on the first live metaD run: sizing the Rg hill width off a **10 ps** vanilla Trp-cage trajectory gives `SIGMA ≈ 0.0018 nm`. Backbone Rg barely moves in 10 ps, so spread/3 measures thermal jitter, not basin width. Hills that narrow never overlap → the accumulated bias at each new deposit stays ≈ 0 → well-tempering has nothing to damp and heights never decay. WT-MetaD silently degenerates into plain metaD that fills nothing.
+
+At `SIGMA = 0.02 nm` (a physically sensible Rg width for a 20-residue protein) the same run behaves correctly: heights decay 1.386 → 0.577 kJ/mol over 30 hills while the bias accumulates to 19.7 kJ/mol.
+
+The heuristic is not wrong — σ ≈ intrabasin fluctuation / 3 is standard — but it is only valid once the vanilla phase has sampled the basin. The `switch_to_metad` decision fires precisely when the CV looks *pinned*, which is also when its measured spread is least trustworthy. Needs a guard before the M4 done-criterion run: either a minimum-sampling precondition (τ_int-based) on the source trajectory, or a physical floor per CV type. The existing `_SIGMA_FLOOR = 1e-3` is a PLUMED-validity floor, not a physical one, and does not help here.
+
+### F5 — PLUMED resolves FILE= against the process CWD, and buffers output (2026-08-11)
+Two defects found by the first live run, both fixed in the same session:
+- A bare `FILE=HILLS` wrote the campaign's deposited bias into whatever directory python was started from — the repo root, in that first run, complete with `bck.0.*` backups. Concurrent campaigns would collide and resume could never find the previous HILLS. `PlumedInput` now requires an **absolute** `output_dir` and prefixes it onto every file PLUMED writes; a relative one raises.
+- PLUMED buffers HILLS/COLVAR and flushes only when the context is finalized, so a campaign killed mid-round loses every deposited hill and a resume reads what looks like an empty file. `PlumedInput.render()` now emits `FLUSH STRIDE=<print_stride>`.
+
+Also worth knowing when reading HILLS: PLUMED records well-tempered hill heights pre-scaled by **γ/(γ-1)**, so the first hill reads `W0·γ/(γ-1)` (1.2472 × 10/9 = 1.3857), not `W0`.
+
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
 - Do not build a persistent multi-agent system; subagents are ephemeral function calls returning structured artifacts, not prose.
@@ -95,6 +109,18 @@ Deliberately not regenerated in this session: 9 h of CPU is a poor trade before 
 ---
 
 ## 2. Session journal
+
+### 2026-08-11 (later) — M4 step 5a: PLUMED runtime live, first metadynamics ever executed
+Closes the "written but never run" gap on the whole M4 bias path. Prior to this session no hill had ever been deposited by this codebase.
+
+- **Environment.** `openmm-plumed` is not on PyPI and PLUMED is not in the Ubuntu repos, so the plain `.venv` cannot host it. User chose conda-forge over the two alternatives (OpenMM's native `app.metadynamics`, which would have meant dropping PLUMED for the OpenMM path and refactoring the Protocol's `plumed_input: str` into a structured bias spec; or a source build). Created via micromamba: env `mdpilot` with `python=3.12 openmm openmm-plumed plumed` + conda-forge deps + `pip install -e .`. PLUMED 2.9, OpenMM 8.4.0. Note `~/micromamba` is an unrelated pre-existing binary occupying the conventional root prefix, so `MAMBA_ROOT_PREFIX=$HOME/.micromamba` is required.
+- **Two environments now exist and they are not equivalent:** `.venv` (pip OpenMM 8.5.1, no PLUMED) and the conda env (OpenMM 8.4.0, PLUMED). The unit suite is green in both — 124 in conda, 123 + 1 skipped in `.venv`, where the real-PlumedForce test skips. Anything touching metaD must run in the conda env.
+- **Test-suite bug surfaced by the install.** Three tests in `test_openmm_plumed_hook.py` asserted `openmmplumed` was genuinely absent, so they stopped testing anything the moment the runtime appeared. Reworked to *simulate* absence via `sys.modules[...] = None`, plus a new test that a real runtime returns a real `PlumedForce` (the stub cannot catch signature drift).
+- **Two real defects found by running it** — see F5: PLUMED resolving `FILE=` against the process CWD (campaign output landed in the repo root), and PLUMED buffering output until finalization (a killed round loses all hills). Both fixed; `PlumedInput` now takes a required absolute `output_dir` and emits `FLUSH`.
+- **One scientific finding** — see F4: `SIGMA = spread/3` off a short vanilla run underestimates the basin width badly enough that WT-MetaD degenerates to plain metaD. Blocks the done-criterion run until guarded.
+- **Verified live** (`tests/integration/test_metad_live.py`, 6 tests, ~9 min, no API key): full mechanical pivot vanilla → `design_cv` → `design_bias` → plumed.dat → biased run. HILLS lands in the campaign dir, 30 hills at PACE=500 over 30 ps, `biasf=10` echoed by PLUMED, heights decay 1.386 → 0.577 kJ/mol, `metad.bias` climbs 0 → 19.7 kJ/mol. The decay and the bias growth together are the evidence that well-tempering is live and the force is genuinely coupled to the dynamics, not merely rendered into a file.
+- **M4 done-criterion still unmet.** What is proven is that the machinery executes and WT-MetaD behaves correctly. What is not: the scientist (LLM) detecting inadequacy and proposing the CV on a system that genuinely requires enhanced sampling, and a real barrier crossing. That needs chignolin, the σ guard from F4, and materially more compute — 30 ps of Trp-cage at a folded Rg of ~0.70 nm crosses nothing, nor should it.
+- **Open / next:** F4 σ guard; chignolin `SystemSpec` + `task_expectation`; GPU platform (both OpenMM code paths still hardcode `Platform.getPlatformByName("CPU")`, which will not do for a folding-timescale run); then the done-criterion campaign.
 
 ### 2026-08-11 — Equilibration, velocity-init parity, and well-tempered metaD (pre-M4 correctness pass)
 Three physics defects fixed before resuming M4. All three were code that ran cleanly and produced wrong physics — the failure mode CLAUDE.md §4 exists to catch.

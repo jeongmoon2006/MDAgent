@@ -36,12 +36,17 @@ guarded import: required only when `plumed_input` is set.
 from __future__ import annotations
 
 import shutil
+from functools import lru_cache
 from pathlib import Path
 
 from openmm import (
+    Context,
     LangevinMiddleIntegrator,
     MonteCarloBarostat,
+    NonbondedForce,
     Platform,
+    System,
+    VerletIntegrator,
     XmlSerializer,
     app,
     unit,
@@ -70,6 +75,14 @@ _PRESSURE_BAR = 1.0
 _BAROSTAT_INTERVAL = 25     # steps between volume-move attempts
 _EQUIL_REPORT_INTERVAL = 500
 
+# Platform selection, fastest first. GPU platforms run production MD in
+# 'mixed' precision: forces in single, accumulation in double. Plain 'single'
+# (the OpenMM default) degrades energy conservation relative to the CPU
+# platform's double, which would make a GPU run quietly less trustworthy than
+# the CPU run it replaces.
+_PLATFORM_PREFERENCE = ("CUDA", "HIP", "OpenCL", "CPU")
+_MIXED_PRECISION_PLATFORMS = frozenset({"CUDA", "HIP", "OpenCL"})
+
 
 def save_checkpoint(simulation: app.Simulation, path: Path) -> Path:
     """Write an OpenMM binary checkpoint (positions, velocities, RNG state)."""
@@ -84,6 +97,61 @@ def load_checkpoint(simulation: app.Simulation, path: Path) -> None:
     """Restore a checkpoint into an existing Simulation built from the same system."""
     with open(path, "rb") as f:
         simulation.context.loadCheckpoint(f.read())
+
+
+def _platform_is_usable(name: str) -> bool:
+    """Can this platform actually build a Context and take a step?
+
+    Registration is not usability. A conda OpenMM whose NVRTC is newer than
+    the installed driver registers CUDA quite happily and then dies at kernel
+    load with CUDA_ERROR_UNSUPPORTED_PTX_VERSION — mid-campaign, after setup
+    has already been paid for. A throwaway two-particle system with a real
+    nonbonded force compiles the same kernel machinery, for microseconds.
+    """
+    try:
+        system = System()
+        system.addParticle(1.0)
+        system.addParticle(1.0)
+        force = NonbondedForce()
+        force.addParticle(0.0, 1.0, 0.0)
+        force.addParticle(0.0, 1.0, 0.0)
+        system.addForce(force)
+        integrator = VerletIntegrator(0.001)
+        context = Context(system, integrator, Platform.getPlatformByName(name))
+        context.setPositions([(0, 0, 0), (0, 0, 1)])
+        integrator.step(1)
+        del context
+        return True
+    except Exception:
+        return False
+
+
+def _registered_platforms() -> set[str]:
+    return {
+        Platform.getPlatform(i).getName() for i in range(Platform.getNumPlatforms())
+    }
+
+
+@lru_cache(maxsize=1)
+def resolve_platform() -> str:
+    """Name of the fastest usable platform. GPU when there is one, else CPU.
+
+    Cached: the probe is cheap but not free, and the answer cannot change
+    within a process.
+    """
+    registered = _registered_platforms()
+    for name in _PLATFORM_PREFERENCE:
+        if name in registered and _platform_is_usable(name):
+            return name
+    return "CPU"
+
+
+def _precision_properties(name: str) -> dict[str, str]:
+    return {"Precision": "mixed"} if name in _MIXED_PRECISION_PLATFORMS else {}
+
+
+def _platform_and_properties(name: str) -> tuple[Platform, dict[str, str]]:
+    return Platform.getPlatformByName(name), _precision_properties(name)
 
 
 def _attach_equilibration_reporter(sim: app.Simulation, path: Path) -> None:
@@ -134,6 +202,10 @@ class OpenMMAdapter:
     TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs,
     MonteCarloBarostat at 1 bar).
 
+    ``platform`` pins the OpenMM platform by name; left at None the adapter
+    picks the fastest one that actually works (GPU when present, CPU
+    otherwise) via ``resolve_platform()``.
+
     ``nvt_steps`` / ``npt_steps`` size the two equilibration stages. Set both
     to 0 to skip equilibration entirely — only useful for tests that need the
     setup pipeline without the MD cost; a run started that way is *not*
@@ -153,6 +225,7 @@ class OpenMMAdapter:
         plumed_input: str | None = None,
         nvt_steps: int = _NVT_EQUIL_STEPS,
         npt_steps: int = _NPT_EQUIL_STEPS,
+        platform: str | None = None,
     ):
         self._work_dir = Path(work_dir)
         self._seed = seed
@@ -160,6 +233,7 @@ class OpenMMAdapter:
         self._plumed_input = plumed_input
         self._nvt_steps = nvt_steps
         self._npt_steps = npt_steps
+        self._platform_name = platform
         self._pdb_path: Path | None = None
         self._sim: app.Simulation | None = None
         self._topology_path = self._work_dir / "topology.pdb"
@@ -245,12 +319,14 @@ class OpenMMAdapter:
             nonbondedCutoff=_NONBONDED_CUTOFF_NM * unit.nanometer,
             constraints=app.HBonds,
         )
-        platform = Platform.getPlatformByName("CPU")
+        platform, platform_props = self._platform()
         cache_dir = system_xml.parent
 
         # NVT: minimize, seed velocities at the bottom of the ramp, heat.
         integrator = self._make_integrator(_HEAT_START_K)
-        sim = app.Simulation(modeller.topology, system, integrator, platform)
+        sim = app.Simulation(
+            modeller.topology, system, integrator, platform, platform_props
+        )
         sim.context.setPositions(modeller.positions)
         sim.minimizeEnergy()
         sim.context.setVelocitiesToTemperature(
@@ -268,6 +344,7 @@ class OpenMMAdapter:
             system,
             sim,
             platform,
+            platform_props,
             log_path=cache_dir / "equilibration_npt.csv",
         )
 
@@ -303,6 +380,7 @@ class OpenMMAdapter:
         system: object,
         nvt_sim: app.Simulation,
         platform: Platform,
+        platform_props: dict[str, str],
         *,
         log_path: Path,
     ) -> app.Simulation:
@@ -311,12 +389,25 @@ class OpenMMAdapter:
         state = nvt_sim.context.getState(
             getPositions=True, getVelocities=True, enforcePeriodicBox=True
         )
-        sim = app.Simulation(topology, system, self._make_integrator(), platform)
+        sim = app.Simulation(
+            topology, system, self._make_integrator(), platform, platform_props
+        )
         sim.context.setState(state)
         _attach_equilibration_reporter(sim, log_path)
         if self._npt_steps > 0:
             sim.step(self._npt_steps)
         return sim
+
+    @property
+    def platform_name(self) -> str:
+        """Platform this adapter runs on. Auto-resolved (GPU if usable, else
+        CPU) unless pinned at construction."""
+        if self._platform_name is None:
+            self._platform_name = resolve_platform()
+        return self._platform_name
+
+    def _platform(self) -> tuple[Platform, dict[str, str]]:
+        return _platform_and_properties(self.platform_name)
 
     def _make_barostat(self) -> MonteCarloBarostat:
         barostat = MonteCarloBarostat(
@@ -337,8 +428,10 @@ class OpenMMAdapter:
             force = _prepare_plumed_force(self._plumed_input, self._work_dir)
             system.addForce(force)
         integrator = self._make_integrator()
-        platform = Platform.getPlatformByName("CPU")
-        sim = app.Simulation(pdb.topology, system, integrator, platform)
+        platform, platform_props = self._platform()
+        sim = app.Simulation(
+            pdb.topology, system, integrator, platform, platform_props
+        )
         state = XmlSerializer.deserialize(state_xml.read_text())
         sim.context.setState(state)
         self._sim = sim

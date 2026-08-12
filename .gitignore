@@ -39,6 +39,42 @@ campaigns/
 *.xtc
 *.trr
 
+# PLUMED output. Campaign runs direct these under campaigns/ via an absolute
+# output_dir, but PLUMED resolves any stray relative FILE= against the process
+# working directory — which once dropped a campaign's HILLS in the repo root.
+HILLS
+HILLS.*
+COLVAR
+COLVAR.*
+bck.*
+
+# GROMACS derived files. All of these are produced by the adapter's setup and
+# run pipeline; none are inputs worth versioning.
+*.tpr
+*.cpt
+*.edr
+mdout.mdp
+step*.pdb
+\#*\#
+
+# OpenMM checkpoints
+*.chk
+
+# Slide decks and their generators. Presentation material is not part of the
+# codebase; keep it local rather than versioning build scripts and exports.
+*.pptx
+*.ppt
+*.odp
+*.key
+slides/
+deck/
+presentation*/
+*-deck.html
+*-slides.html
+make_ppt*.py
+build_deck*.py
+generate_slides*.py
+
 # IDE - VSCode
 .vscode/*
 !.vscode/settings.json
