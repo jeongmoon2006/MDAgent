@@ -4,13 +4,26 @@ Trp-cage in TIP3P + 0.15 M NaCl, AMBER14, LangevinMiddle integrator. The
 system parameters are hardcoded here for now; engine-agnostic SystemSpec
 arrives later when arbitrary-system support lands.
 
+Equilibration: setup runs minimize → staged NVT heating → NPT density
+relaxation before anything is cached, so production never starts from a
+minimized structure. Velocities are seeded explicitly with
+`setVelocitiesToTemperature` at the first heating stage rather than left at
+zero for the thermostat to warm up — that zero-velocity start was a real
+physical mismatch with the GROMACS adapter, which has always generated
+velocities via `gen-vel`. Both engines now reach 300 K over an equivalent
+50 K → 300 K ramp under the same stochastic (Langevin / `sd`) thermostat.
+
+The barostat added for the NPT stage stays in the cached `System`, so
+production runs NPT as well; the box is therefore free to fluctuate rather
+than being frozen at whatever density `addSolvent` happened to produce.
+
 F2 fix: `start()` is idempotent. On the first call we run the full
-Modeller / solvate / createSystem / minimize pipeline, then serialize
-the resulting `System` and post-minimization `State` to `<work_dir>/cache/`.
-On subsequent calls (e.g. process restart for resume) we detect the
-cache and skip straight to constructing a `Simulation` from it. The
-expensive part (minimization on a few-thousand-atom solvated system) no
-longer runs every time `run_campaign` is invoked.
+Modeller / solvate / createSystem / minimize / equilibrate pipeline, then
+serialize the resulting `System` and post-equilibration `State` to
+`<work_dir>/cache/`. On subsequent calls (e.g. process restart for resume)
+we detect the cache and skip straight to constructing a `Simulation` from
+it. The expensive part (minimization plus equilibration on a few-thousand-
+atom solvated system) no longer runs every time `run_campaign` is invoked.
 
 PLUMED hook: `plumed_input` (str) is intentionally *not* part of the
 cache. The cache stays bias-agnostic; the runtime Simulation is built
@@ -25,7 +38,14 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from openmm import LangevinMiddleIntegrator, Platform, XmlSerializer, app, unit
+from openmm import (
+    LangevinMiddleIntegrator,
+    MonteCarloBarostat,
+    Platform,
+    XmlSerializer,
+    app,
+    unit,
+)
 from pdbfixer import PDBFixer
 
 from mdpilot.adapters.system_spec import SystemSpec
@@ -37,6 +57,18 @@ _TEMPERATURE_K = 300.0
 _FRICTION_PER_PS = 1.0
 _TIMESTEP_FS = 2.0
 _NONBONDED_CUTOFF_NM = 1.0
+
+# Equilibration. Heating ramps from _HEAT_START_K to _TEMPERATURE_K in
+# _HEAT_STAGES equal steps under the production thermostat; NPT then relaxes
+# the density at 1 bar. Both stage lengths are constructor-overridable so the
+# test suite can run the pipeline without paying 200 ps of CPU MD.
+_HEAT_START_K = 50.0
+_HEAT_STAGES = 6
+_NVT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
+_NPT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
+_PRESSURE_BAR = 1.0
+_BAROSTAT_INTERVAL = 25     # steps between volume-move attempts
+_EQUIL_REPORT_INTERVAL = 500
 
 
 def save_checkpoint(simulation: app.Simulation, path: Path) -> Path:
@@ -52,6 +84,27 @@ def load_checkpoint(simulation: app.Simulation, path: Path) -> None:
     """Restore a checkpoint into an existing Simulation built from the same system."""
     with open(path, "rb") as f:
         simulation.context.loadCheckpoint(f.read())
+
+
+def _attach_equilibration_reporter(sim: app.Simulation, path: Path) -> None:
+    """Log temperature/density/volume through an equilibration stage.
+
+    An equilibration you cannot inspect is only marginally better than none —
+    this is the OpenMM counterpart of the `.log`/`.edr` pair GROMACS writes for
+    its `nvt`/`npt` stages, so both engines leave the same audit trail.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sim.reporters.append(
+        app.StateDataReporter(
+            str(path),
+            _EQUIL_REPORT_INTERVAL,
+            step=True,
+            temperature=True,
+            volume=True,
+            density=True,
+            potentialEnergy=True,
+        )
+    )
 
 
 def _prepare_plumed_force(plumed_input: str, work_dir: Path):
@@ -78,7 +131,13 @@ def _prepare_plumed_force(plumed_input: str, work_dir: Path):
 class OpenMMAdapter:
     """MDAdapter: direct OpenMM execution. System chosen by SystemSpec; the
     integrator/forcefield/box/ions choices are still hardcoded (AMBER14,
-    TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs).
+    TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs,
+    MonteCarloBarostat at 1 bar).
+
+    ``nvt_steps`` / ``npt_steps`` size the two equilibration stages. Set both
+    to 0 to skip equilibration entirely — only useful for tests that need the
+    setup pipeline without the MD cost; a run started that way is *not*
+    physically comparable to a production one.
 
     ``plumed_input`` (optional): a plumed.dat-format string. When set, a
     `PlumedForce` is attached to the runtime System on every ``start()``;
@@ -92,11 +151,15 @@ class OpenMMAdapter:
         seed: int = 42,
         spec: SystemSpec | None = None,
         plumed_input: str | None = None,
+        nvt_steps: int = _NVT_EQUIL_STEPS,
+        npt_steps: int = _NPT_EQUIL_STEPS,
     ):
         self._work_dir = Path(work_dir)
         self._seed = seed
         self._spec = spec if spec is not None else SystemSpec.trpcage()
         self._plumed_input = plumed_input
+        self._nvt_steps = nvt_steps
+        self._npt_steps = npt_steps
         self._pdb_path: Path | None = None
         self._sim: app.Simulation | None = None
         self._topology_path = self._work_dir / "topology.pdb"
@@ -158,10 +221,14 @@ class OpenMMAdapter:
         self, system_xml: Path, state_xml: Path, cached_topology: Path
     ) -> None:
         """First-time setup: build the vanilla (no-bias) System, minimize,
-        cache. The throwaway minimization Simulation is discarded; the
-        runtime Simulation is rebuilt from cache in
-        `_build_runtime_simulation` so the bias-injection path is the
-        same on first call and on every resume."""
+        equilibrate (NVT heating then NPT density relaxation), cache. The
+        throwaway setup Simulations are discarded; the runtime Simulation is
+        rebuilt from cache in `_build_runtime_simulation` so the
+        bias-injection path is the same on first call and on every resume.
+
+        What lands in the cache is the *post-equilibration* System (barostat
+        included, so production is NPT) and State (positions, velocities and
+        box vectors at 300 K / 1 bar)."""
         assert self._pdb_path is not None
         pdb = app.PDBFile(str(self._pdb_path))
         forcefield = app.ForceField(*_FORCEFIELD_FILES)
@@ -178,11 +245,31 @@ class OpenMMAdapter:
             nonbondedCutoff=_NONBONDED_CUTOFF_NM * unit.nanometer,
             constraints=app.HBonds,
         )
-        integrator = self._make_integrator()
         platform = Platform.getPlatformByName("CPU")
+        cache_dir = system_xml.parent
+
+        # NVT: minimize, seed velocities at the bottom of the ramp, heat.
+        integrator = self._make_integrator(_HEAT_START_K)
         sim = app.Simulation(modeller.topology, system, integrator, platform)
         sim.context.setPositions(modeller.positions)
         sim.minimizeEnergy()
+        sim.context.setVelocitiesToTemperature(
+            _HEAT_START_K * unit.kelvin, self._seed
+        )
+        _attach_equilibration_reporter(sim, cache_dir / "equilibration_nvt.csv")
+        self._heat_nvt(sim, integrator)
+
+        # NPT: the barostat is added to the System itself, so it survives
+        # serialization and production inherits it. Mutating `system` here is
+        # safe — the NVT context holds its own copy.
+        system.addForce(self._make_barostat())
+        sim = self._relax_npt(
+            modeller.topology,
+            system,
+            sim,
+            platform,
+            log_path=cache_dir / "equilibration_npt.csv",
+        )
 
         system_xml.write_text(XmlSerializer.serialize(system))
         state = sim.context.getState(
@@ -190,6 +277,56 @@ class OpenMMAdapter:
         )
         state_xml.write_text(XmlSerializer.serialize(state))
         self._write_topology(sim, cached_topology)
+
+    def _heat_nvt(
+        self, sim: app.Simulation, integrator: LangevinMiddleIntegrator
+    ) -> None:
+        """Ramp the thermostat from _HEAT_START_K to _TEMPERATURE_K in equal
+        stages. A staircase rather than a continuous ramp: the temperature can
+        only change between `step()` calls, and _HEAT_STAGES steps is fine
+        enough for a small solvated protein. No positional restraints — at
+        Trp-cage scale a staged ramp from a minimized structure is gentle
+        enough without them."""
+        if self._nvt_steps <= 0:
+            return
+        per_stage = max(self._nvt_steps // _HEAT_STAGES, 1)
+        for stage in range(1, _HEAT_STAGES + 1):
+            target = _HEAT_START_K + (_TEMPERATURE_K - _HEAT_START_K) * (
+                stage / _HEAT_STAGES
+            )
+            integrator.setTemperature(target * unit.kelvin)
+            sim.step(per_stage)
+
+    def _relax_npt(
+        self,
+        topology: app.Topology,
+        system: object,
+        nvt_sim: app.Simulation,
+        platform: Platform,
+        *,
+        log_path: Path,
+    ) -> app.Simulation:
+        """Rebuild the Simulation against the barostat-bearing System, carrying
+        positions/velocities/box across, and relax the density at 1 bar."""
+        state = nvt_sim.context.getState(
+            getPositions=True, getVelocities=True, enforcePeriodicBox=True
+        )
+        sim = app.Simulation(topology, system, self._make_integrator(), platform)
+        sim.context.setState(state)
+        _attach_equilibration_reporter(sim, log_path)
+        if self._npt_steps > 0:
+            sim.step(self._npt_steps)
+        return sim
+
+    def _make_barostat(self) -> MonteCarloBarostat:
+        barostat = MonteCarloBarostat(
+            _PRESSURE_BAR * unit.bar,
+            _TEMPERATURE_K * unit.kelvin,
+            _BAROSTAT_INTERVAL,
+        )
+        # Volume moves are Monte Carlo; seed them so runs stay reproducible.
+        barostat.setRandomNumberSeed(self._seed)
+        return barostat
 
     def _build_runtime_simulation(
         self, system_xml: Path, state_xml: Path, cached_topology: Path
@@ -208,9 +345,11 @@ class OpenMMAdapter:
         self._topology_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(cached_topology, self._topology_path)
 
-    def _make_integrator(self) -> LangevinMiddleIntegrator:
+    def _make_integrator(
+        self, temperature_k: float = _TEMPERATURE_K
+    ) -> LangevinMiddleIntegrator:
         integrator = LangevinMiddleIntegrator(
-            _TEMPERATURE_K * unit.kelvin,
+            temperature_k * unit.kelvin,
             _FRICTION_PER_PS / unit.picosecond,
             _TIMESTEP_FS * unit.femtosecond,
         )

@@ -16,6 +16,7 @@ import pytest
 
 from mdpilot.adapters.plumed_writer import DistanceCV, GyrationCV, TorsionCV
 from mdpilot.sampling.bias_designer import (
+    _DEFAULT_BIAS_FACTOR,
     _HEIGHT_KT_FRACTION,
     _KB_KJ_PER_MOL_K,
     _SIGMA_FLOOR,
@@ -133,3 +134,31 @@ def test_temperature_and_pace_overrides_flow_through(tmp_path: Path) -> None:
 
     assert bias.height == pytest.approx(_HEIGHT_KT_FRACTION * _KB_KJ_PER_MOL_K * 350.0)
     assert bias.pace == 200
+    # PLUMED needs TEMP to evaluate the well-tempered factor; it has to track
+    # the thermostat, not a hardcoded 300 K.
+    assert bias.temperature_k == pytest.approx(350.0)
+
+
+def test_designed_bias_is_well_tempered(tmp_path: Path) -> None:
+    top = _two_atom_top()
+    xyz = np.zeros((3, 2, 3))
+    xyz[:, 1, 0] = [1.0, 1.1, 0.9]
+    dcd, pdb = _write_traj(tmp_path, top, xyz)
+
+    bias = design_bias(DistanceCV(label="d", atoms=(0, 1)), dcd, pdb)
+
+    assert bias.bias_factor == pytest.approx(_DEFAULT_BIAS_FACTOR)
+    assert bias.bias_factor > 1.0
+    assert "BIASFACTOR=" in bias.render()
+    assert "TEMP=300" in bias.render()
+
+
+def test_bias_factor_override_flows_through(tmp_path: Path) -> None:
+    top = _two_atom_top()
+    xyz = np.zeros((3, 2, 3))
+    xyz[:, 1, 0] = [1.0, 1.1, 0.9]
+    dcd, pdb = _write_traj(tmp_path, top, xyz)
+
+    bias = design_bias(DistanceCV(label="d", atoms=(0, 1)), dcd, pdb, bias_factor=15.0)
+
+    assert bias.bias_factor == pytest.approx(15.0)

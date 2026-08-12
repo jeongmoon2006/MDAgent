@@ -48,9 +48,39 @@ def test_metad_renders_args_sigma_height_pace_file() -> None:
         sigma=(0.1,),
         height=1.2,
         pace=500,
+        bias_factor=10.0,
+        temperature_k=300.0,
     )
     rendered = bias.render()
-    assert rendered == "metad: METAD ARG=d1 SIGMA=0.1 HEIGHT=1.2 PACE=500 FILE=HILLS"
+    assert rendered == (
+        "metad: METAD ARG=d1 SIGMA=0.1 HEIGHT=1.2 PACE=500 "
+        "BIASFACTOR=10 TEMP=300 FILE=HILLS"
+    )
+
+
+def test_metad_is_always_well_tempered() -> None:
+    """Plain metaD (no BIASFACTOR) must not be constructible — it does not
+    converge to the FES. The default carries a finite gamma."""
+    bias = MetadynamicsBias(cv_labels=("d1",), sigma=(0.1,), height=1.0, pace=500)
+    assert "BIASFACTOR=" in bias.render()
+    assert bias.bias_factor > 1.0
+
+
+def test_metad_rejects_bias_factor_at_or_below_one() -> None:
+    for gamma in (1.0, 0.5, -3.0):
+        with pytest.raises(ValueError, match=r"bias_factor"):
+            MetadynamicsBias(
+                cv_labels=("d1",), sigma=(0.1,), height=1.0, pace=500,
+                bias_factor=gamma,
+            )
+
+
+def test_metad_rejects_nonpositive_temperature() -> None:
+    with pytest.raises(ValueError, match="temperature_k must be positive"):
+        MetadynamicsBias(
+            cv_labels=("d1",), sigma=(0.1,), height=1.0, pace=500,
+            temperature_k=0.0,
+        )
 
 
 def test_metad_supports_multiple_cvs() -> None:

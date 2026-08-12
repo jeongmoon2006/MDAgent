@@ -13,10 +13,18 @@ Sizing:
   should be narrower than the basin they fill; the /3 rule of thumb is standard.
   Floored to a small epsilon so a tightly-pinned CV (the exact case that
   triggers ``switch_to_metad``) cannot yield ``SIGMA=0``, which PLUMED rejects.
-- ``HEIGHT`` ≈ 0.5·k_B·T. Conservative: deep enough to climb out of a basin over
-  many deposits, shallow enough not to heat the system. Tied to the thermostat
-  temperature so it tracks the run conditions (~1.25 kJ/mol at 300 K).
+- ``HEIGHT`` ≈ 0.5·k_B·T — the *initial* hill height W0. Conservative: deep
+  enough to climb out of a basin over many deposits, shallow enough not to heat
+  the system. Tied to the thermostat temperature so it tracks the run conditions
+  (~1.25 kJ/mol at 300 K). Under well-tempering it decays from here.
 - ``PACE`` = 500 steps. Standard deposition stride; system-independent.
+- ``BIASFACTOR`` (γ) = 10. Well-tempered metadynamics: the deposition rate decays
+  as exp(-V/k_B ΔT) with ΔT = (γ-1)T, so the bias converges to -(1 - 1/γ)F(s)
+  rather than overfilling the basin indefinitely the way plain metaD does. γ=10
+  puts ΔT = 2700 K, i.e. the sampled distribution flattens barriers up to
+  ~γ·k_B·T ≈ 25 kJ/mol — the right order for the conformational barriers that
+  trigger a ``switch_to_metad`` in the first place. Larger γ explores more
+  aggressively but converges more slowly.
 
 Torsion CVs use circular statistics for the spread (an ordinary stddev is wrong
 across the ±π wrap); distance and gyration CVs use an ordinary stddev.
@@ -43,6 +51,7 @@ _DEFAULT_PACE = 500
 _SIGMA_FRACTION = 1.0 / 3.0
 _SIGMA_FLOOR = 1e-3  # CV units (nm or rad); keeps SIGMA>0 for a pinned CV
 _HEIGHT_KT_FRACTION = 0.5
+_DEFAULT_BIAS_FACTOR = 10.0
 
 
 def design_bias(
@@ -52,6 +61,7 @@ def design_bias(
     *,
     temperature_k: float = _DEFAULT_TEMPERATURE_K,
     pace: int = _DEFAULT_PACE,
+    bias_factor: float = _DEFAULT_BIAS_FACTOR,
 ) -> MetadynamicsBias:
     """Size a single-CV metadynamics bias from the CV's fluctuation on a run.
 
@@ -69,6 +79,8 @@ def design_bias(
         sigma=(sigma,),
         height=height,
         pace=pace,
+        bias_factor=bias_factor,
+        temperature_k=temperature_k,
     )
 
 

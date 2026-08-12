@@ -41,7 +41,8 @@
       "Bash(.venv/bin/pytest tests/unit -x -q)",
       "Bash(.venv/bin/pip show *)",
       "Bash(python -m pytest tests/unit/test_exploration.py -q)",
-      "Bash(git --no-pager diff --stat)"
+      "Bash(git --no-pager diff --stat)",
+      "Bash(gmx --version)"
     ]
   }
 }

@@ -1,11 +1,17 @@
 """GROMACS implementation of `MDAdapter`.
 
 Trp-cage in TIP3P + 0.15 M NaCl, amber99sb-ildn force field, stochastic-
-dynamics integrator (Langevin equivalent) at 300 K. The system-level
-parameters intentionally mirror those in `openmm_adapter` so that the
-same convergence rubric can be applied to trajectories produced by
-either engine; small force-field-level differences (amber99sb-ildn vs
-amber14-all) are accepted.
+dynamics integrator (Langevin equivalent) at 300 K, C-rescale barostat at
+1 bar. The system-level parameters intentionally mirror those in
+`openmm_adapter` so that the same convergence rubric can be applied to
+trajectories produced by either engine; small force-field-level differences
+(amber99sb-ildn vs amber14-all) are accepted.
+
+Setup ends with NVT staged heating followed by NPT density relaxation, so
+production starts from an equilibrated state at 300 K / 1 bar rather than
+from the minimized structure. This mirrors the OpenMM adapter stage for
+stage — the two engines were previously inequivalent at t=0, GROMACS
+generating velocities via `gen-vel` while OpenMM started from rest.
 
 Subprocess pattern: every `gmx` invocation goes through `_run_gmx()`,
 which captures stderr and raises a RuntimeError with the tail of the
@@ -37,6 +43,17 @@ _TEMPERATURE_K = 300.0
 _TAU_T_PS = 1.0          # inverse friction; 1/friction_per_ps with friction = 1 ps^-1
 _TIMESTEP_PS = 0.002     # 2 fs
 _CUTOFF_NM = 1.0
+_PRESSURE_BAR = 1.0
+_TAU_P_PS = 2.0
+_COMPRESSIBILITY = 4.5e-5   # bar^-1, water
+# Equilibration mirrors the OpenMM adapter: 50 K -> 300 K ramp under the same
+# stochastic (sd) thermostat, then NPT density relaxation at 1 bar. GROMACS
+# interpolates the anneal linearly between points where OpenMM steps a
+# staircase; the endpoint state is what matters and both cover the same ramp
+# over the same number of steps.
+_HEAT_START_K = 50.0
+_NVT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
+_NPT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
 _EM_MAX_STEPS = 50_000
 _EM_TOLERANCE = 100.0
 _GMX_TIMEOUT_SECONDS = 1800.0
@@ -70,8 +87,90 @@ rvdw          = {_CUTOFF_NM}
 pbc           = xyz
 """
 
+_NVT_MDP_TEMPLATE = f"""\
+; equilibration stage 1 — staged heating, NVT, Langevin (sd) integrator
+integrator           = sd
+dt                   = {_TIMESTEP_PS}
+nsteps               = {{nsteps}}
+
+nstxout              = 0
+nstvout              = 0
+nstfout              = 0
+nstlog               = 500
+nstenergy            = 500
+
+tc-grps              = System
+tau-t                = {_TAU_T_PS}
+ref-t                = {_TEMPERATURE_K}
+
+; ramp {_HEAT_START_K:g} K -> {_TEMPERATURE_K:g} K across the whole stage
+annealing            = single
+annealing-npoints    = 2
+annealing-time       = 0 {{anneal_ps}}
+annealing-temp       = {_HEAT_START_K} {_TEMPERATURE_K}
+
+constraints          = h-bonds
+constraint-algorithm = LINCS
+lincs-iter           = 1
+lincs-order          = 4
+
+cutoff-scheme        = Verlet
+nstlist              = 10
+ns_type              = grid
+coulombtype          = PME
+rcoulomb             = {_CUTOFF_NM}
+rvdw                 = {_CUTOFF_NM}
+pbc                  = xyz
+
+gen-vel              = yes
+gen-temp             = {_HEAT_START_K}
+gen-seed             = {{seed}}
+ld-seed              = {{seed}}
+continuation         = no
+"""
+
+_NPT_MDP_TEMPLATE = f"""\
+; equilibration stage 2 — density relaxation, NPT, C-rescale barostat
+integrator           = sd
+dt                   = {_TIMESTEP_PS}
+nsteps               = {{nsteps}}
+
+nstxout              = 0
+nstvout              = 0
+nstfout              = 0
+nstlog               = 500
+nstenergy            = 500
+
+tc-grps              = System
+tau-t                = {_TAU_T_PS}
+ref-t                = {_TEMPERATURE_K}
+
+pcoupl               = C-rescale
+pcoupltype           = isotropic
+tau-p                = {_TAU_P_PS}
+ref-p                = {_PRESSURE_BAR}
+compressibility      = {_COMPRESSIBILITY}
+
+constraints          = h-bonds
+constraint-algorithm = LINCS
+lincs-iter           = 1
+lincs-order          = 4
+
+cutoff-scheme        = Verlet
+nstlist              = 10
+ns_type              = grid
+coulombtype          = PME
+rcoulomb             = {_CUTOFF_NM}
+rvdw                 = {_CUTOFF_NM}
+pbc                  = xyz
+
+gen-vel              = no
+ld-seed              = {{seed}}
+continuation         = yes
+"""
+
 _MD_MDP_TEMPLATE = f"""\
-; production MD, NVT, Langevin (sd) integrator
+; production MD, NPT, Langevin (sd) integrator + C-rescale barostat
 integrator           = sd
 dt                   = {_TIMESTEP_PS}
 nsteps               = {{nsteps}}
@@ -87,6 +186,12 @@ nstfout              = 0
 tc-grps              = System
 tau-t                = {_TAU_T_PS}
 ref-t                = {_TEMPERATURE_K}
+
+pcoupl               = C-rescale
+pcoupltype           = isotropic
+tau-p                = {_TAU_P_PS}
+ref-p                = {_PRESSURE_BAR}
+compressibility      = {_COMPRESSIBILITY}
 
 constraints          = h-bonds
 constraint-algorithm = LINCS
@@ -136,14 +241,27 @@ def _run_gmx(
 class GROMACSAdapter:
     """MDAdapter: subprocess-driven GROMACS execution. System chosen by
     SystemSpec; the forcefield/water/integrator choices stay hardcoded
-    (amber99sb-ildn, TIP3P, sd at 300 K, 2 fs)."""
+    (amber99sb-ildn, TIP3P, sd at 300 K, 2 fs, C-rescale barostat at 1 bar).
+
+    ``nvt_steps`` / ``npt_steps`` size the two equilibration stages. Setting
+    *both* to 0 skips equilibration entirely and falls back to the legacy
+    cold-start path (first production round generates its own velocities) —
+    only useful for tests that need the setup pipeline without the MD cost."""
 
     def __init__(
-        self, *, work_dir: Path, seed: int = 42, spec: SystemSpec | None = None
+        self,
+        *,
+        work_dir: Path,
+        seed: int = 42,
+        spec: SystemSpec | None = None,
+        nvt_steps: int = _NVT_EQUIL_STEPS,
+        npt_steps: int = _NPT_EQUIL_STEPS,
     ):
         self._work_dir = Path(work_dir)
         self._seed = seed
         self._spec = spec if spec is not None else SystemSpec.trpcage()
+        self._nvt_steps = nvt_steps
+        self._npt_steps = npt_steps
         self._setup_dir = self._work_dir / "setup"
         self._inputs_dir = self._work_dir / "inputs"
         self._topology_path = self._work_dir / "topology.pdb"
@@ -193,21 +311,24 @@ class GROMACSAdapter:
         return self._spec.structure_path.stem
 
     def start(self) -> None:
-        """Run pdb2gmx → editconf → solvate → genion → minimize. Write topology.pdb.
+        """Run pdb2gmx → editconf → solvate → genion → minimize → NVT → NPT.
+        Write topology.pdb.
 
-        Idempotent (F2): if the post-minimization outputs already exist in
+        Idempotent (F2): if the post-equilibration outputs already exist in
         `setup/`, skip the whole pipeline and just rebind to them. This is
         what makes resume cheap — the per-restart cost drops from
-        "rerun minimization" to "stat a few files."
+        "rerun minimization and equilibration" to "stat a few files."
         """
         if self._pdb_path is None:
             raise RuntimeError("GROMACSAdapter.start() called before prepare()")
         self._setup_dir.mkdir(parents=True, exist_ok=True)
 
+        final = self._final_setup_tag()
         if self._is_setup_cached():
             self._top_path = self._setup_dir / "topol.top"
-            self._last_gro = self._setup_dir / "em.gro"
-            self._last_cpt = None
+            self._last_gro = self._setup_dir / f"{final}.gro"
+            cpt = self._setup_dir / f"{final}.cpt"
+            self._last_cpt = cpt if cpt.exists() else None
             self._started = True
             return
 
@@ -283,9 +404,15 @@ class GROMACSAdapter:
             cwd=self._setup_dir,
         )
 
+        self._equilibrate()
+
         self._top_path = self._setup_dir / "topol.top"
-        self._last_gro = self._setup_dir / "em.gro"
-        self._last_cpt = None  # no checkpoint yet; first MD round seeds velocities itself
+        self._last_gro = self._setup_dir / f"{final}.gro"
+        cpt = self._setup_dir / f"{final}.cpt"
+        # After equilibration the NPT checkpoint carries velocities forward, so
+        # production never cold-starts. Only the equilibration-disabled path
+        # leaves this None.
+        self._last_cpt = cpt if cpt.exists() else None
 
         # Topology snapshot for diagnostics: convert em.gro to a PDB at the canonical path
         self._topology_path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,12 +449,11 @@ class GROMACSAdapter:
             )
         )
 
-        # On the very first round, no prior checkpoint exists. grompp without -t will
-        # generate fresh velocities from the structure, which we don't want (gen-vel=no
-        # in mdp). For round 0 we generate velocities once via gen-vel=yes; for
-        # subsequent rounds the cpt carries them forward. We side-step this by
-        # always running grompp without -t on the first round but injecting a
-        # temporary gen-vel=yes mdp override.
+        # Legacy cold-start path, reachable only when equilibration is disabled
+        # (both stage lengths 0). Normally `start()` leaves an NPT checkpoint
+        # behind and velocities come from there. Without a cpt, grompp would
+        # start from zero velocities (gen-vel=no in the mdp), so this branch
+        # injects a temporary gen-vel=yes override for that one round.
         grompp_args = [
             "grompp",
             "-f", mdp_path.name,
@@ -391,12 +517,67 @@ class GROMACSAdapter:
         existing = sorted(self._setup_dir.glob("round_*.tpr"))
         return f"{len(existing) + 1:03d}"
 
+    def _equilibrate(self) -> None:
+        """NVT staged heating then NPT density relaxation, starting from em.gro.
+
+        All-or-nothing: with both stage lengths at 0 this is a no-op and the
+        first production round cold-starts its own velocities (legacy path).
+        Running only one stage is deliberately not supported — an NPT stage
+        with no preceding NVT checkpoint would start from zero velocities,
+        which is the exact defect equilibration exists to remove.
+        """
+        if self._nvt_steps <= 0 and self._npt_steps <= 0:
+            return
+        nvt_steps = max(self._nvt_steps, 1)
+        npt_steps = max(self._npt_steps, 1)
+
+        (self._setup_dir / "nvt.mdp").write_text(
+            _NVT_MDP_TEMPLATE.format(
+                nsteps=nvt_steps,
+                anneal_ps=f"{nvt_steps * _TIMESTEP_PS:g}",
+                seed=self._seed,
+            )
+        )
+        _run_gmx(
+            "grompp",
+            "-f", "nvt.mdp",
+            "-c", "em.gro",
+            "-p", "topol.top",
+            "-o", "nvt.tpr",
+            "-maxwarn", "1",
+            cwd=self._setup_dir,
+        )
+        _run_gmx("mdrun", "-deffnm", "nvt", "-ntmpi", "1", cwd=self._setup_dir)
+
+        (self._setup_dir / "npt.mdp").write_text(
+            _NPT_MDP_TEMPLATE.format(nsteps=npt_steps, seed=self._seed)
+        )
+        # -t carries velocities and RNG state out of the heating stage.
+        _run_gmx(
+            "grompp",
+            "-f", "npt.mdp",
+            "-c", "nvt.gro",
+            "-t", "nvt.cpt",
+            "-p", "topol.top",
+            "-o", "npt.tpr",
+            "-maxwarn", "1",
+            cwd=self._setup_dir,
+        )
+        _run_gmx("mdrun", "-deffnm", "npt", "-ntmpi", "1", cwd=self._setup_dir)
+
+    def _final_setup_tag(self) -> str:
+        """Basename of the last setup stage — the NPT equilibration, or the
+        minimization when equilibration is disabled."""
+        if self._nvt_steps <= 0 and self._npt_steps <= 0:
+            return "em"
+        return "npt"
+
     def _is_setup_cached(self) -> bool:
         return all(
             p.exists()
             for p in (
                 self._setup_dir / "topol.top",
-                self._setup_dir / "em.gro",
+                self._setup_dir / f"{self._final_setup_tag()}.gro",
                 self._topology_path,
             )
         )

@@ -76,17 +76,28 @@ CV = Union[DistanceCV, TorsionCV, GyrationCV]
 
 @dataclass(frozen=True)
 class MetadynamicsBias:
-    """Metadynamics on one or more CVs.
+    """Well-tempered metadynamics on one or more CVs.
 
-    SIGMA is the Gaussian width (one per CV). HEIGHT and PACE control
-    deposition. HILLS is the file PLUMED writes deposited Gaussians to —
-    `plumed sum_hills` later integrates this into a free-energy surface.
+    SIGMA is the Gaussian width (one per CV). HEIGHT is the *initial* hill
+    height and PACE the deposition stride. HILLS is the file PLUMED writes
+    deposited Gaussians to — `plumed sum_hills` later integrates this into a
+    free-energy surface.
+
+    Well-tempered only: `bias_factor` (γ, PLUMED's BIASFACTOR) makes the
+    deposition rate decay as exp(-V(s,t)/k_B ΔT) with ΔT = (γ-1)T, so the
+    bias converges to -(1 - 1/γ)F(s) instead of overfilling the basin the
+    way plain metadynamics does. γ must exceed 1; γ → ∞ recovers plain
+    metaD, which is why it is not constructible here. PLUMED needs TEMP to
+    evaluate the tempering factor, so `temperature_k` must match the
+    thermostat the engine is running.
     """
 
     cv_labels: tuple[str, ...]
     sigma: tuple[float, ...]
-    height: float            # kJ/mol
+    height: float            # kJ/mol, initial hill height W0
     pace: int                # steps between deposits
+    bias_factor: float = 10.0        # γ, dimensionless; must be > 1
+    temperature_k: float = 300.0     # must match the thermostat
     hills_file: str = "HILLS"
     bias_label: str = "metad"
 
@@ -102,6 +113,15 @@ class MetadynamicsBias:
             raise ValueError(f"metaD: height must be positive (got {self.height})")
         if self.pace <= 0:
             raise ValueError(f"metaD: pace must be positive (got {self.pace})")
+        if self.bias_factor <= 1.0:
+            raise ValueError(
+                f"metaD: bias_factor (γ) must be > 1 for well-tempered "
+                f"metadynamics (got {self.bias_factor})"
+            )
+        if self.temperature_k <= 0:
+            raise ValueError(
+                f"metaD: temperature_k must be positive (got {self.temperature_k})"
+            )
 
     def render(self) -> str:
         args = ",".join(self.cv_labels)
@@ -109,6 +129,7 @@ class MetadynamicsBias:
         return (
             f"{self.bias_label}: METAD ARG={args} "
             f"SIGMA={sigmas} HEIGHT={self.height:g} PACE={self.pace} "
+            f"BIASFACTOR={self.bias_factor:g} TEMP={self.temperature_k:g} "
             f"FILE={self.hills_file}"
         )
 
