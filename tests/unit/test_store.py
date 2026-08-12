@@ -266,3 +266,102 @@ def test_pre_m4_db_is_migrated_to_metad_aware_schema(tmp_path: Path) -> None:
     )
     rows = store.list_rounds(tmp_path)
     assert rows[-1].decision == "switch_to_metad"
+
+
+# ---------- M4 step 4: plumed_dat_path column (biased-round marker) ----------
+
+def test_biased_round_persists_plumed_dat_path(tmp_path: Path) -> None:
+    store.init_campaign(tmp_path, _config())
+    store.append_round(
+        tmp_path,
+        round_index=1,
+        n_steps=25_000,
+        dcd_path=tmp_path / "rounds/round_001.dcd",
+        checkpoint_path=tmp_path / "rounds/round_001.chk",
+        report=_report(n_frames=50, ess=80.0),
+        decision="extend",
+        reason="biased run, still filling",
+        extra_ns=0.5,
+        plumed_dat_path=tmp_path / "plumed.dat",
+    )
+    rows = store.list_rounds(tmp_path)
+    assert rows[0].plumed_dat_path == tmp_path / "plumed.dat"
+
+
+def test_vanilla_round_has_null_plumed_dat_path(tmp_path: Path) -> None:
+    store.init_campaign(tmp_path, _config())
+    store.append_round(
+        tmp_path,
+        round_index=1,
+        n_steps=25_000,
+        dcd_path=tmp_path / "r1.dcd",
+        checkpoint_path=None,
+        report=_report(n_frames=50, ess=3.0),
+        decision="extend",
+        reason="vanilla",
+        extra_ns=0.5,
+    )
+    assert store.list_rounds(tmp_path)[0].plumed_dat_path is None
+
+
+def test_pre_plumed_db_gains_column_and_keeps_rows(tmp_path: Path) -> None:
+    """An M4-step-3 DB (has metad_proposal_json, no plumed_dat_path) is migrated
+    in place: the column is added, existing rows read back with a NULL path, and
+    a new biased round persists its path."""
+    import sqlite3
+
+    import json as _json
+
+    pre_plumed_schema = """
+    CREATE TABLE IF NOT EXISTS campaign (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        config_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS rounds (
+        round_index INTEGER PRIMARY KEY,
+        n_steps INTEGER NOT NULL,
+        dcd_path TEXT NOT NULL,
+        checkpoint_path TEXT,
+        report_json TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('extend', 'stop', 'switch_to_metad')),
+        reason TEXT NOT NULL,
+        extra_ns REAL,
+        metad_proposal_json TEXT,
+        created_at TEXT NOT NULL
+    );
+    """
+    db = store.db_path(tmp_path)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db)) as conn:
+        conn.executescript(pre_plumed_schema)
+        conn.execute(
+            """
+            INSERT INTO rounds (round_index, n_steps, dcd_path, checkpoint_path,
+                report_json, decision, reason, extra_ns, metad_proposal_json, created_at)
+            VALUES (1, 1000, 'r1.dcd', NULL, '{}', 'extend', 'x', 0.5, NULL, '2026-01-01')
+            """
+        )
+        conn.execute(
+            "INSERT INTO campaign (id, config_json, created_at) VALUES (1, ?, ?)",
+            (_json.dumps(_config(), sort_keys=True), "2026-01-01"),
+        )
+
+    store.init_campaign(tmp_path, _config())  # triggers migration
+
+    rows = store.list_rounds(tmp_path)
+    assert len(rows) == 1 and rows[0].plumed_dat_path is None
+
+    store.append_round(
+        tmp_path,
+        round_index=2,
+        n_steps=1000,
+        dcd_path=tmp_path / "r2.dcd",
+        checkpoint_path=None,
+        report=_report(n_frames=50, ess=90.0),
+        decision="extend",
+        reason="biased",
+        extra_ns=0.5,
+        plumed_dat_path=tmp_path / "plumed.dat",
+    )
+    assert store.list_rounds(tmp_path)[-1].plumed_dat_path == tmp_path / "plumed.dat"

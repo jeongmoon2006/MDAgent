@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     reason TEXT NOT NULL,
     extra_ns REAL,
     metad_proposal_json TEXT,
+    plumed_dat_path TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -71,6 +72,7 @@ class RoundRow:
     reason: str
     extra_ns: float | None
     metad_proposal: dict[str, Any] | None = None
+    plumed_dat_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,7 @@ def init_campaign(work_dir: Path, config: dict[str, Any]) -> None:
     with _connect(work_dir) as conn:
         conn.executescript(_SCHEMA)
         _migrate_rounds_for_metad(conn)
+        _migrate_rounds_for_plumed(conn)
         row = conn.execute("SELECT config_json FROM campaign WHERE id = 1").fetchone()
         if row is None:
             conn.execute(
@@ -143,12 +146,18 @@ def append_round(
     reason: str,
     extra_ns: float | None,
     metad_proposal: dict[str, Any] | None = None,
+    plumed_dat_path: Path | None = None,
 ) -> None:
     """Insert one completed round. Round_index must be unique within a campaign.
 
     ``metad_proposal`` is the structured CV proposal when ``decision`` is
     ``switch_to_metad`` (and None otherwise); persisted as a JSON blob so the
     loop can reconstruct it on resume.
+
+    ``plumed_dat_path`` marks a round run under a metadynamics bias: NULL for a
+    vanilla round, the path to the plumed.dat that drove it otherwise. It is
+    both the phase marker and the audit artifact — reading it back recovers the
+    exact bias config for that round.
     """
     with _connect(work_dir) as conn:
         conn.execute(
@@ -156,8 +165,8 @@ def append_round(
             INSERT INTO rounds (
                 round_index, n_steps, dcd_path, checkpoint_path,
                 report_json, decision, reason, extra_ns,
-                metad_proposal_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metad_proposal_json, plumed_dat_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 round_index,
@@ -169,6 +178,7 @@ def append_round(
                 reason,
                 extra_ns,
                 json.dumps(metad_proposal, sort_keys=True) if metad_proposal else None,
+                str(plumed_dat_path) if plumed_dat_path else None,
                 _now_iso(),
             ),
         )
@@ -182,7 +192,8 @@ def list_rounds(work_dir: Path) -> list[RoundRow]:
         cursor = conn.execute(
             """
             SELECT round_index, n_steps, dcd_path, checkpoint_path,
-                   report_json, decision, reason, extra_ns, metad_proposal_json
+                   report_json, decision, reason, extra_ns, metad_proposal_json,
+                   plumed_dat_path
             FROM rounds ORDER BY round_index ASC
             """
         )
@@ -197,6 +208,7 @@ def list_rounds(work_dir: Path) -> list[RoundRow]:
                 reason=r[6],
                 extra_ns=r[7],
                 metad_proposal=json.loads(r[8]) if r[8] else None,
+                plumed_dat_path=Path(r[9]) if r[9] else None,
             )
             for r in cursor.fetchall()
         ]
@@ -273,6 +285,21 @@ def _migrate_rounds_for_metad(conn: sqlite3.Connection) -> None:
         COMMIT;
         """
     )
+
+
+def _migrate_rounds_for_plumed(conn: sqlite3.Connection) -> None:
+    """Add the nullable ``plumed_dat_path`` column to pre-pivot ``rounds`` tables.
+
+    Unlike the metaD migration this changes no CHECK constraint, so a plain
+    ``ALTER TABLE ... ADD COLUMN`` suffices — no rename-create-copy-drop.
+    Idempotent: a no-op once the column exists. Runs after
+    ``_migrate_rounds_for_metad`` so it also covers the table that migration
+    freshly recreated (which lacks the column).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(rounds)").fetchall()}
+    if not cols or "plumed_dat_path" in cols:
+        return
+    conn.execute("ALTER TABLE rounds ADD COLUMN plumed_dat_path TEXT")
 
 
 def _now_iso() -> str:
