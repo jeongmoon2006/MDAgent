@@ -23,7 +23,18 @@ _MIN_FRAMES_FOR_STATISTICS = 8
 
 
 def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
-    """Load a DCD, compute CA-RMSD-to-first-frame, summarize convergence."""
+    """Load a trajectory, compute CA-RMSD to the campaign reference, summarize.
+
+    The reference is the campaign's topology structure, *not* this round's
+    first frame. A per-round reference makes every round a different
+    observable: round 3 would measure displacement from wherever round 3
+    happened to start, while the scientist is shown `ess` and
+    `plateau_reached` across rounds as if they described one time series. A
+    campaign drifting steadily away from its starting structure would then
+    show a clean plateau in every round and stop. `top_path` is written once
+    by the adapter's `start()` (post-equilibration) and is constant for the
+    life of the campaign, so RMSD against it is comparable across rounds.
+    """
     dcd_path = Path(dcd_path)
     top_path = Path(top_path)
     traj = md.load(str(dcd_path), top=str(top_path))
@@ -31,7 +42,9 @@ def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
     if ca.size == 0:
         raise ValueError("no protein CA atoms found in topology")
     protein = traj.atom_slice(ca)
-    rmsd_angstrom = md.rmsd(protein, protein, frame=0) * 10.0  # nm -> A
+    # Same `ca` indices are valid for both: traj was loaded with this topology.
+    reference = md.load(str(top_path)).atom_slice(ca)
+    rmsd_angstrom = md.rmsd(protein, reference, frame=0) * 10.0  # nm -> A
 
     if traj.n_frames > 1:
         frame_dt_ps = float(np.diff(traj.time).mean())
@@ -42,7 +55,7 @@ def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
 
     return _summarize(
         observable=rmsd_angstrom,
-        observable_name="rmsd_ca_to_first_angstrom",
+        observable_name="rmsd_ca_to_reference_angstrom",
         dcd_path=dcd_path,
         top_path=top_path,
         frame_dt_ps=frame_dt_ps,

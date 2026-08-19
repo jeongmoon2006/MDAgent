@@ -55,7 +55,7 @@ def test_chignolin_vanilla_single_round(tmp_path: Path) -> None:
 
     # Diagnostic report ran on a non-Trp-cage system
     report = round_0.report
-    assert report["observable_name"] == "rmsd_ca_to_first_angstrom"
+    assert report["observable_name"] == "rmsd_ca_to_reference_angstrom"
     assert report["n_frames"] > 0
 
     # Topology has chignolin's protein atoms (10 residues, ~150 heavy + H)

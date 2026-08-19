@@ -23,7 +23,7 @@ def _config_kwargs() -> dict:
     )
 
 
-def _full_config(cfg: dict) -> dict:
+def _full_config(cfg: dict, *, engine: str = "OpenMMAdapter") -> dict:
     """The full config dict that run_campaign will compute and write."""
     return {
         "seed": cfg["seed"],
@@ -31,6 +31,8 @@ def _full_config(cfg: dict) -> dict:
         "report_interval_steps": cfg["report_interval_steps"],
         "equilibration_steps": cfg["equilibration_steps"],
         "system_spec": SystemSpec.trpcage().to_dict(),
+        "engine": engine,
+        "task_expectation": None,
     }
 
 
@@ -93,3 +95,40 @@ def test_system_spec_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="different config"):
         run_campaign(work_dir=tmp_path, max_rounds=1, adapter=chignolin_adapter, **cfg)
     assert not (tmp_path / "inputs").exists()
+
+
+def test_task_expectation_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
+    """`task_expectation` is the only input gating switch_to_metad, so resuming
+    without it (or with a different one) must raise rather than silently revert
+    an enhanced-sampling campaign to a plain convergence task."""
+    import pytest
+
+    cfg = _config_kwargs()
+    store.init_campaign(
+        tmp_path,
+        {**_full_config(cfg), "task_expectation": "expect a fold/unfold transition"},
+    )
+
+    with pytest.raises(ValueError, match="different config"):
+        run_campaign(work_dir=tmp_path, max_rounds=1, **cfg)
+    assert not (tmp_path / "inputs").exists()
+
+
+def test_engine_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
+    """Checkpoints are engine-specific binary formats. Swapping adapters on
+    resume must fail the config guard, not feed an OpenMM .chk to `grompp -t`."""
+    import pytest
+
+    from mdpilot.adapters.gromacs_adapter import GROMACSAdapter
+
+    cfg = _config_kwargs()
+    store.init_campaign(tmp_path, _full_config(cfg))  # engine=OpenMMAdapter
+
+    with pytest.raises(ValueError, match="different config"):
+        run_campaign(
+            work_dir=tmp_path,
+            adapter=GROMACSAdapter(work_dir=tmp_path, seed=cfg["seed"]),
+            max_rounds=1,
+            **cfg,
+        )
+    assert not (tmp_path / "setup").exists()

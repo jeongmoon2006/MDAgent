@@ -121,6 +121,8 @@ def _full_config(tmp_path: Path) -> dict:
         "report_interval_steps": 50,
         "equilibration_steps": 0,
         "system_spec": SystemSpec.trpcage().to_dict(),
+        "engine": "_FakeAdapter",
+        "task_expectation": None,
     }
 
 
@@ -236,3 +238,94 @@ def test_second_switch_in_metad_phase_terminates(tmp_path: Path, monkeypatch) ->
     ]
     # The second (metaD-phase) switch round is marked biased.
     assert result.rounds[1].plumed_dat_path == tmp_path / "plumed.dat"
+
+
+def test_resume_after_second_switch_stays_terminal(tmp_path: Path, monkeypatch) -> None:
+    """A switch_to_metad recorded on an already-biased round is terminal on
+    resume too, not just in-process.
+
+    The stored row carries decision='switch_to_metad' *and* a plumed_dat_path.
+    Without the phase check, resume would take the pivot branch and rebuild the
+    bias from that biased round's trajectory — sizing SIGMA off a spread the
+    bias itself produced, which is exactly the second pivot the live loop
+    declined to perform.
+    """
+    store.init_campaign(tmp_path, _full_config(tmp_path))
+    plumed_dat = tmp_path / "plumed.dat"
+    plumed_dat.write_text("PLUMED-TEXT\n")
+    store.append_round(
+        tmp_path,
+        round_index=1,
+        n_steps=100,
+        dcd_path=tmp_path / "rounds/round_001.dcd",
+        checkpoint_path=tmp_path / "rounds/round_001.chk",
+        report=dict(_REPORT),
+        decision="switch_to_metad",
+        reason="second switch, already biased",
+        extra_ns=None,
+        metad_proposal=_proposal().to_dict(),
+        plumed_dat_path=plumed_dat,
+    )
+
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    result = run_campaign(
+        work_dir=tmp_path, adapter=base, max_rounds=5, **_run_kwargs()
+    )
+
+    assert result.stop_reason == "switch_to_metad_requested"
+    assert [r.index for r in result.rounds] == [1]
+    # Nothing ran: no engine work, no rebuilt bias.
+    assert base.run_calls == []
+    assert base.started is False
+
+
+def test_default_biased_factory_refuses_a_non_openmm_engine(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Without an injected factory, a pivot from a non-OpenMM adapter raises.
+
+    The CV's atom indices were resolved against the vanilla engine's topology.
+    Silently building an OpenMM biased adapter would bias whichever atoms sat
+    at those indices in a differently-solvated, differently-ordered system.
+    """
+    _stub_collaborators(monkeypatch, [_switch()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+
+    with pytest.raises(NotImplementedError, match="_FakeAdapter"):
+        run_campaign(work_dir=tmp_path, adapter=base, max_rounds=5, **_run_kwargs())
+
+
+def test_resumed_extend_round_is_clamped_to_max_extra_ns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """SQLite stores the model's raw extra_ns, so the clamp has to be re-applied
+    on read. Applying it only in the live loop let a resumed campaign run a
+    longer round than the uninterrupted one would have.
+    """
+    store.init_campaign(tmp_path, _full_config(tmp_path))
+    store.append_round(
+        tmp_path,
+        round_index=1,
+        n_steps=100,
+        dcd_path=tmp_path / "rounds/round_001.dcd",
+        checkpoint_path=tmp_path / "rounds/round_001.chk",
+        report=dict(_REPORT),
+        decision="extend",
+        reason="far from converged",
+        extra_ns=20.0,  # well past any sane max_extra_ns
+    )
+    (tmp_path / "rounds").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "rounds/round_001.chk").write_text("CHK")
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        max_rounds=2,
+        max_extra_ns=2.0,
+        **_run_kwargs(),
+    )
+
+    # 2.0 ns at 2 fs = 1_000_000 steps, not the 10_000_000 the row asked for.
+    assert base.run_calls == [1_000_000]

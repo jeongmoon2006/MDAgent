@@ -26,9 +26,9 @@ integrator:
   constraints: HBonds
 
 observable:
-  name: rmsd_ca_to_first_angstrom
+  name: rmsd_ca_to_reference_angstrom
   selection: "protein and name CA"
-  reference: first_frame
+  reference: campaign_topology   # post-equilibration structure, constant across rounds
 
 diagnostics:
   - block_averaging

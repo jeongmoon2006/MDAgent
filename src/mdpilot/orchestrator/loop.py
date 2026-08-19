@@ -40,6 +40,7 @@ import numpy as np
 from mdpilot.adapters.base import MDAdapter
 from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.adapters.plumed_writer import PlumedInput
+from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.diagnostics.report import make_report
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
@@ -122,13 +123,9 @@ def run_campaign(
     base_spec = adapter.spec
 
     if biased_adapter_factory is None:
-        def biased_adapter_factory(plumed_input: str) -> MDAdapter:
-            return OpenMMAdapter(
-                work_dir=work_dir,
-                seed=seed,
-                spec=base_spec,
-                plumed_input=plumed_input,
-            )
+        biased_adapter_factory = _default_biased_factory(
+            adapter, work_dir=work_dir, seed=seed, spec=base_spec
+        )
 
     config = {
         "seed": seed,
@@ -136,6 +133,14 @@ def run_campaign(
         "report_interval_steps": report_interval_steps,
         "equilibration_steps": equilibration_steps,
         "system_spec": base_spec.to_dict(),
+        # Engine identity is physics-bound: checkpoints are engine-specific
+        # binary formats, and a swapped adapter would feed an OpenMM .chk to
+        # `grompp -t` (or the reverse) instead of failing the config guard.
+        "engine": type(adapter).__name__,
+        # task_expectation is the only input gating `switch_to_metad`. Resuming
+        # without it silently reverts an enhanced-sampling campaign to a plain
+        # convergence task, so it locks with the rest.
+        "task_expectation": task_expectation,
     }
     store.init_campaign(work_dir, config)
     prior_rows = store.list_rounds(work_dir)
@@ -143,6 +148,18 @@ def run_campaign(
 
     if rounds and rounds[-1].decision.decision == "stop":
         return CampaignResult(work_dir, tuple(rounds), "scientist_said_stop")
+
+    if (
+        rounds
+        and rounds[-1].decision.decision == "switch_to_metad"
+        and rounds[-1].plumed_dat_path is not None
+    ):
+        # Second pivot from an already-biased round: the in-process loop below
+        # refuses this and ends cleanly for human inspection. Re-invoking must
+        # not quietly perform the pivot the live run declined — the resume
+        # branches would otherwise rebuild a bias from a *biased* trajectory's
+        # spread, which is not the width anything was measured against.
+        return CampaignResult(work_dir, tuple(rounds), "switch_to_metad_requested")
 
     # Build the vanilla engine state up front. This is idempotent and cheap on
     # resume (rebuilds from cache), and it guarantees the cached System +
@@ -191,13 +208,13 @@ def run_campaign(
         in_metad = True
         current_plumed_dat = last.plumed_dat_path
         start_round = last.round_index + 1
-        n_steps = max(int((last.extra_ns or 0.5) * _STEPS_PER_NS), 1)
+        n_steps = _extend_steps(last.extra_ns, max_extra_ns)
     else:
         # Vanilla resume.
         _require_checkpoint(last)
         adapter.load_checkpoint(last.checkpoint_path)  # type: ignore[arg-type]
         start_round = last.round_index + 1
-        n_steps = max(int((last.extra_ns or 0.5) * _STEPS_PER_NS), 1)
+        n_steps = _extend_steps(last.extra_ns, max_extra_ns)
 
     ledger_notes: list[store.LedgerNote] = list(store.list_ledger_notes(work_dir))
 
@@ -209,6 +226,12 @@ def run_campaign(
             report_interval_steps=report_interval_steps,
         )
         report = make_report(dcd, adapter.topology_path)
+        # Checkpoint before `decide()`, not after. The MD is already paid for at
+        # this point; a transient API failure in decide() would otherwise
+        # discard the whole round, since without a checkpoint restart has no
+        # resume point and re-runs it. A checkpoint with no matching row is the
+        # already-documented harmless case (D4).
+        ckpt = adapter.save_checkpoint(rounds_dir / f"round_{round_idx:03d}.chk")
         prior_summaries = [_compact_prior(r) for r in rounds]
         decision = decide(
             report,
@@ -217,7 +240,6 @@ def run_campaign(
             task_expectation=task_expectation,
         )
 
-        ckpt = adapter.save_checkpoint(rounds_dir / f"round_{round_idx:03d}.chk")
         summary_path = rounds_dir / f"round_{round_idx:03d}.json"
         _persist_round_json(
             summary_path, round_idx, n_steps, dcd, report, decision, current_plumed_dat
@@ -273,10 +295,66 @@ def run_campaign(
             n_steps = initial_steps
             continue
 
-        extra_ns = min(decision.extra_ns or 0.5, max_extra_ns)
-        n_steps = max(int(extra_ns * _STEPS_PER_NS), 1)
+        n_steps = _extend_steps(decision.extra_ns, max_extra_ns)
 
     return CampaignResult(work_dir, tuple(rounds), "max_rounds_reached")
+
+
+def _default_biased_factory(
+    adapter: MDAdapter,
+    *,
+    work_dir: Path,
+    seed: int,
+    spec: SystemSpec,
+) -> BiasedAdapterFactory:
+    """Biased adapter over the *same engine* that ran the vanilla phase.
+
+    Engine-matching is a correctness requirement, not a preference. The CV's
+    atom indices are resolved against the vanilla adapter's topology, and each
+    engine builds a different system from the same `SystemSpec`: `gmx solvate`
+    and OpenMM's Modeller place different numbers of waters, and pdb2gmx and
+    Modeller name and order hydrogens differently. Handing those indices to
+    another engine's system biases whichever atoms happen to sit at those
+    positions — wrong physics, no error anywhere. (This is not an off-by-one:
+    the 0-based to PLUMED 1-based conversion in `plumed_writer` is correct and
+    no offset can reconcile two different atom orderings.)
+
+    Only OpenMM has a bias path today. Any other engine gets a refusal naming
+    the injection point rather than a silent engine swap.
+    """
+    if isinstance(adapter, OpenMMAdapter):
+
+        def openmm_factory(plumed_input: str) -> MDAdapter:
+            return OpenMMAdapter(
+                work_dir=work_dir,
+                seed=seed,
+                spec=spec,
+                plumed_input=plumed_input,
+            )
+
+        return openmm_factory
+
+    engine = type(adapter).__name__
+
+    def unsupported(plumed_input: str) -> MDAdapter:
+        raise NotImplementedError(
+            f"{engine} has no metadynamics path, and the CV's atom indices were "
+            f"resolved against its topology, so they are not transferable to "
+            f"another engine. Pass `biased_adapter_factory=` to run the biased "
+            f"phase through a {engine}-compatible adapter."
+        )
+
+    return unsupported
+
+
+def _extend_steps(extra_ns: float | None, max_extra_ns: float) -> int:
+    """Steps for an extend round, clamped to the caller's `max_extra_ns`.
+
+    What SQLite stores is the model's raw request, so the clamp has to be
+    re-applied on every read. Applying it only in the live loop made a resumed
+    campaign run a longer round than the uninterrupted one would have.
+    """
+    return max(int(min(extra_ns or 0.5, max_extra_ns) * _STEPS_PER_NS), 1)
 
 
 def _pivot_to_metad(

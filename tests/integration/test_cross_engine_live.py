@@ -53,7 +53,7 @@ def test_single_round_through_gromacs_adapter(tmp_path: Path) -> None:
     # Diagnostic report is well-formed regardless of which engine produced
     # the trajectory — the whole point of the MDAdapter abstraction.
     report = round_0.report
-    assert report["observable_name"] == "rmsd_ca_to_first_angstrom"
+    assert report["observable_name"] == "rmsd_ca_to_reference_angstrom"
     assert report["n_frames"] > 0
     assert "ess" in report
     assert "plateau_reached" in report
