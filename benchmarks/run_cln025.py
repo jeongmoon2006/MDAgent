@@ -72,6 +72,7 @@ def run(task: dict[str, Any], work_dir: Path, *, dry_run: bool) -> CampaignResul
         max_extra_ns=2.0,
         max_biased_ns=max_biased_ns,
         min_recrossings=int(criterion["min_recrossings"]),
+        cv_upper_wall_nm=task.get("sampling", {}).get("cv_upper_wall_nm"),
         task_expectation=task["task_expectation"],
         seed=42,
     )

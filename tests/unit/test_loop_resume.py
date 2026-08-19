@@ -33,6 +33,7 @@ def _full_config(cfg: dict, *, engine: str = "OpenMMAdapter") -> dict:
         "system_spec": SystemSpec.trpcage().to_dict(),
         "engine": engine,
         "task_expectation": None,
+        "cv_upper_wall_nm": None,
     }
 
 

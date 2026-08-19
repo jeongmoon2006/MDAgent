@@ -164,6 +164,10 @@ def run_campaign(
         # without it silently reverts an enhanced-sampling campaign to a plain
         # convergence task, so it locks with the rest.
         "task_expectation": task_expectation,
+        # The wall bounds the CV the bias acts on, so it is biased-phase physics
+        # rather than a loop-control bound: changing it on resume would join two
+        # halves of a campaign sampled under different Hamiltonians.
+        "cv_upper_wall_nm": cv_upper_wall_nm,
     }
     store.init_campaign(work_dir, config)
     prior_rows = store.list_rounds(work_dir)

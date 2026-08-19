@@ -63,6 +63,17 @@ task_expectation: |
   50 ns are expected to stay trapped in whichever basin they start from, which
   here is the folded state.
 
+# Enhanced-sampling bounds. The position is a task-level fact (what counts as
+# unfolded), not something the scientist or a magic constant should decide; the
+# wall stiffness lives in bias_designer with SIGMA and HEIGHT.
+sampling:
+  # 2x the extended-state threshold (0.4 nm). RMSD-to-native is unbounded on the
+  # unfolded side, so without a wall well-tempered metaD drives the walker ever
+  # further out instead of returning: the first campaign deposited 129 kJ/mol of
+  # bias -- an order of magnitude past the real folding free energy -- and got
+  # one crossing with no return trip.
+  cv_upper_wall_nm: 0.8
+
 # Done criterion (per ROADMAP.md, Milestone 4). All three must hold:
 #   (a) the scientist decides `switch_to_metad` from the vanilla phase rather
 #       than extending indefinitely;

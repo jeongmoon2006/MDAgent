@@ -151,6 +151,7 @@ def _full_config(tmp_path: Path) -> dict:
         "system_spec": SystemSpec.trpcage().to_dict(),
         "engine": "_FakeAdapter",
         "task_expectation": None,
+        "cv_upper_wall_nm": None,
     }
 
 
