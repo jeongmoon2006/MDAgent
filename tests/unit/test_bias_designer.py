@@ -14,12 +14,13 @@ import mdtraj as md
 import numpy as np
 import pytest
 
-from mdpilot.adapters.plumed_writer import DistanceCV, GyrationCV, TorsionCV
+from mdpilot.adapters.plumed_writer import DistanceCV, GyrationCV, RmsdCV, TorsionCV
 from mdpilot.sampling.bias_designer import (
     _DEFAULT_BIAS_FACTOR,
     _HEIGHT_KT_FRACTION,
     _KB_KJ_PER_MOL_K,
     design_bias,
+    design_upper_wall,
     sigma_floor,
     size_sigma,
 )
@@ -229,3 +230,30 @@ def test_unknown_cv_type_has_no_silent_default() -> None:
 
     with pytest.raises(TypeError, match="no SIGMA floor"):
         sigma_floor(FakeCV())  # type: ignore[arg-type]
+
+
+# ---------- upper walls ----------
+
+
+def test_upper_wall_bounds_a_length_dimensioned_cv() -> None:
+    """RMSD is unbounded on the unfolded side, so well-tempered metaD drives the
+    walker outward forever instead of returning. The first CLN025 campaign
+    deposited 129 kJ/mol — an order of magnitude past the real folding free
+    energy — and got one crossing with no return trip."""
+    cv = RmsdCV(label="rmsd_ca", atoms=(1, 2, 3), reference_path=Path("/tmp/r.pdb"))
+    wall = design_upper_wall(cv, 0.8)
+    assert wall is not None
+    assert wall.cv_label == "rmsd_ca"
+    assert wall.at == 0.8
+    assert "UPPER_WALLS" in wall.render() and "AT=0.8" in wall.render()
+
+
+def test_no_wall_when_none_requested() -> None:
+    cv = RmsdCV(label="r", atoms=(1, 2, 3), reference_path=Path("/tmp/r.pdb"))
+    assert design_upper_wall(cv, None) is None
+
+
+def test_no_wall_on_a_torsion() -> None:
+    """A wall position in nm is meaningless on a torsion, which is already
+    bounded on [-pi, pi]."""
+    assert design_upper_wall(TorsionCV(label="phi", atoms=(1, 2, 3, 4)), 0.8) is None

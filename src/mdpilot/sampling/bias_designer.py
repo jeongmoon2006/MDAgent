@@ -54,6 +54,8 @@ from mdpilot.adapters.plumed_writer import (
     DistanceCV,
     GyrationCV,
     MetadynamicsBias,
+    RmsdCV,
+    UpperWall,
     TorsionCV,
 )
 
@@ -68,10 +70,16 @@ _DEFAULT_BIAS_FACTOR = 10.0
 # are nm; a 0.02 nm hill puts ~5 deposits across a 0.1 nm basin, which is enough
 # overlap to fill. Torsions are radians; 0.15 rad (~8.6°) sits at the low end of
 # the 0.1-0.35 rad range conventionally used for dihedral metadynamics.
+# RMSD-to-native is a *global* coordinate: it spans ~1 nm between folded and
+# unfolded for a small protein, where a distance or Rg between two chosen points
+# spans a fraction of that. 0.05 nm (0.5 A) is the low end of the 0.05-0.1 nm
+# range conventionally used for RMSD metadynamics, the same way 0.15 rad sits at
+# the low end of the dihedral range.
 _SIGMA_FLOORS: tuple[tuple[type, float], ...] = (
     (DistanceCV, 0.02),
     (GyrationCV, 0.02),
     (TorsionCV, 0.15),
+    (RmsdCV, 0.05),
 )
 
 
@@ -139,6 +147,12 @@ def _cv_series(cv: CV, traj: md.Trajectory) -> np.ndarray:
         return md.compute_dihedrals(traj, np.array([cv.atoms]))[:, 0]
     if isinstance(cv, GyrationCV):
         return md.compute_rg(traj.atom_slice(list(cv.atoms)))
+    if isinstance(cv, RmsdCV):
+        # The reference PDB holds exactly `cv.atoms`, in the same ascending
+        # order `atom_slice` produces, so the two line up index-for-index.
+        # md.rmsd superposes before measuring, matching PLUMED TYPE=OPTIMAL.
+        reference = md.load(str(cv.reference_path))
+        return md.rmsd(traj.atom_slice(list(cv.atoms)), reference, frame=0)
     raise TypeError(f"bias_designer: unsupported CV type {type(cv).__name__}")
 
 
@@ -158,3 +172,28 @@ def _circular_std(angles: np.ndarray) -> float:
     if r <= 0.0:
         return float(np.pi)
     return float(np.sqrt(-2.0 * np.log(r)))
+
+
+# Stiff enough that the walker turns around within ~0.1 nm of the wall
+# (1000 * 0.1^2 = 10 kJ/mol, ~4 kT), soft enough not to shock the dynamics.
+_WALL_KAPPA_KJ_PER_MOL_NM2 = 1000.0
+
+# CVs measured in nanometres. A wall position in nm is meaningful only for
+# these; a torsion is already bounded on [-pi, pi] and needs no wall.
+_LENGTH_DIMENSIONED = (DistanceCV, GyrationCV, RmsdCV)
+
+
+def design_upper_wall(cv: CV, at_nm: float | None) -> UpperWall | None:
+    """Bound an unbounded CV from above, or None if no wall applies.
+
+    Returns None when no wall was requested, and also when the CV is not
+    length-dimensioned — a wall at "0.8" means nothing on a torsion, which is
+    already bounded on [-pi, pi]. The position comes from the campaign (the
+    task knows what counts as unfolded); only the stiffness is a constant here,
+    the same boundary `design_bias` draws for SIGMA and HEIGHT.
+    """
+    if at_nm is None or not isinstance(cv, _LENGTH_DIMENSIONED):
+        return None
+    return UpperWall(
+        cv_label=cv.label, at=at_nm, kappa=_WALL_KAPPA_KJ_PER_MOL_NM2
+    )

@@ -23,14 +23,15 @@ on it deterministically rather than guessing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import mdtraj as md
 
-from mdpilot.adapters.plumed_writer import CV, DistanceCV, GyrationCV, TorsionCV
+from mdpilot.adapters.plumed_writer import CV, DistanceCV, GyrationCV, RmsdCV, TorsionCV
 
-CVType = Literal["distance", "torsion", "gyration"]
-_CV_TYPES: tuple[str, ...] = ("distance", "torsion", "gyration")
+CVType = Literal["distance", "torsion", "gyration", "rmsd"]
+_CV_TYPES: tuple[str, ...] = ("distance", "torsion", "gyration", "rmsd")
 
 
 @dataclass(frozen=True)
@@ -39,8 +40,9 @@ class CVProposal:
 
     ``selections`` are MDTraj selection strings, one per logical position the
     CV needs. Arity is type-dependent: ``distance`` takes 2 single-atom
-    selections, ``torsion`` takes 4 single-atom selections, ``gyration``
-    takes 1 multi-atom selection.
+    selections, ``torsion`` takes 4 single-atom selections, ``gyration`` and
+    ``rmsd`` each take 1 multi-atom selection (>=2 and >=3 atoms
+    respectively).
     """
 
     cv_type: CVType
@@ -48,8 +50,20 @@ class CVProposal:
     label: str
 
 
-def design_cv(proposal: CVProposal, topology: md.Topology) -> CV:
-    """Resolve a CVProposal against a topology; return a typed PLUMED CV."""
+def design_cv(
+    proposal: CVProposal,
+    topology: md.Topology,
+    *,
+    reference: md.Trajectory | None = None,
+    output_dir: Path | None = None,
+) -> CV:
+    """Resolve a CVProposal against a topology; return a typed PLUMED CV.
+
+    ``reference`` and ``output_dir`` are required only for ``cv_type="rmsd"``,
+    which is the one CV that needs coordinates rather than just connectivity:
+    PLUMED compares against a reference structure on disk, so one has to be
+    written. Everything else resolves from topology alone.
+    """
     if proposal.cv_type not in _CV_TYPES:
         raise ValueError(
             f"cv_designer: unknown cv_type {proposal.cv_type!r}; "
@@ -64,6 +78,8 @@ def design_cv(proposal: CVProposal, topology: md.Topology) -> CV:
         return _build_torsion(proposal.label, indices)
     if proposal.cv_type == "gyration":
         return _build_gyration(proposal.label, indices)
+    if proposal.cv_type == "rmsd":
+        return _build_rmsd(proposal.label, indices, reference, output_dir)
     raise AssertionError(f"unreachable cv_type {proposal.cv_type!r}")
 
 
@@ -125,3 +141,65 @@ def _build_gyration(
             f"(got {len(atoms)})"
         )
     return GyrationCV(label=label, atoms=atoms)
+
+
+def _build_rmsd(
+    label: str,
+    sels: tuple[tuple[int, ...], ...],
+    reference: "md.Trajectory | None",
+    output_dir: Path | None,
+) -> RmsdCV:
+    if len(sels) != 1:
+        raise ValueError(
+            f"cv_designer: rmsd requires 1 selection, got {len(sels)}"
+        )
+    atoms = sels[0]
+    if len(atoms) < 3:
+        raise ValueError(
+            f"cv_designer: rmsd selection must resolve to >=3 atoms for optimal "
+            f"superposition (got {len(atoms)})"
+        )
+    if reference is None or output_dir is None:
+        raise ValueError(
+            "cv_designer: cv_type='rmsd' needs `reference` (the structure to "
+            "measure against) and `output_dir` (where to write the reference "
+            "PDB); pass both to design_cv"
+        )
+    path = (Path(output_dir) / f"{label}_reference.pdb").resolve()
+    _write_reference_pdb(path, reference, atoms)
+    return RmsdCV(label=label, atoms=atoms, reference_path=path)
+
+
+def _write_reference_pdb(
+    path: Path, reference: "md.Trajectory", atoms: tuple[int, ...]
+) -> None:
+    """Write the reference structure PLUMED's RMSD action reads.
+
+    Hand-rolled rather than `reference.atom_slice(atoms).save_pdb(path)`,
+    because PLUMED identifies reference atoms by **PDB serial number** and
+    mdtraj renumbers serials from 1 when it writes a sliced trajectory. That
+    would map the reference onto atoms 1..N of the simulated system — the first
+    N atoms of the protein, not the selected ones — and align against the wrong
+    thing without any error. Serials here are the original 0-based indices + 1,
+    matching the convention the rest of `plumed_writer` uses.
+
+    Occupancy and B-factor are both 1.00: PLUMED reads occupancy as the
+    alignment weight and B-factor as the displacement weight, so this measures
+    RMSD over exactly the selected atoms, aligned on the same set.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    top = reference.topology
+    xyz = reference.xyz[0] * 10.0  # nm -> Angstrom, as PDB requires
+    lines = []
+    for atom_index in atoms:
+        atom = top.atom(atom_index)
+        x, y, z = xyz[atom_index]
+        element = (atom.element.symbol if atom.element is not None else "").upper()
+        lines.append(
+            f"ATOM  {atom_index + 1:>5d} {atom.name:<4.4s}{'':1s}"
+            f"{atom.residue.name:>3.3s} {'A':1s}{atom.residue.resSeq:>4d}{'':1s}   "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{1.00:>6.2f}{1.00:>6.2f}"
+            f"{'':10s}{element:>2.2s}"
+        )
+    lines.append("END")
+    path.write_text("\n".join(lines) + "\n")

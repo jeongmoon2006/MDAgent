@@ -72,7 +72,48 @@ class GyrationCV:
         return f"{self.label}: GYRATION TYPE=RADIUS ATOMS={idx}"
 
 
-CV = Union[DistanceCV, TorsionCV, GyrationCV]
+@dataclass(frozen=True)
+class RmsdCV:
+    """RMSD to a reference structure after optimal superposition (0-based atoms).
+
+    PLUMED's ``RMSD ... TYPE=OPTIMAL`` action — Kearsley superposition, so this
+    is RMSD *after* removing rigid-body motion, the folding order parameter
+    people actually mean by "RMSD to native".
+
+    ``reference_path`` points at a PDB holding only ``atoms``. PLUMED maps that
+    file onto the running system by **PDB serial number**, not by file order, so
+    the reference cannot be written with `mdtraj.save_pdb` on a sliced
+    trajectory (which renumbers serials from 1 and would silently align against
+    the wrong atoms). `cv_designer.design_cv` writes it with the original
+    1-based serials preserved.
+
+    The path must be absolute, for the same reason ``PlumedInput.output_dir``
+    must be: PLUMED resolves relative paths against the *process* working
+    directory, not the location of plumed.dat (F5).
+    """
+
+    label: str
+    atoms: tuple[int, ...]
+    reference_path: Path
+
+    def __post_init__(self) -> None:
+        if len(self.atoms) < 3:
+            raise ValueError(
+                f"RmsdCV: need at least 3 atoms for optimal superposition "
+                f"(got {len(self.atoms)})"
+            )
+        if not Path(self.reference_path).is_absolute():
+            raise ValueError(
+                f"RmsdCV: reference_path must be absolute (got "
+                f"{self.reference_path!r}); PLUMED resolves relative paths "
+                f"against the process working directory"
+            )
+
+    def render(self) -> str:
+        return f"{self.label}: RMSD REFERENCE={self.reference_path} TYPE=OPTIMAL"
+
+
+CV = Union[DistanceCV, TorsionCV, GyrationCV, RmsdCV]
 
 
 @dataclass(frozen=True)
@@ -165,7 +206,78 @@ class HarmonicRestraint:
         return f"{self.restraint_label}.bias"
 
 
+@dataclass(frozen=True)
+class UpperWall:
+    """One-sided harmonic wall bounding a CV from above (PLUMED ``UPPER_WALLS``).
+
+    Needed for CVs that are unbounded on one side. RMSD-to-native is the clear
+    case: the folded side is pinned near zero, but the unfolded side runs to
+    arbitrarily large values, so well-tempered metadynamics keeps driving the
+    walker outward into an ever-larger unfolded space instead of coming back.
+    The first CLN025 campaign deposited 129 kJ/mol of bias — an order of
+    magnitude past the real folding free energy — and got one crossing with no
+    return trip. A wall past the "unfolded" threshold bounds the space the bias
+    has to fill and concentrates sampling in the transition region.
+
+    Flat below ``at``; above it the energy rises as ``kappa * (s - at)^exp``.
+    """
+
+    cv_label: str
+    at: float                 # CV units (nm for length-dimensioned CVs)
+    kappa: float              # kJ/mol per CV-unit^exp
+    exp: int = 2
+    wall_label: str = "uwall"
+
+    def __post_init__(self) -> None:
+        if self.kappa <= 0:
+            raise ValueError(f"UpperWall: kappa must be positive (got {self.kappa})")
+        if self.exp < 1:
+            raise ValueError(f"UpperWall: exp must be >= 1 (got {self.exp})")
+
+    def render(self) -> str:
+        return (
+            f"{self.wall_label}: UPPER_WALLS ARG={self.cv_label} "
+            f"AT={self.at:g} KAPPA={self.kappa:g} EXP={self.exp}"
+        )
+
+
 Bias = Union[MetadynamicsBias, HarmonicRestraint]
+
+
+_RESTART_DIRECTIVE = "RESTART"
+
+
+def enable_restart(plumed_input: str) -> str:
+    """Return `plumed_input` with PLUMED's RESTART directive enabled.
+
+    Without it, PLUMED backs the existing HILLS up to ``bck.0.HILLS`` and
+    starts a fresh file with zero accumulated bias — verified against PLUMED
+    2.9: ``metad.bias`` reads exactly 0.0 on the first frame. A biased phase
+    resumed that way continues from a *biased* configuration under *no* bias.
+    The walker sits in a basin the campaign already filled, refills it, and
+    the surface eventually integrated is the sum of two disjoint fillings.
+    With RESTART, METAD reads HILLS back at initialization ("Restarting from
+    HILLS: N Gaussians read") and appends to it, and PRINT appends to COLVAR
+    instead of backing that up too — which is what keeps the recrossing count
+    covering the whole biased phase rather than only the last leg.
+
+    Text-level rather than a `PlumedInput` field because the persisted
+    ``plumed.dat`` *is* the interface on resume: the loop rebuilds the biased
+    adapter from that file's contents, not from the proposal that produced it.
+
+    Idempotent. The adapter rewrites plumed.dat on every ``start()``, so a
+    second resume reads text this function has already touched.
+    """
+    for line in plumed_input.splitlines():
+        stripped = line.strip()
+        if stripped == _RESTART_DIRECTIVE or stripped.startswith(
+            _RESTART_DIRECTIVE + " "
+        ):
+            return plumed_input
+    return (
+        f"{_RESTART_DIRECTIVE}   "
+        f"# resumed biased phase: read HILLS back and append\n{plumed_input}"
+    )
 
 
 @dataclass(frozen=True)
@@ -184,6 +296,7 @@ class PlumedInput:
     cvs: tuple[CV, ...]
     bias: Bias
     output_dir: Path
+    walls: tuple[UpperWall, ...] = ()
     print_stride: int = 500
     colvar_file: str = "COLVAR"
 
@@ -199,7 +312,7 @@ class PlumedInput:
         cv_labels = {cv.label for cv in self.cvs}
         if len(cv_labels) != len(self.cvs):
             raise ValueError(f"PlumedInput: CV labels must be unique")
-        used = self._bias_cv_labels()
+        used = self._bias_cv_labels() | {w.cv_label for w in self.walls}
         missing = used - cv_labels
         if missing:
             raise ValueError(
@@ -240,11 +353,11 @@ class PlumedInput:
                 "#       narrowest hill worth depositing. Treat the vanilla",
                 "#       phase as having under-sampled this coordinate.",
             ]
-        lines += [
-            self._bias_with_resolved_paths().render(),
-            "",
-            "# Periodic output",
-        ]
+        lines.append(self._bias_with_resolved_paths().render())
+        if self.walls:
+            lines += ["", "# Bounds"]
+            lines += [w.render() for w in self.walls]
+        lines += ["", "# Periodic output"]
         print_args = ",".join([cv.label for cv in self.cvs] + [self.bias.bias_value])
         colvar = Path(self.output_dir) / self.colvar_file
         lines.append(

@@ -78,21 +78,45 @@ _REPORT = {
     "n_basins": 1,
 }
 
+# What `diagnostics.free_energy.metad_report` returns for a biased round. Note
+# what is *not* here: no ess, no plateau_reached, no exploring. That omission is
+# the contract under test, not an abbreviation of the fixture.
+_METAD_REPORT = {
+    "fes_drift_kj_per_mol": 0.9,
+    "recrossings": 3,
+    "barrier_crossed": True,
+    "fes_converged": True,
+    "n_basins_fes": 2,
+    "barrier_kj_per_mol": 21.4,
+}
 
-def _stub_collaborators(monkeypatch, decisions: list[Decision]) -> list[str]:
-    """Patch decide/make_report/_build_plumed_input; return list plumed calls append to."""
+
+def _stub_collaborators(monkeypatch, decisions: list[Decision]) -> dict:
+    """Patch decide / both report builders / _build_plumed_input.
+
+    Returns a record of what the loop asked for: `plumed_texts` (one entry per
+    rendered bias) and `phases` (the phase passed to each decide call), so
+    tests can assert the loop routed each round to the right contract.
+    """
     queue = list(decisions)
-    monkeypatch.setattr(loop_mod, "make_report", lambda *a, **k: dict(_REPORT))
-    monkeypatch.setattr(loop_mod, "decide", lambda *a, **k: queue.pop(0))
-    built: list[str] = []
+    record: dict = {"plumed_texts": [], "phases": []}
 
-    def fake_build(proposal, traj, top, output_dir):  # noqa: ANN001
+    monkeypatch.setattr(loop_mod, "make_report", lambda *a, **k: dict(_REPORT))
+    monkeypatch.setattr(loop_mod, "metad_report", lambda *a, **k: dict(_METAD_REPORT))
+
+    def fake_decide(report, **kwargs):  # noqa: ANN001
+        record["phases"].append(kwargs.get("phase"))
+        return queue.pop(0)
+
+    monkeypatch.setattr(loop_mod, "decide", fake_decide)
+
+    def fake_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
         text = "PLUMED-TEXT\n"
-        built.append(text)
+        record["plumed_texts"].append(text)
         return text
 
     monkeypatch.setattr(loop_mod, "_build_plumed_input", fake_build)
-    return built
+    return record
 
 
 def _proposal() -> MetadProposal:
@@ -108,6 +132,10 @@ def _switch() -> Decision:
         extra_ns=None,
         metad_proposal=_proposal(),
     )
+
+
+def _extend() -> Decision:
+    return Decision(decision="extend", reason="surface still moving", extra_ns=0.5)
 
 
 def _stop() -> Decision:
@@ -329,3 +357,252 @@ def test_resumed_extend_round_is_clamped_to_max_extra_ns(
 
     # 2.0 ns at 2 fs = 1_000_000 steps, not the 10_000_000 the row asked for.
     assert base.run_calls == [1_000_000]
+
+
+def test_biased_round_gets_the_free_energy_report_not_the_equilibrium_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The pivot swaps the diagnostic contract, not just the adapter.
+
+    A biased trajectory is not an equilibrium ensemble, so the vanilla
+    convergence fields must be *absent* from a biased round's report rather
+    than present-and-ignorable. This pins the omission, the phase label, and
+    the action space handed to the scientist in each phase.
+    """
+    record = _stub_collaborators(monkeypatch, [_switch(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=lambda p: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=p
+        ),
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    vanilla, biased = result.rounds[0].report, result.rounds[1].report
+    assert vanilla["phase"] == "vanilla"
+    assert vanilla["ess"] == 5.0
+
+    assert biased["phase"] == "metad"
+    assert biased["fes_converged"] is True
+    assert biased["recrossings"] == 3
+    for equilibrium_field in ("ess", "plateau_reached", "exploring", "n_basins"):
+        assert equilibrium_field not in biased, equilibrium_field
+
+    # The scientist was offered the matching action space each round.
+    assert record["phases"] == ["vanilla", "metad"]
+
+
+def test_prior_round_summaries_do_not_leak_equilibrium_fields_from_biased_rounds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The compact prior-round view is phase-keyed too — otherwise the fields
+    the biased report omits would reappear via the campaign history."""
+    _stub_collaborators(monkeypatch, [_switch(), _extend(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=lambda p: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=p
+        ),
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    summaries = [loop_mod._compact_prior(r) for r in result.rounds]
+    vanilla_summary, biased_summary = summaries[0], summaries[1]
+
+    assert vanilla_summary["phase"] == "vanilla"
+    assert "ess" in vanilla_summary
+
+    assert biased_summary["phase"] == "metad"
+    assert biased_summary["fes_converged"] is True
+    assert "ess" not in biased_summary
+    assert "plateau_reached" not in biased_summary
+
+
+def _seed_metad_phase_round(tmp_path: Path, *, round_index: int = 1) -> Path:
+    """A campaign already inside the metaD phase: one completed biased round,
+    its checkpoint, its plumed.dat, and the bias snapshot paired with it."""
+    plumed_dat = tmp_path / "plumed.dat"
+    plumed_dat.write_text("PLUMED-TEXT\n")
+    rounds = tmp_path / "rounds"
+    rounds.mkdir(parents=True, exist_ok=True)
+    (rounds / f"round_{round_index:03d}.chk").write_text("CHK")
+    (rounds / f"round_{round_index:03d}.hills").write_text("SNAPSHOT-HILLS\n")
+    (rounds / f"round_{round_index:03d}.colvar").write_text("SNAPSHOT-COLVAR\n")
+
+    store.init_campaign(tmp_path, _full_config(tmp_path))
+    store.append_round(
+        tmp_path,
+        round_index=round_index,
+        n_steps=100,
+        dcd_path=rounds / f"round_{round_index:03d}.dcd",
+        checkpoint_path=rounds / f"round_{round_index:03d}.chk",
+        report=dict(_METAD_REPORT),
+        decision="extend",
+        reason="surface still moving",
+        extra_ns=0.5,
+        plumed_dat_path=plumed_dat,
+    )
+    return plumed_dat
+
+
+def test_mid_metad_resume_enables_restart_and_restores_the_bias(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Resuming inside the biased phase must continue the deposited bias.
+
+    Without RESTART, PLUMED backs HILLS up to bck.0.HILLS and refills from
+    zero while the coordinates carry on from a biased configuration — so the
+    surface the campaign integrates is the sum of two disjoint fillings. The
+    HILLS/COLVAR snapshot is the other half: it puts the bias back to the
+    point the restored checkpoint corresponds to.
+    """
+    _seed_metad_phase_round(tmp_path)
+    # A live HILLS left over from a round that crashed before it was recorded.
+    (tmp_path / "HILLS").write_text("SNAPSHOT-HILLS\nSTALE-EXTRA-HILL\n")
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    handed: list[str] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        handed.append(plumed_input)
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=factory,
+        max_rounds=2,
+        **_run_kwargs(),
+    )
+
+    assert len(handed) == 1
+    assert handed[0].splitlines()[0].startswith("RESTART")
+    assert "PLUMED-TEXT" in handed[0]
+    # The stale hill from the unrecorded round is gone; the bias matches the
+    # checkpoint it is paired with.
+    assert (tmp_path / "HILLS").read_text() == "SNAPSHOT-HILLS\n"
+    assert (tmp_path / "COLVAR").read_text() == "SNAPSHOT-COLVAR\n"
+
+
+def test_fresh_pivot_does_not_enable_restart(tmp_path: Path, monkeypatch) -> None:
+    """A pivot has no prior bias for this campaign. RESTART there would read
+    back whatever HILLS happened to be lying in the campaign directory."""
+    _stub_collaborators(monkeypatch, [_switch(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    handed: list[str] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        handed.append(plumed_input)
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=factory,
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    assert handed == ["PLUMED-TEXT\n"]
+
+
+def test_biased_round_snapshots_the_bias_beside_its_checkpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every biased round leaves a bias snapshot next to its checkpoint, so a
+    later resume has a consistent pair to restore."""
+    _stub_collaborators(monkeypatch, [_switch(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        # Stand in for PLUMED depositing hills during the biased round.
+        (tmp_path / "HILLS").write_text("HILL-1\nHILL-2\n")
+        (tmp_path / "COLVAR").write_text("ROW-1\n")
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=factory,
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    rounds = tmp_path / "rounds"
+    # Round 1 was vanilla — no bias existed yet, so nothing was snapshotted.
+    assert not (rounds / "round_001.hills").exists()
+    # Round 2 was biased.
+    assert (rounds / "round_002.hills").read_text() == "HILL-1\nHILL-2\n"
+    assert (rounds / "round_002.colvar").read_text() == "ROW-1\n"
+
+
+def test_biased_budget_clamps_the_last_round_and_ends_the_campaign(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`max_biased_ns` is a hard cap on cumulative biased simulation time.
+
+    A budget stated only in `task_expectation` is advisory — the model reads
+    it and can still ask for more — which is exactly the wrong property for an
+    unattended multi-hour run. The round that would overshoot is shortened to
+    land on the budget rather than skipped, so its hills still count.
+    """
+    _stub_collaborators(monkeypatch, [_switch(), _extend(), _extend()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    biased: list[_FakeAdapter] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        a = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+        biased.append(a)
+        return a
+
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=factory,
+        max_rounds=10,
+        max_biased_ns=0.0003,          # 150 steps at 2 fs
+        **_run_kwargs(),               # initial_steps=100
+    )
+
+    assert result.stop_reason == "biased_budget_exhausted"
+    # 100 steps, then the second biased round clamped from 250_000 to 50.
+    assert biased[0].run_calls == [100, 50]
+    assert sum(biased[0].run_calls) == 150
+    # The vanilla switch round is not charged to the biased budget.
+    assert base.run_calls == [100]
+
+
+def test_biased_budget_survives_a_resume(tmp_path: Path, monkeypatch) -> None:
+    """The meter is recomputed from the persisted biased rounds, so restarting
+    a campaign cannot silently buy it another full budget."""
+    _seed_metad_phase_round(tmp_path)   # one completed biased round, 100 steps
+
+    _stub_collaborators(monkeypatch, [_extend(), _extend()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    biased: list[_FakeAdapter] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        a = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+        biased.append(a)
+        return a
+
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=factory,
+        max_rounds=10,
+        max_biased_ns=0.0003,          # 150 steps; 100 already spent before the kill
+        **_run_kwargs(),
+    )
+
+    assert result.stop_reason == "biased_budget_exhausted"
+    assert biased[0].run_calls == [50]   # only the 50 steps still owed

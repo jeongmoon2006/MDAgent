@@ -220,7 +220,7 @@ def test_decision_tool_schema_includes_metad_proposal() -> None:
     assert props["decision"]["enum"] == ["extend", "stop", "switch_to_metad"]
     assert "metad_proposal" in _DECISION_TOOL["input_schema"]["required"]
     sub = props["metad_proposal"]["properties"]
-    assert sub["cv_type"]["enum"] == ["distance", "torsion", "gyration"]
+    assert sub["cv_type"]["enum"] == ["distance", "torsion", "gyration", "rmsd"]
 
 
 def test_metad_proposal_round_trips_through_dict() -> None:
@@ -230,3 +230,39 @@ def test_metad_proposal_round_trips_through_dict() -> None:
         label="d_term",
     )
     assert MetadProposal.from_dict(mp.to_dict()) == mp
+
+
+# ---------- tool schema validity under strict mode ----------
+
+
+def test_tool_schemas_avoid_keywords_strict_mode_rejects() -> None:
+    """`strict: true` restricts the usable JSON Schema vocabulary.
+
+    `minItems`/`maxItems` on an array return a 400 ("For 'array' type,
+    property 'maxItems' is not supported"). Both were present on
+    `metad_proposal.selections` from the M4 action-space refactor (f0e4b8e)
+    until the first live campaign hit the API — every vanilla decide() call in
+    between would have failed, and every unit test stayed green because they
+    all mock the client. This is the cheap guard; the authoritative check is
+    still a live call.
+    """
+    from mdpilot.orchestrator.scientist import (
+        _DECISION_TOOL,
+        _METAD_DECISION_TOOL,
+    )
+
+    rejected = {"minItems", "maxItems"}
+
+    def walk(node, path="input_schema"):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                assert key not in rejected, f"{path}.{key} is rejected under strict mode"
+                walk(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, f"{path}[{i}]")
+
+    for tool in (_DECISION_TOOL, _METAD_DECISION_TOOL):
+        assert tool["strict"] is True
+        assert tool["input_schema"]["additionalProperties"] is False
+        walk(tool["input_schema"])

@@ -176,7 +176,14 @@ def sum_hills(
     if not indexed:
         return [outfile]
     indexed.sort()
-    return [p for _, p in indexed]
+    surfaces = [p for _, p in indexed]
+    # When the hill count is a multiple of `stride`, sum_hills writes the final
+    # complete surface *and* the last strided one, and they are byte-identical.
+    # A drift measured across that pair is exactly 0.0 by construction — which
+    # is what silently made the drift half of the convergence test vacuous.
+    if len(surfaces) >= 2 and surfaces[-1].read_bytes() == surfaces[-2].read_bytes():
+        surfaces.pop()
+    return surfaces
 
 
 def load_fes(path: Path) -> FreeEnergySurface:
@@ -305,6 +312,7 @@ def metad_report(
     *,
     temperature_k: float = _DEFAULT_TEMPERATURE_K,
     stride: int = 10,
+    min_recrossings: int = 1,
 ) -> dict[str, Any]:
     """Compact diagnostic bundle for a biased round.
 
@@ -315,9 +323,15 @@ def metad_report(
     final = load_fes(surfaces[-1])
     minima = final.minima(temperature_k)
 
+    # Drift against the half-way surface, not the previous one. With a stride
+    # of 10 over thousands of hills, consecutive estimates are ~0.25% of the run
+    # apart, so their difference is near zero however unconverged the surface
+    # is. The standard well-tempered test compares estimates that are
+    # meaningfully separated in time.
     drift = None
     if len(surfaces) >= 2:
-        drift = fes_drift_kj_per_mol(load_fes(surfaces[-2]), final)
+        baseline = load_fes(surfaces[len(surfaces) // 2])
+        drift = fes_drift_kj_per_mol(baseline, final)
 
     report: dict[str, Any] = {
         "hills_path": str(hills_path),
@@ -343,18 +357,25 @@ def metad_report(
             low, high = thresholds
             n = count_recrossings(series, low, high)
             report["recrossings"] = n
+            # "Did the walker cross the barrier at all", which is n >= 1 —
+            # deliberately NOT gated on min_recrossings. Tying it to the
+            # round-trip threshold made the field contradict its own name
+            # (recrossings=1 reported as barrier_crossed=false), and the
+            # scientist flagged exactly that as inconsistent mid-campaign.
+            # `fes_converged` is where min_recrossings belongs.
             report["barrier_crossed"] = n >= 1
         elif series is not None:
             report["recrossings"] = 0
             report["barrier_crossed"] = False
         report["colvar_path"] = str(colvar_path)
 
-    report["fes_converged"] = _fes_converged(report, temperature_k)
+    report["min_recrossings"] = min_recrossings
+    report["fes_converged"] = _fes_converged(report, temperature_k, min_recrossings)
     return report
 
 
 def _fes_converged(
-    report: dict[str, Any], temperature_k: float
+    report: dict[str, Any], temperature_k: float, min_recrossings: int = 1
 ) -> bool | None:
     """Small drift is necessary for convergence but nowhere near sufficient.
 
@@ -367,9 +388,17 @@ def _fes_converged(
     So convergence also requires the walker to have gone back and forth over
     the barrier: a well-tempered surface is trustworthy once the CV is
     diffusing across the region, not merely once the first basin is full.
+
+    `min_recrossings` is how many transitions count as "back and forth".
+    `count_recrossings` increments once per transition, so a one-way A -> B
+    trip scores 1 and a full A -> B -> A round trip scores 2. The default of
+    1 accepts a one-way crossing; a task whose criterion is a full round trip
+    (the reverse barrier is unsampled otherwise) should pass 2.
     """
     drift = report.get("fes_drift_kj_per_mol")
     recrossings = report.get("recrossings")
     if drift is None or recrossings is None:
         return None
-    return bool(drift < _KB_KJ_PER_MOL_K * temperature_k and recrossings >= 1)
+    return bool(
+        drift < _KB_KJ_PER_MOL_K * temperature_k and recrossings >= min_recrossings
+    )

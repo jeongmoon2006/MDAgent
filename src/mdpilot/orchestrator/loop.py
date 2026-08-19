@@ -30,7 +30,8 @@ is a possible follow-up.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
 
@@ -39,21 +40,30 @@ import numpy as np
 
 from mdpilot.adapters.base import MDAdapter
 from mdpilot.adapters.openmm_adapter import OpenMMAdapter
-from mdpilot.adapters.plumed_writer import PlumedInput
+from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
 from mdpilot.adapters.system_spec import SystemSpec
+from mdpilot.diagnostics.free_energy import metad_report
 from mdpilot.diagnostics.report import make_report
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
-from mdpilot.sampling.bias_designer import design_bias
+from mdpilot.sampling.bias_designer import design_bias, design_upper_wall
 from mdpilot.sampling.cv_designer import CVProposal, design_cv
 
 _TIMESTEP_FS = 2.0  # matches the OpenMM adapter's integrator timestep
 _STEPS_PER_NS = int(1_000_000.0 / _TIMESTEP_FS)  # 500_000 steps/ns at 2 fs
 _METAD_TEMPERATURE_K = 300.0  # matches the adapters' thermostat; follows SystemSpec when temperature does
 _PLUMED_DAT_NAME = "plumed.dat"  # canonical bias artifact (the OpenMM adapter also writes here)
+# PLUMED's own outputs, alongside plumed.dat. These names must match the
+# defaults `_build_plumed_input` leaves on MetadynamicsBias.hills_file and
+# PlumedInput.colvar_file — they are what the rendered FILE= directives point at.
+_HILLS_NAME = "HILLS"
+_COLVAR_NAME = "COLVAR"
 
 StopReason = Literal[
-    "scientist_said_stop", "max_rounds_reached", "switch_to_metad_requested"
+    "scientist_said_stop",
+    "max_rounds_reached",
+    "switch_to_metad_requested",
+    "biased_budget_exhausted",
 ]
 
 # Given a rendered plumed.dat string, build an adapter that runs biased MD.
@@ -85,6 +95,9 @@ def run_campaign(
     initial_steps: int = 25_000,         # 50 ps default at 2 fs
     max_rounds: int = 10,
     max_extra_ns: float = 2.0,
+    max_biased_ns: float | None = None,
+    min_recrossings: int = 1,
+    cv_upper_wall_nm: float | None = None,
     seed: int = 42,
     report_interval_steps: int = 500,    # 1 ps/frame at 2 fs
     equilibration_steps: int = 0,
@@ -96,10 +109,20 @@ def run_campaign(
     `adapter` defaults to `OpenMMAdapter(work_dir=work_dir, seed=seed)`.
     Pass a different `MDAdapter` to run through another engine.
 
-    `max_rounds` and `max_extra_ns` are loop-control bounds and may differ
-    between invocations; the physics-bound params (seed, initial_steps,
-    report_interval_steps, equilibration_steps) are locked at first init
-    and a mismatch on resume raises.
+    `max_rounds`, `max_extra_ns` and `max_biased_ns` are loop-control bounds
+    and may differ between invocations; the physics-bound params (seed,
+    initial_steps, report_interval_steps, equilibration_steps) are locked at
+    first init and a mismatch on resume raises.
+
+    `max_biased_ns` caps *cumulative* simulation time in the metadynamics
+    phase, counting across rounds and across resumes (it is recomputed from
+    the persisted biased rounds, so a restart cannot reset the meter). The
+    round that would exceed it is shortened to land exactly on the budget and
+    the campaign then ends with `biased_budget_exhausted`. The vanilla phase
+    is not counted. Left at None the biased phase is bounded only by
+    `max_rounds`. A compute budget stated only in `task_expectation` is
+    advisory — the model can read it and still ask for more — so anything
+    running unattended wants this set.
 
     `task_expectation` is free-form campaign-level guidance threaded into
     every `decide()` call — what the trajectory must accomplish, the
@@ -192,6 +215,7 @@ def run_campaign(
             topology_path=adapter.topology_path,
             factory=biased_adapter_factory,
             plumed_dat_path=plumed_dat_path,
+            cv_upper_wall_nm=cv_upper_wall_nm,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
@@ -199,8 +223,16 @@ def run_campaign(
         n_steps = initial_steps
     elif last.plumed_dat_path is not None:
         # Mid-metaD-phase resume: rebuild the biased adapter from the persisted
-        # plumed.dat and continue from that round's (biased) checkpoint.
-        adapter = biased_adapter_factory(last.plumed_dat_path.read_text())
+        # plumed.dat and continue from that round's (biased) checkpoint. The
+        # deposited bias is the other half of that resume point — restore the
+        # snapshot paired with the checkpoint, then turn RESTART on so METAD
+        # reads it back instead of backing it up and refilling from zero.
+        _restore_bias_state(
+            last.plumed_dat_path.parent, rounds_dir, last.round_index
+        )
+        adapter = biased_adapter_factory(
+            enable_restart(last.plumed_dat_path.read_text())
+        )
         adapter.prepare()
         adapter.start()
         _require_checkpoint(last)
@@ -216,29 +248,72 @@ def run_campaign(
         start_round = last.round_index + 1
         n_steps = _extend_steps(last.extra_ns, max_extra_ns)
 
+    # Cumulative biased steps already spent, so a resume continues the meter
+    # rather than restarting it.
+    biased_steps_run = sum(
+        r.n_steps for r in prior_rows if r.plumed_dat_path is not None
+    )
+    biased_step_budget = (
+        int(max_biased_ns * _STEPS_PER_NS) if max_biased_ns is not None else None
+    )
+
     ledger_notes: list[store.LedgerNote] = list(store.list_ledger_notes(work_dir))
 
     for round_idx in range(start_round, max_rounds + 1):
+        if in_metad and biased_step_budget is not None:
+            remaining = biased_step_budget - biased_steps_run
+            if remaining <= 0:
+                return CampaignResult(
+                    work_dir, tuple(rounds), "biased_budget_exhausted"
+                )
+            # Shorten the round that would overshoot rather than skipping it —
+            # a partial round still deposits hills and still gets diagnosed.
+            n_steps = min(n_steps, remaining)
+
         dcd = rounds_dir / f"round_{round_idx:03d}{adapter.trajectory_extension}"
         adapter.run_steps(
             n_steps,
             trajectory_path=dcd,
             report_interval_steps=report_interval_steps,
         )
-        report = make_report(dcd, adapter.topology_path)
-        # Checkpoint before `decide()`, not after. The MD is already paid for at
-        # this point; a transient API failure in decide() would otherwise
-        # discard the whole round, since without a checkpoint restart has no
-        # resume point and re-runs it. A checkpoint with no matching row is the
-        # already-documented harmless case (D4).
+        if in_metad:
+            biased_steps_run += n_steps
+        # Checkpoint first: everything after this line can fail on something
+        # external (a `plumed sum_hills` that is not on PATH, a transient
+        # Anthropic outage) and the MD is already paid for. Without a
+        # checkpoint, restart has no resume point and re-runs the round. A
+        # checkpoint with no matching row is the documented harmless case (D4).
         ckpt = adapter.save_checkpoint(rounds_dir / f"round_{round_idx:03d}.chk")
+        if current_plumed_dat is not None:
+            _snapshot_bias_state(
+                current_plumed_dat.parent, rounds_dir, round_idx
+            )
+        report = _round_report(
+            dcd,
+            adapter.topology_path,
+            plumed_dat_path=current_plumed_dat,
+            fes_dir=rounds_dir / f"round_{round_idx:03d}_fes",
+            min_recrossings=min_recrossings,
+        )
         prior_summaries = [_compact_prior(r) for r in rounds]
         decision = decide(
             report,
             prior_round_summaries=prior_summaries,
             hypothesis_ledger=[f"R{n.round_index}: {n.text}" for n in ledger_notes],
             task_expectation=task_expectation,
+            phase="metad" if in_metad else "vanilla",
         )
+
+        override_note: str | None = None
+        if in_metad:
+            remaining = (
+                biased_step_budget - biased_steps_run
+                if biased_step_budget is not None
+                else None
+            )
+            decision, override_note = _refuse_premature_stop(
+                decision, report, remaining
+            )
 
         summary_path = rounds_dir / f"round_{round_idx:03d}.json"
         _persist_round_json(
@@ -259,12 +334,12 @@ def run_campaign(
             ),
             plumed_dat_path=current_plumed_dat,
         )
-        if decision.ledger_note:
-            store.append_ledger_note(
-                work_dir, round_index=round_idx, text=decision.ledger_note
-            )
+        for note in (decision.ledger_note, override_note):
+            if not note:
+                continue
+            store.append_ledger_note(work_dir, round_index=round_idx, text=note)
             ledger_notes.append(
-                store.LedgerNote(round_index=round_idx, text=decision.ledger_note)
+                store.LedgerNote(round_index=round_idx, text=note)
             )
         rounds.append(
             RoundResult(
@@ -289,6 +364,7 @@ def run_campaign(
                 topology_path=adapter.topology_path,
                 factory=biased_adapter_factory,
                 plumed_dat_path=plumed_dat_path,
+                cv_upper_wall_nm=cv_upper_wall_nm,
             )
             in_metad = True
             current_plumed_dat = plumed_dat_path
@@ -347,6 +423,124 @@ def _default_biased_factory(
     return unsupported
 
 
+# HILLS and COLVAR are to a biased round what the checkpoint is to a vanilla
+# one: the state needed to continue. They are snapshotted together and restored
+# together.
+_BIAS_STATE_FILES = (_HILLS_NAME, _COLVAR_NAME)
+
+
+def _snapshot_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> None:
+    """Copy the deposited bias alongside the round's checkpoint.
+
+    Turning RESTART on makes the live HILLS load-bearing, which turns the
+    existing mid-round crash window (D4: a crash between `save_checkpoint` and
+    `append_round` leaves the round absent, so restart re-runs it) from
+    "wasted time" into "wrong physics" — the re-run would deposit that round's
+    hills a second time on top of the ones already on disk. Snapshotting at
+    the same moment as the checkpoint means resume can restore the bias to
+    exactly the point the positions correspond to.
+    """
+    for name in _BIAS_STATE_FILES:
+        src = bias_dir / name
+        if src.exists():
+            shutil.copy2(src, _bias_snapshot_path(rounds_dir, round_index, name))
+
+
+def _restore_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> None:
+    """Put the bias back to its state at the end of `round_index`.
+
+    A missing snapshot is not an error: campaigns that pivoted before
+    snapshotting existed have none, and leaving the live files untouched is
+    the best available behaviour there.
+    """
+    bias_dir.mkdir(parents=True, exist_ok=True)
+    for name in _BIAS_STATE_FILES:
+        snapshot = _bias_snapshot_path(rounds_dir, round_index, name)
+        if snapshot.exists():
+            shutil.copy2(snapshot, bias_dir / name)
+
+
+def _bias_snapshot_path(rounds_dir: Path, round_index: int, name: str) -> Path:
+    return rounds_dir / f"round_{round_index:03d}.{name.lower()}"
+
+
+def _round_report(
+    trajectory_path: Path,
+    topology_path: Path,
+    *,
+    plumed_dat_path: Path | None,
+    fes_dir: Path,
+    min_recrossings: int = 1,
+) -> dict[str, Any]:
+    """Diagnostic bundle for one round, chosen by phase.
+
+    A vanilla round gets the equilibrium convergence bundle. A biased round
+    gets the free-energy bundle instead — *instead*, not alongside. The
+    equilibrium statistics describe an equilibrium ensemble, and a biased
+    trajectory is not one: the bias drives the observable, so a long
+    autocorrelation means the bias is still filling and a bimodal marginal
+    means the bias worked. Emitting them on a biased round would invite the
+    scientist to read them as convergence evidence, which is the category
+    error `diagnostics.free_energy` exists to remove.
+
+    HILLS and COLVAR accumulate across the whole biased phase in a single
+    file, so the surface integrated here is cumulative — which is what the
+    well-tempered convergence test wants — not per-round.
+    """
+    if plumed_dat_path is None:
+        report = make_report(trajectory_path, topology_path)
+        report["phase"] = "vanilla"
+        return report
+
+    bias_dir = plumed_dat_path.parent
+    report = metad_report(
+        bias_dir / _HILLS_NAME,
+        bias_dir / _COLVAR_NAME,
+        fes_dir,
+        temperature_k=_METAD_TEMPERATURE_K,
+        min_recrossings=min_recrossings,
+    )
+    report["phase"] = "metad"
+    report["trajectory_path"] = str(trajectory_path)
+    report["plumed_dat_path"] = str(plumed_dat_path)
+    return report
+
+
+def _refuse_premature_stop(
+    decision: Decision, report: dict[str, Any], remaining_steps: int | None
+) -> tuple[Decision, str | None]:
+    """Convert a biased-phase `stop` into an extend while the surface is unconverged.
+
+    The system prompt already states the rule — `fes_converged=true` → stop,
+    otherwise extend — but a rule the model can reason its way around is not a
+    rule. On the first CLN025 campaign the scientist read `fes_converged=false`,
+    wrote a paragraph rationalising the constituent numbers, and stopped with 16
+    of 20 ns unspent and the done criterion one recrossing short.
+
+    This does not take judgement away from the scientist: it still chooses the
+    CV, sizes each extension, and decides when to stop once the diagnostic
+    actually reports convergence. It removes only the ability to declare victory
+    against the diagnostic. The refusal is written to the hypothesis ledger
+    rather than swallowed, so the next round sees that it happened.
+    """
+    if decision.decision != "stop":
+        return decision, None
+    if report.get("fes_converged") is True:
+        return decision, None
+    if remaining_steps is not None and remaining_steps <= 0:
+        return decision, None
+
+    note = (
+        f"stop refused: the scientist chose stop but fes_converged="
+        f"{report.get('fes_converged')!r} "
+        f"(drift={report.get('fes_drift_kj_per_mol')}, "
+        f"recrossings={report.get('recrossings')}, "
+        f"required>={report.get('min_recrossings')}). Budget remains, so the "
+        f"round was converted to an extend. Reason given was: {decision.reason}"
+    )
+    return replace(decision, decision="extend", extra_ns=decision.extra_ns or 0.5), note
+
+
 def _extend_steps(extra_ns: float | None, max_extra_ns: float) -> int:
     """Steps for an extend round, clamped to the caller's `max_extra_ns`.
 
@@ -364,6 +558,7 @@ def _pivot_to_metad(
     topology_path: Path,
     factory: BiasedAdapterFactory,
     plumed_dat_path: Path,
+    cv_upper_wall_nm: float | None = None,
 ) -> MDAdapter:
     """Resolve a CV proposal into a biased, started adapter.
 
@@ -374,7 +569,11 @@ def _pivot_to_metad(
     """
     plumed_dat_path.parent.mkdir(parents=True, exist_ok=True)
     plumed_input = _build_plumed_input(
-        proposal, source_trajectory, topology_path, plumed_dat_path.parent
+        proposal,
+        source_trajectory,
+        topology_path,
+        plumed_dat_path.parent,
+        cv_upper_wall_nm=cv_upper_wall_nm,
     )
     plumed_dat_path.write_text(plumed_input)
     biased = factory(plumed_input)
@@ -388,6 +587,7 @@ def _build_plumed_input(
     trajectory_path: Path,
     topology_path: Path,
     output_dir: Path,
+    cv_upper_wall_nm: float | None = None,
 ) -> str:
     """Proposal → resolved CV → sized bias → rendered plumed.dat text.
 
@@ -396,20 +596,30 @@ def _build_plumed_input(
     the process working directory, so the deposited bias would otherwise land
     outside the campaign entirely.
     """
-    topology = md.load_topology(str(topology_path))
+    # Loaded with coordinates, not just connectivity: an `rmsd` CV measures
+    # against a reference structure, and the campaign topology is the same
+    # reference the vanilla observable uses, so both phases score against one
+    # fixed structure rather than two different ones.
+    reference = md.load(str(topology_path))
     cv = design_cv(
         CVProposal(
             cv_type=proposal.cv_type,
             selections=tuple(proposal.selections),
             label=proposal.label,
         ),
-        topology,
+        reference.topology,
+        reference=reference,
+        output_dir=output_dir,
     )
     bias = design_bias(
         cv, trajectory_path, topology_path, temperature_k=_METAD_TEMPERATURE_K
     )
+    wall = design_upper_wall(cv, cv_upper_wall_nm)
     return PlumedInput(
-        cvs=(cv,), bias=bias, output_dir=Path(output_dir).resolve()
+        cvs=(cv,),
+        bias=bias,
+        walls=(wall,) if wall is not None else (),
+        output_dir=Path(output_dir).resolve(),
     ).render()
 
 
@@ -443,17 +653,32 @@ def _row_to_result(row: store.RoundRow) -> RoundResult:
 
 
 def _compact_prior(r: RoundResult) -> dict[str, Any]:
-    """Lean view of a prior round for the scientist's context — no raw report."""
-    return {
+    """Lean view of a prior round for the scientist's context — no raw report.
+
+    Phase-keyed for the same reason the per-round report is: carrying `ess`
+    and `plateau_reached` forward from a biased round would re-introduce the
+    equilibrium statistics the biased report deliberately omits.
+    """
+    base = {
         "round_index": r.index,
         "n_steps": r.n_steps,
-        "trajectory_length_ns": r.report.get("trajectory_length_ns"),
-        "ess": r.report.get("ess"),
-        "plateau_reached": r.report.get("plateau_reached"),
+        "phase": r.report.get("phase", "vanilla"),
         "decision": r.decision.decision,
         "reason": r.decision.reason,
-        "biased": r.plumed_dat_path is not None,
     }
+    if r.plumed_dat_path is not None:
+        base.update(
+            fes_drift_kj_per_mol=r.report.get("fes_drift_kj_per_mol"),
+            recrossings=r.report.get("recrossings"),
+            fes_converged=r.report.get("fes_converged"),
+        )
+    else:
+        base.update(
+            trajectory_length_ns=r.report.get("trajectory_length_ns"),
+            ess=r.report.get("ess"),
+            plateau_reached=r.report.get("plateau_reached"),
+        )
+    return base
 
 
 def _persist_round_json(

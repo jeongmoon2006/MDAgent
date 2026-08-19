@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import mdtraj as md
 import pytest
+from pathlib import Path
 
-from mdpilot.adapters.plumed_writer import DistanceCV, GyrationCV, TorsionCV
+from mdpilot.adapters.plumed_writer import DistanceCV, GyrationCV, TorsionCV, RmsdCV
 from mdpilot.sampling.cv_designer import CVProposal, design_cv
 
 
@@ -77,7 +78,7 @@ def test_gyration_resolves_to_atom_group() -> None:
 
 def test_unknown_cv_type_lists_available_types() -> None:
     top = _mini_peptide()
-    prop = CVProposal(cv_type="rmsd", selections=(), label="x")  # type: ignore[arg-type]
+    prop = CVProposal(cv_type="coordination", selections=(), label="x")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="unknown cv_type"):
         design_cv(prop, top)
 
@@ -148,3 +149,68 @@ def test_gyration_single_atom_selection_raises() -> None:
     )
     with pytest.raises(ValueError, match=">=2 atoms"):
         design_cv(prop, top)
+
+
+# ---------- rmsd ----------
+
+
+def _reference_frame():
+    """A 1-frame trajectory over the mini peptide, for rmsd references."""
+    import mdtraj as md
+    import numpy as np
+
+    top = _mini_peptide()
+    xyz = np.arange(top.n_atoms * 3, dtype=np.float32).reshape(1, top.n_atoms, 3) / 100.0
+    return md.Trajectory(xyz, top)
+
+
+def test_rmsd_writes_a_reference_with_original_serial_numbers(tmp_path: Path) -> None:
+    """PLUMED maps the reference onto the running system by PDB *serial
+    number*. mdtraj renumbers serials from 1 when saving a sliced trajectory,
+    which would silently align against the first N atoms of the system instead
+    of the selected ones — so the writer must preserve index+1."""
+    reference = _reference_frame()
+    prop = CVProposal(cv_type="rmsd", selections=("name CA",), label="rmsd_native")
+
+    cv = design_cv(prop, reference.topology, reference=reference, output_dir=tmp_path)
+
+    assert isinstance(cv, RmsdCV)
+    assert "RMSD" in cv.render() and "TYPE=OPTIMAL" in cv.render()
+    assert cv.reference_path.is_absolute()
+
+    serials = [
+        int(line[6:11]) for line in cv.reference_path.read_text().splitlines()
+        if line.startswith("ATOM")
+    ]
+    assert serials == [a + 1 for a in cv.atoms]
+    # Not renumbered from 1 — the selected CAs are not the first atoms.
+    assert serials[0] != 1
+
+
+def test_rmsd_reference_weights_alignment_and_displacement(tmp_path: Path) -> None:
+    """PLUMED reads occupancy as the alignment weight and B-factor as the
+    displacement weight; both must be set or the CV measures the wrong thing."""
+    reference = _reference_frame()
+    cv = design_cv(
+        CVProposal(cv_type="rmsd", selections=("name CA",), label="r"),
+        reference.topology, reference=reference, output_dir=tmp_path,
+    )
+    for line in cv.reference_path.read_text().splitlines():
+        if line.startswith("ATOM"):
+            assert float(line[54:60]) == 1.00, line   # occupancy
+            assert float(line[60:66]) == 1.00, line   # B-factor
+
+
+def test_rmsd_without_a_reference_names_what_is_missing(tmp_path: Path) -> None:
+    top = _mini_peptide()
+    prop = CVProposal(cv_type="rmsd", selections=("name CA",), label="r")
+    with pytest.raises(ValueError, match="needs `reference`"):
+        design_cv(prop, top)
+
+
+def test_rmsd_needs_three_atoms_for_superposition(tmp_path: Path) -> None:
+    """Optimal superposition is undefined on fewer than 3 points."""
+    reference = _reference_frame()
+    prop = CVProposal(cv_type="rmsd", selections=("resSeq 1 and name CA",), label="r")
+    with pytest.raises(ValueError, match=">=3 atoms"):
+        design_cv(prop, reference.topology, reference=reference, output_dir=tmp_path)

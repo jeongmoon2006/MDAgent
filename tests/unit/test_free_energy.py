@@ -278,3 +278,56 @@ def test_oscillating_walker_still_registers_its_transitions() -> None:
         np.full(20, left + 0.05), np.full(20, right - 0.05),
     ])
     assert count_recrossings(series, low, high) == 3
+
+
+def test_min_recrossings_can_require_a_full_round_trip() -> None:
+    """`count_recrossings` increments per transition, so a one-way A -> B trip
+    scores 1 and a full A -> B -> A round trip scores 2. A task whose criterion
+    is a round trip (otherwise the reverse barrier is never sampled) must be
+    able to demand 2 rather than accept the one-way default."""
+    one_way = {"fes_drift_kj_per_mol": 0.5, "recrossings": 1}
+    round_trip = {"fes_drift_kj_per_mol": 0.5, "recrossings": 2}
+
+    assert _fes_converged(one_way, 300.0) is True
+    assert _fes_converged(one_way, 300.0, min_recrossings=2) is False
+    assert _fes_converged(round_trip, 300.0, min_recrossings=2) is True
+
+
+def test_barrier_crossed_is_not_gated_on_min_recrossings(tmp_path: Path) -> None:
+    """`barrier_crossed` answers "did the walker cross at all" (n >= 1).
+
+    Gating it on min_recrossings made it report False on a run that had
+    demonstrably crossed once — the field contradicting its own name. The
+    scientist caught it live and called it inconsistent, then reasoned poorly
+    from it. min_recrossings belongs to `fes_converged` alone.
+    """
+    from mdpilot.diagnostics.free_energy import count_recrossings
+
+    # One-way A -> B trip: crossed the barrier, but not a round trip.
+    series = np.array([0.0, 0.0, 0.5, 1.0, 1.0])
+    n = count_recrossings(series, 0.2, 0.8)
+    assert n == 1
+    assert (n >= 1) is True                                   # barrier_crossed
+    assert _fes_converged({"fes_drift_kj_per_mol": 0.5, "recrossings": n},
+                          300.0, min_recrossings=2) is False  # not yet converged
+
+
+def test_sum_hills_drops_a_trailing_duplicate_surface(tmp_path: Path, monkeypatch) -> None:
+    """When the hill count is a multiple of --stride, sum_hills emits the final
+    complete surface *and* an identical last strided one. Comparing that pair
+    yields a drift of exactly 0.0 by construction, which silently made the
+    drift half of the convergence gate vacuous for every biased round."""
+    from mdpilot.diagnostics import free_energy as fe
+
+    out = tmp_path / "out"
+    out.mkdir()
+    body = "#! FIELDS cv file.free\n0.0 0.0\n1.0 5.0\n"
+    for i in range(3):
+        (out / f"fes.dat{i}.dat").write_text(body if i < 1 else "#! FIELDS cv file.free\n0.0 0.0\n1.0 7.0\n")
+    # fes.dat1 and fes.dat2 are byte-identical -> the trailing duplicate.
+    monkeypatch.setattr(fe, "plumed_available", lambda: True)
+    monkeypatch.setattr(fe.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stderr": ""})())
+
+    surfaces = fe.sum_hills(tmp_path / "HILLS", out, stride=10)
+    assert [p.name for p in surfaces] == ["fes.dat0.dat", "fes.dat1.dat"]
