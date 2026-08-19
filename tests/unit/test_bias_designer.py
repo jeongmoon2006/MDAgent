@@ -19,8 +19,9 @@ from mdpilot.sampling.bias_designer import (
     _DEFAULT_BIAS_FACTOR,
     _HEIGHT_KT_FRACTION,
     _KB_KJ_PER_MOL_K,
-    _SIGMA_FLOOR,
     design_bias,
+    sigma_floor,
+    size_sigma,
 )
 
 
@@ -74,7 +75,8 @@ def test_pinned_cv_sigma_is_floored(tmp_path: Path) -> None:
 
     bias = design_bias(DistanceCV(label="d", atoms=(0, 1)), dcd, pdb)
 
-    assert bias.sigma[0] == pytest.approx(_SIGMA_FLOOR)
+    assert bias.sigma[0] == pytest.approx(sigma_floor(DistanceCV(label="d", atoms=(0, 1))))
+    assert bias.sigma_floored is True
 
 
 def test_gyration_sizes_from_the_atom_subset(tmp_path: Path) -> None:
@@ -118,7 +120,10 @@ def test_constant_torsion_uses_circular_spread_and_floors(tmp_path: Path) -> Non
 
     bias = design_bias(TorsionCV(label="phi", atoms=(0, 1, 2, 3)), dcd, pdb)
 
-    assert bias.sigma[0] == pytest.approx(_SIGMA_FLOOR)
+    assert bias.sigma[0] == pytest.approx(
+        sigma_floor(TorsionCV(label="phi", atoms=(0, 1, 2, 3)))
+    )
+    assert bias.sigma_floored is True
     assert bias.height == pytest.approx(_height(), rel=1e-6)
 
 
@@ -162,3 +167,65 @@ def test_bias_factor_override_flows_through(tmp_path: Path) -> None:
     bias = design_bias(DistanceCV(label="d", atoms=(0, 1)), dcd, pdb, bias_factor=15.0)
 
     assert bias.bias_factor == pytest.approx(15.0)
+
+
+# ---------- F4: the SIGMA floor ----------
+
+def test_pinned_cv_gets_the_floor_not_thermal_jitter(tmp_path: Path) -> None:
+    """The F4 regression, with the real measured number.
+
+    Backbone Rg over 10 ps of Trp-cage gave spread/3 = 0.0018 nm. Hills that
+    narrow never overlap, so the accumulated bias stays ~0, well-tempering has
+    nothing to damp, and WT-MetaD degenerates into plain metaD that fills
+    nothing. The floor has to bind here.
+    """
+    cv = GyrationCV(label="rg", atoms=(0, 1, 2))
+    sigma, floored = size_sigma(cv, spread=0.0018 * 3.0)
+
+    assert floored is True
+    assert sigma == pytest.approx(sigma_floor(cv))
+    assert sigma > 0.01, "a hill this narrow cannot overlap its neighbours"
+
+
+def test_well_sampled_cv_keeps_its_measured_width() -> None:
+    """The floor is a floor, not an override — a CV that genuinely explored a
+    wide basin must not be widened to a rule of thumb."""
+    cv = GyrationCV(label="rg", atoms=(0, 1, 2))
+    sigma, floored = size_sigma(cv, spread=0.30)
+
+    assert floored is False
+    assert sigma == pytest.approx(0.10)
+
+
+def test_floor_binds_below_the_boundary_and_releases_above() -> None:
+    """Behaviour either side of the floor. Exact-equality at the boundary is
+    left unspecified — `floor * 3 / 3` lands an ulp off and either answer is
+    correct there."""
+    cv = DistanceCV(label="d", atoms=(0, 1))
+    floor = sigma_floor(cv)
+
+    above, floored_above = size_sigma(cv, spread=floor * 3.0 * 1.05)
+    below, floored_below = size_sigma(cv, spread=floor * 3.0 * 0.95)
+
+    assert floored_above is False
+    assert above == pytest.approx(floor * 1.05)
+    assert floored_below is True
+    assert below == pytest.approx(floor)
+
+
+def test_torsion_floor_is_in_radians_not_nanometres() -> None:
+    """Torsions span 2π; a 0.02 rad hill would be absurdly narrow. Sharing one
+    floor across CV types would silently mis-size dihedral biases."""
+    angular = sigma_floor(TorsionCV(label="phi", atoms=(0, 1, 2, 3)))
+    linear = sigma_floor(DistanceCV(label="d", atoms=(0, 1)))
+
+    assert angular > linear
+    assert 0.1 <= angular <= 0.35
+
+
+def test_unknown_cv_type_has_no_silent_default() -> None:
+    class FakeCV:
+        label = "x"
+
+    with pytest.raises(TypeError, match="no SIGMA floor"):
+        sigma_floor(FakeCV())  # type: ignore[arg-type]

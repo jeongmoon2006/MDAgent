@@ -242,3 +242,31 @@ def test_plumed_input_places_hills_under_output_dir() -> None:
     text = pi.render()
     assert "FILE=/campaigns/demo/rounds/HILLS" in text
     assert "FILE=/campaigns/demo/rounds/COLVAR" in text
+
+
+def test_floored_sigma_is_declared_in_the_plumed_input() -> None:
+    """A floored SIGMA must be visible in the audit artifact. Reading plumed.dat
+    later, a substituted width is indistinguishable from a measured one unless
+    the file says so."""
+    pi = PlumedInput(
+        cvs=(DistanceCV(label="d1", atoms=(0, 9)),),
+        bias=MetadynamicsBias(
+            cv_labels=("d1",), sigma=(0.02,), height=1.0, pace=500,
+            sigma_floored=True,
+        ),
+        output_dir=Path("/campaigns/demo"),
+    )
+    text = pi.render()
+    assert "NOTE" in text and "floor" in text
+    assert "under-sampled" in text
+
+
+def test_measured_sigma_carries_no_note() -> None:
+    pi = PlumedInput(
+        cvs=(DistanceCV(label="d1", atoms=(0, 9)),),
+        bias=MetadynamicsBias(
+            cv_labels=("d1",), sigma=(0.06,), height=1.0, pace=500
+        ),
+        output_dir=Path("/campaigns/demo"),
+    )
+    assert "NOTE" not in pi.render()

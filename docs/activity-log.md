@@ -85,12 +85,20 @@ Production is now NPT from an equilibrated start, so **new runs are not drawn fr
 
 Deliberately not regenerated in this session: 9 h of CPU is a poor trade before the M4 live work, which will want chignolin fixtures anyway.
 
-### F4 — `SIGMA = spread/3` needs a trajectory that has actually sampled the basin (2026-08-11)
+### F4 — `SIGMA = spread/3` needs a trajectory that has actually sampled the basin (2026-08-11) — GUARDED 2026-08-11
 Measured on the first live metaD run: sizing the Rg hill width off a **10 ps** vanilla Trp-cage trajectory gives `SIGMA ≈ 0.0018 nm`. Backbone Rg barely moves in 10 ps, so spread/3 measures thermal jitter, not basin width. Hills that narrow never overlap → the accumulated bias at each new deposit stays ≈ 0 → well-tempering has nothing to damp and heights never decay. WT-MetaD silently degenerates into plain metaD that fills nothing.
 
 At `SIGMA = 0.02 nm` (a physically sensible Rg width for a 20-residue protein) the same run behaves correctly: heights decay 1.386 → 0.577 kJ/mol over 30 hills while the bias accumulates to 19.7 kJ/mol.
 
-The heuristic is not wrong — σ ≈ intrabasin fluctuation / 3 is standard — but it is only valid once the vanilla phase has sampled the basin. The `switch_to_metad` decision fires precisely when the CV looks *pinned*, which is also when its measured spread is least trustworthy. Needs a guard before the M4 done-criterion run: either a minimum-sampling precondition (τ_int-based) on the source trajectory, or a physical floor per CV type. The existing `_SIGMA_FLOOR = 1e-3` is a PLUMED-validity floor, not a physical one, and does not help here.
+The heuristic is not wrong — σ ≈ intrabasin fluctuation / 3 is standard — but it is only valid once the vanilla phase has sampled the basin. The `switch_to_metad` decision fires precisely when the CV looks *pinned*, which is also when its measured spread is least trustworthy.
+
+**Guard (2026-08-11):** physical per-CV-type floors replace the old `_SIGMA_FLOOR = 1e-3`, which was a PLUMED-validity epsilon (keep SIGMA > 0) and did nothing for this. Floors are the narrowest hill worth depositing for each coordinate: **0.02 nm** for `distance` and `gyration` (~5 deposits across a 0.1 nm basin, enough overlap to fill), **0.15 rad** for `torsion` (torsions span 2π; the conventional dihedral range is 0.1–0.35 rad, and sharing the linear floor would have mis-sized every dihedral bias by an order of magnitude). `size_sigma()` returns `(sigma, floored)`; the flag rides on `MetadynamicsBias.sigma_floored` and makes `PlumedInput.render()` emit a `# NOTE:` block, so a substituted width is never indistinguishable from a measured one when the plumed.dat is read back later.
+
+Chosen over the τ_int precondition considered alongside it: a low-ESS check correctly identifies that the spread is untrustworthy but yields no better number, and its only honest response — refuse the pivot and extend — would need a new path through the loop. The floor gives a defensible width now; the reliability signal is the `floored` flag.
+
+Verified against the original input: the same `smoke.dcd` + backbone-Rg proposal that measured 0.00166 nm now yields SIGMA = 0.02 nm with the note in the rendered file. **The floor is a floor, not an override** — a CV measuring wider keeps its measured value (unit-tested both sides).
+
+Still open on sizing: there is no *upper* guard. A CV that drifted monotonically gives an inflated spread and hills wider than the features being resolved. Not observed yet, so not guarded.
 
 ### F5 — PLUMED resolves FILE= against the process CWD, and buffers output (2026-08-11)
 Two defects found by the first live run, both fixed in the same session:
@@ -109,6 +117,31 @@ Also worth knowing when reading HILLS: PLUMED records well-tempered hill heights
 ---
 
 ## 2. Session journal
+
+### 2026-08-11 — F4 guarded; HILLS read back into a free-energy surface
+Two of the three blockers on the M4 done-criterion run. Both were cases of a statistic reporting success on a run that did nothing.
+
+- **F4 σ guard** (details in the finding). Physical per-CV-type floors — 0.02 nm for `distance`/`gyration`, 0.15 rad for `torsion` — replacing the old `1e-3` PLUMED-validity epsilon. `size_sigma()` returns `(sigma, floored)`; the flag rides on `MetadynamicsBias.sigma_floored` and makes `PlumedInput.render()` emit a `# NOTE:` block, so a substituted width can never be mistaken for a measured one when the plumed.dat is read back. Verified against the original F4 input: `smoke.dcd` + backbone Rg went 0.00166 nm → 0.02 nm with the note present.
+- **`diagnostics/free_energy.py`** — the deposited bias is no longer write-only. `sum_hills()` shells out to `plumed sum_hills` (delegated, not reimplemented: PLUMED pre-scales WT heights by γ/(γ-1) and uses stretched Gaussians, so a hand-rolled sum would silently disagree with the file it integrates). `load_fes` / `load_colvar` parse the results; `FreeEnergySurface` yields basins, barrier height and depth; `fes_drift_kj_per_mol` implements the standard WT convergence test over the overlapping grid region; `count_recrossings` measures barrier crossings with hysteresis. `metad_report()` returns the same JSON-serializable scalars-and-paths contract as `make_report`.
+- **`fes_converged` requires low drift AND at least one recrossing.** Drift alone is trivially satisfied: a walker that never leaves its basin produces a surface that stops changing immediately, because nothing new is being sampled. Reporting that as converged is the metastable-basin error one level up — the same shape as the problem the exploration diagnostic exists to solve. Confirmed on the real Trp-cage HILLS, which reports drift 1.83 kJ/mol (under kT) with zero recrossings and is now correctly *not* converged.
+- **Two bugs the tests caught, both in prominence/threshold logic:**
+  1. Basin prominence was measured against the *global* maximum on each side, so any ripple at the bottom of a deep well inherited the prominence of the whole well and counted as a basin. Now measured against the enclosing local maximum (`_uphill_peak`). Follow-on: the filter then discarded the global minimum when it sat inside a ripple, leaving a surface with no basins at all — the deepest point is now always a basin by definition.
+  2. Recrossings were counted against the basin *minima* as thresholds, so a walker oscillating around a basin without landing exactly on the minimum scored zero. `basin_thresholds()` now places the dividing surfaces halfway between the crest and each minimum, committor-style.
+- **PLUMED naming gotcha:** with `--stride`, sum_hills appends the index *and* another `.dat` to `--outfile`, giving `fes.dat0.dat`, not `fes_0.dat`. A glob written for the latter silently finds nothing and falls back to a single surface, which would have disabled the drift check without failing.
+- Tests: 163 unit green (was 137; +21 free energy, +5 σ floor), 162 + 1 skipped in `.venv`. New `tests/integration/test_free_energy_live.py` (7 tests) runs real `sum_hills` against synthesized two-basin HILLS — clustered hills integrate to two basins with a positive barrier, a shuttling walker reports ≥3 recrossings, a pinned one is refused a convergence verdict.
+- **Not wired into the loop yet.** `metad_report` exists but nothing calls it: biased rounds still receive `make_report`'s equilibrium statistics. Doing so needs a decision on whether the equilibrium verdicts (`plateau_reached`, `ess`, `well_sampled`, `exploring`) are suppressed or merely relabelled on a biased round, and a matching change to the scientist's system prompt — which is the agent's reasoning loop, so it wants sign-off per CLAUDE.md §1.
+- **Open / next:** wire `metad_report` into `loop.py` for biased rounds + update the scientist prompt; then chignolin (CLN025 / 5AWL) and the done-criterion campaign.
+
+### 2026-08-11 (latest) — GPU by default, README rewrite (commit `70a4b23`)
+- **Platform selection.** `resolve_platform()` walks `CUDA → HIP → OpenCL → CPU` and returns the first that is *usable*, not merely registered — it builds a throwaway two-particle Context with a real `NonbondedForce` and takes a step. `lru_cache`d; `OpenMMAdapter(platform=...)` pins it explicitly. Both hardcoded `Platform.getPlatformByName("CPU")` sites are gone.
+- **Why the probe exists.** The conda env registered CUDA and then died at kernel load with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`: conda-forge had installed `cuda-nvrtc 13.3.33` while the driver supports CUDA 13.2, so OpenMM's JIT emitted PTX the driver could not consume. Selecting on registration alone would have handed back a platform that fails *mid-campaign, after setup is already paid for*. Fixed the env with `micromamba install -n mdpilot -c conda-forge "cuda-version=13.2"`; the pin is documented in README because a fresh `micromamba create` reproduces the mismatch.
+- **Mixed precision on GPU.** `{"Precision": "mixed"}` for CUDA/HIP/OpenCL. OpenMM's GPU default is single, which would make a GPU run quietly *less* accurate than the CPU run it replaces — a silent quality regression is worse than a slow one.
+- **Measured** on the real 4810-atom Trp-cage system: **11.4 ns/day (CPU) → 298.9 ns/day (CUDA)**, 26×. Through the real adapter, the metaD + equilibration live suites went from ~10.5 min to **61 s** for 10 tests.
+- Tests: +6 unit for platform selection, including the registered-but-broken fallback and a bogus-platform probe. 130 unit green in conda, 129 + 1 skipped in `.venv`.
+- README rewritten around demonstrated capability, with the M4 done-criterion explicitly marked unmet. `.gitignore` extended for PLUMED output (defence-in-depth against the F5 CWD bug), GROMACS derived files, checkpoints, and presentation artifacts.
+- **Not done:** the GROMACS adapter still shells out to the Ubuntu `gmx`, which is a CPU-only build. GPU applies to the OpenMM path only.
+- **Planning consequence.** At ~300 ns/day the tens-of-ns metaD run chignolin needs is a few hours locally, not the multi-day CPU job that made D6 step 5 (AWS launcher) look like a prerequisite. **The M4 done-criterion now looks reachable on this machine**, so M5 stays deferred.
+- **Open / next:** F4 σ guard (blocking — narrow hills mean WT-MetaD fills nothing); read HILLS back via `plumed sum_hills` so post-pivot rounds stop being judged by the unbiased convergence rubric; chignolin (CLN025 / 5AWL) `SystemSpec` + `task_expectation`; then the done-criterion campaign with the LLM in the loop.
 
 ### 2026-08-11 (later) — M4 step 5a: PLUMED runtime live, first metadynamics ever executed
 Closes the "written but never run" gap on the whole M4 bias path. Prior to this session no hill had ever been deposited by this codebase.

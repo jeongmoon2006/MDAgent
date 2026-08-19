@@ -99,6 +99,7 @@ class MetadynamicsBias:
     pace: int                # steps between deposits
     bias_factor: float = 10.0        # γ, dimensionless; must be > 1
     temperature_k: float = 300.0     # must match the thermostat
+    sigma_floored: bool = False      # SIGMA came from the floor, not the data
     hills_file: str = "HILLS"
     bias_label: str = "metad"
 
@@ -229,9 +230,17 @@ class PlumedInput:
         ]
         for cv in self.cvs:
             lines.append(cv.render())
+        lines += ["", "# Bias"]
+        if isinstance(self.bias, MetadynamicsBias) and self.bias.sigma_floored:
+            # The audit artifact has to say when SIGMA did not come from the
+            # data, or a floored width reads later as a measured one.
+            lines += [
+                "# NOTE: SIGMA was raised to this CV type's floor — the source",
+                "#       trajectory's spread measured narrower than the",
+                "#       narrowest hill worth depositing. Treat the vanilla",
+                "#       phase as having under-sampled this coordinate.",
+            ]
         lines += [
-            "",
-            "# Bias",
             self._bias_with_resolved_paths().render(),
             "",
             "# Periodic output",
