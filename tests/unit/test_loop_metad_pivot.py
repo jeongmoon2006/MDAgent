@@ -84,6 +84,8 @@ _REPORT = {
 _METAD_REPORT = {
     "fes_drift_kj_per_mol": 0.9,
     "recrossings": 3,
+    "recrossing_low": -0.4,
+    "recrossing_high": 0.6,
     "barrier_crossed": True,
     "fes_converged": True,
     "n_basins_fes": 2,
@@ -607,3 +609,37 @@ def test_biased_budget_survives_a_resume(tmp_path: Path, monkeypatch) -> None:
 
     assert result.stop_reason == "biased_budget_exhausted"
     assert biased[0].run_calls == [50]   # only the 50 steps still owed
+
+
+def test_prior_summaries_carry_the_boundaries_a_recrossing_count_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two basins are re-derived from the current surface each round, so
+    the boundaries move. A count carried into the campaign history without them
+    is not comparable across rounds — the same defect that phase-keying fixed
+    for `ess`, arriving through the history channel instead."""
+    _stub_collaborators(
+        monkeypatch,
+        [
+            Decision("switch_to_metad", "pivot", None, metad_proposal=_proposal()),
+            Decision("stop", "converged", None),
+        ],
+    )
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    result = run_campaign(
+        work_dir=tmp_path / "campaign",
+        adapter=base,
+        biased_adapter_factory=lambda p: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=p
+        ),
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    biased = [s for s in map(loop_mod._compact_prior, result.rounds)
+              if s["phase"] == "metad"]
+    assert biased
+    for summary in biased:
+        assert summary["recrossings"] == 3
+        assert summary["recrossing_low"] == -0.4
+        assert summary["recrossing_high"] == 0.6

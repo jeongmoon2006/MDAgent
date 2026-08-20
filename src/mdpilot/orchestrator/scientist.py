@@ -137,13 +137,18 @@ free-energy surface:
 - `fes_drift_kj_per_mol` — how much the surface changed between the last two \
 cumulative estimates. The standard well-tempered convergence test.
 - `recrossings` — barrier crossings between the two deepest basins, counted \
-with hysteresis. `barrier_crossed` is `recrossings >= 1`.
+with hysteresis. `barrier_crossed` is `recrossings >= 1`. The two basins are \
+re-derived from the *current* surface every round, so these boundaries move \
+as the bias fills. `recrossing_low` and `recrossing_high` are the CV values \
+the count was actually taken between; `cv_start` is where the walker began.
 - `fes_converged` — true only when drift is below kT (≈2.5 kJ/mol at 300 K) \
 AND `recrossings >= 1`. Low drift *alone* is not convergence: a walker that \
 never left its starting basin produces a surface that stops changing \
 immediately, because nothing new is being sampled.
-- `n_basins_fes`, `barrier_kj_per_mol`, `fes_depth_kj_per_mol`, `cv_min`, \
-`cv_max`, `n_fes_estimates` — shape of the surface recovered so far.
+- `n_basins_fes`, `barrier_kj_per_mol`, `fes_depth_kj_per_mol`, \
+`n_fes_estimates` — shape of the surface recovered so far. `cv_min` and \
+`cv_max` are the range the walker actually visited, and `fes_depth` is \
+measured over that range only, not over the wider grid `sum_hills` writes.
 
 Decision rule:
 
@@ -156,6 +161,12 @@ an under-filled basin, not a converged surface.
 `fes_depth_kj_per_mol`, say so in `reason` and record it in `ledger_note` — \
 that pattern suggests the biased CV is not the slow coordinate. You cannot \
 act on it, but a human reading the ledger can.
+- Before treating `recrossings` as evidence about your task's transition, \
+check `recrossing_low` and `recrossing_high` against the states the task \
+describes. If both boundaries sit on the same side of those states, the count \
+is measuring motion *within* one state rather than the transition you were \
+asked for, and a non-zero count is then not evidence that the CV is working. \
+Say so in `reason` and record it in `ledger_note`.
 
 === BOTH PHASES ===
 

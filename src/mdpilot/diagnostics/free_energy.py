@@ -110,6 +110,26 @@ class FreeEnergySurface:
     def depth_kj_per_mol(self) -> float:
         return float(self.free_energy.max() - self.free_energy.min())
 
+    def restricted_to(self, low: float, high: float) -> "FreeEnergySurface":
+        """The part of the profile between `low` and `high`, inclusive.
+
+        `sum_hills` grids a few SIGMA beyond the outermost hill, so the profile
+        extends past anything the walker visited. Free energy out there is
+        extrapolation: no hill ever landed on it, so it never changes, and it
+        is typically the highest point on the grid. Every statistic taken over
+        the whole grid then describes that padding rather than the sampling —
+        `depth_kj_per_mol` most of all, since it is a max minus a min.
+
+        Returns self unchanged when the restriction would leave too few points
+        to compute anything on.
+        """
+        mask = (self.cv >= low) & (self.cv <= high)
+        if int(mask.sum()) < 3:
+            return self
+        return FreeEnergySurface(
+            self.cv_label, self.cv[mask], self.free_energy[mask], self.periodic
+        )
+
 
 def plumed_available() -> bool:
     return shutil.which("plumed") is not None
@@ -321,6 +341,27 @@ def metad_report(
     """
     surfaces = sum_hills(hills_path, out_dir, stride=stride)
     final = load_fes(surfaces[-1])
+
+    # The CV series is what distinguishes sampling from grid padding, so it is
+    # read before any statistic is taken rather than after.
+    series = None
+    if colvar_path is not None and Path(colvar_path).exists():
+        series = load_colvar(Path(colvar_path)).get(final.cv_label)
+
+    baseline = load_fes(surfaces[len(surfaces) // 2]) if len(surfaces) >= 2 else None
+
+    # Only *depth* is restricted to the sampled region. Depth is a max minus a
+    # min, so the extrapolated shelf beyond the outermost hill — always the
+    # highest point on the grid, and frozen, since no hill ever lands there —
+    # becomes the entire measurement. Basins, barrier and drift are left on the
+    # full grid: they are local or difference-based, the padding does not
+    # dominate them, and cropping at the sampled extremes would strand a basin
+    # minimum on the boundary where the interior-only scan in `minima` cannot
+    # see it.
+    sampled = final
+    if series is not None and series.size:
+        sampled = final.restricted_to(float(series.min()), float(series.max()))
+
     minima = final.minima(temperature_k)
 
     # Drift against the half-way surface, not the previous one. With a stride
@@ -328,35 +369,39 @@ def metad_report(
     # apart, so their difference is near zero however unconverged the surface
     # is. The standard well-tempered test compares estimates that are
     # meaningfully separated in time.
-    drift = None
-    if len(surfaces) >= 2:
-        baseline = load_fes(surfaces[len(surfaces) // 2])
-        drift = fes_drift_kj_per_mol(baseline, final)
+    drift = fes_drift_kj_per_mol(baseline, final) if baseline is not None else None
 
     report: dict[str, Any] = {
         "hills_path": str(hills_path),
         "fes_path": str(surfaces[-1]),
         "cv_label": final.cv_label,
-        "cv_min": float(final.cv.min()),
-        "cv_max": float(final.cv.max()),
+        # The range the walker actually visited, not the grid sum_hills chose.
+        # The grid runs a few SIGMA wider, which is where the unphysical
+        # negative RMSD the scientist kept flagging in its ledger came from.
+        "cv_min": float(sampled.cv.min()),
+        "cv_max": float(sampled.cv.max()),
         "n_fes_estimates": len(surfaces),
         "n_basins_fes": len(minima),
         "barrier_kj_per_mol": final.barrier_kj_per_mol(temperature_k),
-        "fes_depth_kj_per_mol": final.depth_kj_per_mol(),
+        "fes_depth_kj_per_mol": sampled.depth_kj_per_mol(),
         "fes_drift_kj_per_mol": drift,
         "recrossings": None,
         "barrier_crossed": None,
         "fes_converged": None,
     }
 
-    if colvar_path is not None and Path(colvar_path).exists():
-        colvar = load_colvar(Path(colvar_path))
-        series = colvar.get(final.cv_label)
+    if series is not None and series.size:
         thresholds = basin_thresholds(final, temperature_k)
-        if series is not None and thresholds is not None:
+        if thresholds is not None:
             low, high = thresholds
             n = count_recrossings(series, low, high)
             report["recrossings"] = n
+            # Publish the boundaries the count was taken against. They are
+            # derived from the two deepest basins of the *current* surface, so
+            # they move as the surface fills, and a count reported without them
+            # cannot be checked against the states the task cares about.
+            report["recrossing_low"] = low
+            report["recrossing_high"] = high
             # "Did the walker cross the barrier at all", which is n >= 1 —
             # deliberately NOT gated on min_recrossings. Tying it to the
             # round-trip threshold made the field contradict its own name
@@ -364,9 +409,12 @@ def metad_report(
             # scientist flagged exactly that as inconsistent mid-campaign.
             # `fes_converged` is where min_recrossings belongs.
             report["barrier_crossed"] = n >= 1
-        elif series is not None:
+        else:
             report["recrossings"] = 0
             report["barrier_crossed"] = False
+        # Where the walker began, so "did it ever come back" is answerable from
+        # the report alone rather than only against the task's own thresholds.
+        report["cv_start"] = float(series[0])
         report["colvar_path"] = str(colvar_path)
 
     report["min_recrossings"] = min_recrossings

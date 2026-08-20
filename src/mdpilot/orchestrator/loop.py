@@ -674,6 +674,10 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
         base.update(
             fes_drift_kj_per_mol=r.report.get("fes_drift_kj_per_mol"),
             recrossings=r.report.get("recrossings"),
+            # The boundaries move as the surface fills, so a count carried
+            # forward without them is not comparable across rounds.
+            recrossing_low=r.report.get("recrossing_low"),
+            recrossing_high=r.report.get("recrossing_high"),
             fes_converged=r.report.get("fes_converged"),
         )
     else:

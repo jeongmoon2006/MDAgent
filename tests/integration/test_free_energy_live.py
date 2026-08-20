@@ -155,3 +155,38 @@ def test_report_is_json_serializable(tmp_path: Path) -> None:
     report = metad_report(hills, colvar, tmp_path / "out", stride=30)
 
     assert json.loads(json.dumps(report)) == report
+
+
+def test_report_measures_depth_over_the_sampled_region_only(tmp_path: Path) -> None:
+    """sum_hills grids past the outermost hill, and the extrapolated shelf out
+    there is the highest point on the surface. Taking depth over the whole grid
+    reports that shelf instead of the landscape the walker explored."""
+    hills = _write_hills(tmp_path / "HILLS", _two_basin_centres())
+    series = np.concatenate([np.full(40, s) for s in (-1, 1, -1, 1, -1)])
+    colvar = _write_colvar(tmp_path / "COLVAR", series)
+
+    report = metad_report(hills, colvar, tmp_path / "out", stride=30)
+    grid = load_fes(Path(report["fes_path"]))
+
+    assert grid.cv.min() < report["cv_min"] and report["cv_max"] < grid.cv.max()
+    assert report["cv_min"] == pytest.approx(series.min(), abs=0.05)
+    assert report["cv_max"] == pytest.approx(series.max(), abs=0.05)
+    assert report["fes_depth_kj_per_mol"] < grid.depth_kj_per_mol()
+
+
+def test_report_publishes_the_thresholds_its_recrossing_count_used(
+    tmp_path: Path,
+) -> None:
+    """`recrossings` is counted between the two deepest basins of the *current*
+    surface, so the boundaries move as the surface fills. A count without them
+    cannot be checked against the states the task actually cares about."""
+    hills = _write_hills(tmp_path / "HILLS", _two_basin_centres())
+    series = np.concatenate([np.full(40, s) for s in (-1, 1, -1, 1, -1)])
+    colvar = _write_colvar(tmp_path / "COLVAR", series)
+
+    report = metad_report(hills, colvar, tmp_path / "out", stride=30)
+
+    assert report["recrossing_low"] < report["recrossing_high"]
+    assert report["cv_start"] == pytest.approx(-1.0)
+    # The boundaries must bracket the barrier, not sit inside one basin.
+    assert -1.0 < report["recrossing_low"] < report["recrossing_high"] < 1.0

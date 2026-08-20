@@ -331,3 +331,38 @@ def test_sum_hills_drops_a_trailing_duplicate_surface(tmp_path: Path, monkeypatc
 
     surfaces = fe.sum_hills(tmp_path / "HILLS", out, stride=10)
     assert [p.name for p in surfaces] == ["fes.dat0.dat", "fes.dat1.dat"]
+
+
+# ---------- restriction to the sampled region ----------
+
+def _padded_well(n: int = 201) -> FreeEnergySurface:
+    """A well over [-1, 1] with a flat, very high shelf on either side.
+
+    This is the shape `sum_hills` produces: it grids a few SIGMA past the
+    outermost hill, and out there the surface is extrapolation that no hill
+    ever touched.
+    """
+    x = np.linspace(-2.0, 2.0, n)
+    f = np.where(np.abs(x) <= 1.0, 10.0 * x**2, 500.0)
+    return FreeEnergySurface("cv", x, f - f.min(), periodic=False)
+
+
+def test_restricted_to_excludes_unsampled_padding() -> None:
+    s = _padded_well()
+    assert s.depth_kj_per_mol() == pytest.approx(500.0)
+    assert s.restricted_to(-1.0, 1.0).depth_kj_per_mol() == pytest.approx(10.0)
+
+
+def test_restricted_to_keeps_the_grid_when_too_little_survives() -> None:
+    """Fewer than three points cannot carry a minimum, a barrier or a drift,
+    so an over-narrow restriction returns the surface untouched rather than a
+    stub that every downstream statistic would have to special-case."""
+    s = _padded_well()
+    assert s.restricted_to(0.0, 0.0) is s
+
+
+def test_restricted_to_preserves_label_and_periodicity() -> None:
+    s = FreeEnergySurface("phi", np.linspace(-3, 3, 51), np.zeros(51), periodic=True)
+    r = s.restricted_to(-1.0, 1.0)
+    assert (r.cv_label, r.periodic) == ("phi", True)
+    assert r.cv.min() >= -1.0 and r.cv.max() <= 1.0
