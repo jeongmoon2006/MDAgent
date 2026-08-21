@@ -220,7 +220,13 @@ def test_decision_tool_schema_includes_metad_proposal() -> None:
     assert props["decision"]["enum"] == ["extend", "stop", "switch_to_metad"]
     assert "metad_proposal" in _DECISION_TOOL["input_schema"]["required"]
     sub = props["metad_proposal"]["properties"]
-    assert sub["cv_type"]["enum"] == ["distance", "torsion", "gyration", "rmsd"]
+    # Pinned against cv_designer's vocabulary rather than a literal list: the
+    # schema is what the model may emit and `_CV_TYPES` is what the resolver
+    # accepts, so a type added to one and not the other is a runtime ValueError
+    # on a live campaign — exactly the kind of drift a mocked test would miss.
+    from mdpilot.sampling.cv_designer import _CV_TYPES
+
+    assert sub["cv_type"]["enum"] == list(_CV_TYPES)
 
 
 def test_metad_proposal_round_trips_through_dict() -> None:

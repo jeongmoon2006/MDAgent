@@ -299,3 +299,30 @@ def test_enable_restart_ignores_a_commented_directive() -> None:
     for an already-enabled restart."""
     rendered = enable_restart("# RESTART deliberately off here\nd: DISTANCE ATOMS=1,2\n")
     assert rendered.splitlines()[0].startswith("RESTART")
+
+
+# ---------- contacts ----------
+
+def test_contacts_renders_a_summed_contactmap() -> None:
+    from mdpilot.adapters.plumed_writer import ContactsCV
+
+    cv = ContactsCV(label="q", pairs=((4, 46), (10, 52)), r0_nm=0.75)
+    rendered = cv.render()
+
+    assert rendered.startswith("q: CONTACTMAP ...")
+    # 1-based, like every other CV here.
+    assert "ATOMS1=5,47" in rendered
+    assert "ATOMS2=11,53" in rendered
+    assert "SWITCH={RATIONAL R_0=0.75 NN=6 MM=12}" in rendered
+    assert "  SUM" in rendered
+    # PLUMED asserts on `... CONTACTMAP`: a second word there must repeat the
+    # *label*, not the action name. Bare "..." is what closes the block.
+    assert rendered.splitlines()[-1] == "..."
+
+
+def test_contacts_rejects_an_empty_map() -> None:
+    from mdpilot.adapters.plumed_writer import ContactsCV
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="at least 1 contact pair"):
+        ContactsCV(label="q", pairs=(), r0_nm=0.75)

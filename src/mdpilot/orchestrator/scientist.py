@@ -177,8 +177,12 @@ drift well above kT or zero recrossings). When `stop` or `switch_to_metad`, \
 
 When `switch_to_metad`, populate `metad_proposal`:
 
-- `cv_type` — one of `distance`, `torsion`, `gyration`, `rmsd`. Pick the type \
-that matches the physical coordinate you believe is slow.
+- `cv_type` — one of `distance`, `torsion`, `gyration`, `rmsd`, `contacts`. \
+Pick the type that matches the physical coordinate you believe is slow. Note \
+that `distance`, `gyration` and `rmsd` are unbounded above, so a bias on them \
+can drive the system into an ever-larger unfolded space and never return; \
+`torsion` and `contacts` are bounded on both sides and do not have that \
+failure mode.
 - `selections` — MDTraj selection strings. Arity is type-specific:
   - `distance`: 2 selections, each must resolve to exactly 1 atom. \
 Example: `["name CA and resSeq 1", "name CA and resSeq 10"]`.
@@ -190,6 +194,14 @@ Example: `["backbone and resSeq 1 to 10"]`.
   - `rmsd`: 1 selection, must resolve to ≥3 atoms. RMSD to the campaign's \
 reference structure after optimal superposition — the usual folding order \
 parameter. Example: `["name CA"]`.
+  - `contacts`: 1 selection, must resolve to ≥2 atoms. A smooth count of the \
+native contacts formed among the selected atoms, running from ~0 (none) to \
+the number of contacts present in the reference structure. Pairs closer than \
+3 residues in sequence are excluded, since those are formed in any \
+conformation. Example: `["name CA"]`. For folding and unfolding this is \
+usually a better coordinate than `rmsd`: it measures how much of the native \
+structure is present rather than how far the whole chain has moved, and \
+because it is bounded the unfolded side cannot run away.
 - `label` — short snake_case identifier (e.g. `rg_back`, `d_term`). It MUST \
 name the coordinate you are actually biasing. Do not name it after a \
 coordinate you would have preferred but did not select: the label is written \
@@ -219,7 +231,7 @@ _METAD_PROPOSAL_SCHEMA = {
     "properties": {
         "cv_type": {
             "type": "string",
-            "enum": ["distance", "torsion", "gyration", "rmsd"],
+            "enum": ["distance", "torsion", "gyration", "rmsd", "contacts"],
             "description": "Which type of CV to bias with metadynamics.",
         },
         "selections": {

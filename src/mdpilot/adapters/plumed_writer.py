@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Union
+from typing import ClassVar, Union
 
 
 @dataclass(frozen=True)
@@ -113,7 +113,64 @@ class RmsdCV:
         return f"{self.label}: RMSD REFERENCE={self.reference_path} TYPE=OPTIMAL"
 
 
-CV = Union[DistanceCV, TorsionCV, GyrationCV, RmsdCV]
+@dataclass(frozen=True)
+class ContactsCV:
+    """Number of native contacts formed, via PLUMED's ``CONTACTMAP ... SUM``.
+
+    Each pair contributes a rational switching function that goes to 1 when the
+    two atoms are closer than ``r0_nm`` and to 0 when they are far apart, so the
+    CV is a smooth count running from ~0 (no native contacts) to ~len(pairs)
+    (fully formed).
+
+    Unlike RMSD-to-native this coordinate is **bounded on both sides**, which is
+    what makes it usable with well-tempered metadynamics on a folding problem:
+    there is no open unfolded tail for the bias to drive the walker into
+    indefinitely.
+
+    ``pairs`` are 0-based atom index pairs, resolved from the reference
+    structure by ``cv_designer``; indices are converted to PLUMED's 1-based
+    convention at render time like every other CV here.
+    """
+
+    label: str
+    pairs: tuple[tuple[int, int], ...]
+    r0_nm: float
+
+    # Rational switching exponents. `bias_designer` evaluates this same
+    # function in Python to size SIGMA, using the identity
+    # (1 - x**NN) / (1 - x**MM) == 1 / (1 + x**NN), which holds exactly when
+    # MM == 2 * NN and avoids the 0/0 the raw form hits at x == 1. Preserve
+    # that relation if these ever change, or the two evaluations diverge.
+    NN: ClassVar[int] = 6
+    MM: ClassVar[int] = 12
+
+    def __post_init__(self) -> None:
+        if len(self.pairs) < 1:
+            raise ValueError("ContactsCV: need at least 1 contact pair")
+        if self.r0_nm <= 0.0:
+            raise ValueError(
+                f"ContactsCV: r0_nm must be positive (got {self.r0_nm})"
+            )
+
+    def render(self) -> str:
+        # PLUMED's line-continuation form: one ATOMS<n> per pair, then a single
+        # global SWITCH that applies to all of them, then SUM to collapse the
+        # map into one number. NN/MM are the conventional rational exponents.
+        lines = [f"{self.label}: CONTACTMAP ..."]
+        for n, (i, j) in enumerate(self.pairs, start=1):
+            lines.append(f"  ATOMS{n}={i + 1},{j + 1}")
+        lines.append(
+            f"  SWITCH={{RATIONAL R_0={self.r0_nm} NN={self.NN} MM={self.MM}}}"
+        )
+        lines.append("  SUM")
+        # Bare "..." to close the continuation. PLUMED accepts a second word
+        # there only if it repeats the *label* ("... q:"), not the action name —
+        # `... CONTACTMAP` is an assertion failure, not a comment.
+        lines.append("...")
+        return "\n".join(lines)
+
+
+CV = Union[DistanceCV, TorsionCV, GyrationCV, RmsdCV, ContactsCV]
 
 
 @dataclass(frozen=True)

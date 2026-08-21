@@ -7,8 +7,9 @@ proposal against the actual topology, looks up the atom indices
 deterministically, and returns a typed CV object that ``plumed_writer`` can
 render. Atom indices never pass through the LLM; CVs are never pre-curated
 per system. The system-agnostic vocabulary is what ``plumed_writer`` can
-render today (``distance``, ``torsion``, ``gyration``); new types are added
-when a real campaign needs one — not before.
+render today (``distance``, ``torsion``, ``gyration``, ``rmsd``,
+``contacts``); new types are added when a real campaign needs one — not
+before.
 
 Selection language: MDTraj selection strings (``"backbone and resid 1 to 10"``,
 ``"name CA and resid 1"``). MDTraj is already a project dependency and its
@@ -28,10 +29,30 @@ from typing import Literal
 
 import mdtraj as md
 
-from mdpilot.adapters.plumed_writer import CV, DistanceCV, GyrationCV, RmsdCV, TorsionCV
+import numpy as np
 
-CVType = Literal["distance", "torsion", "gyration", "rmsd"]
-_CV_TYPES: tuple[str, ...] = ("distance", "torsion", "gyration", "rmsd")
+from mdpilot.adapters.plumed_writer import (
+    CV,
+    ContactsCV,
+    DistanceCV,
+    GyrationCV,
+    RmsdCV,
+    TorsionCV,
+)
+
+CVType = Literal["distance", "torsion", "gyration", "rmsd", "contacts"]
+_CV_TYPES: tuple[str, ...] = (
+    "distance", "torsion", "gyration", "rmsd", "contacts",
+)
+
+# A CA-CA pair closer than this in the reference structure counts as a native
+# contact. 0.75 nm is the conventional CA-level cutoff; heavy-atom definitions
+# use ~0.45 nm, which does not transfer to a CA-only selection.
+_CONTACT_CUTOFF_NM = 0.75
+# Contacts between residues near each other in sequence are formed in any
+# conformation, folded or not, so they carry no information about nativeness
+# and would only add a constant offset to the count.
+_MIN_SEQUENCE_SEPARATION = 3
 
 
 @dataclass(frozen=True)
@@ -59,10 +80,12 @@ def design_cv(
 ) -> CV:
     """Resolve a CVProposal against a topology; return a typed PLUMED CV.
 
-    ``reference`` and ``output_dir`` are required only for ``cv_type="rmsd"``,
-    which is the one CV that needs coordinates rather than just connectivity:
-    PLUMED compares against a reference structure on disk, so one has to be
-    written. Everything else resolves from topology alone.
+    ``reference`` is required for ``cv_type="rmsd"`` and ``cv_type="contacts"``
+    — the two CVs that need coordinates rather than just connectivity, since
+    both are defined relative to a native structure. ``output_dir`` is required
+    only for ``rmsd``, which is the one that has to write a reference PDB for
+    PLUMED to read; ``contacts`` bakes the resolved pairs into plumed.dat
+    directly. Everything else resolves from topology alone.
     """
     if proposal.cv_type not in _CV_TYPES:
         raise ValueError(
@@ -80,6 +103,8 @@ def design_cv(
         return _build_gyration(proposal.label, indices)
     if proposal.cv_type == "rmsd":
         return _build_rmsd(proposal.label, indices, reference, output_dir)
+    if proposal.cv_type == "contacts":
+        return _build_contacts(proposal.label, indices, reference)
     raise AssertionError(f"unreachable cv_type {proposal.cv_type!r}")
 
 
@@ -168,6 +193,61 @@ def _build_rmsd(
     path = (Path(output_dir) / f"{label}_reference.pdb").resolve()
     _write_reference_pdb(path, reference, atoms)
     return RmsdCV(label=label, atoms=atoms, reference_path=path)
+
+
+def _build_contacts(
+    label: str,
+    sels: tuple[tuple[int, ...], ...],
+    reference: "md.Trajectory | None",
+) -> ContactsCV:
+    if len(sels) != 1:
+        raise ValueError(
+            f"cv_designer: contacts requires 1 selection, got {len(sels)}"
+        )
+    atoms = sels[0]
+    if len(atoms) < 2:
+        raise ValueError(
+            f"cv_designer: contacts selection must resolve to >=2 atoms "
+            f"(got {len(atoms)})"
+        )
+    if reference is None:
+        raise ValueError(
+            "cv_designer: cv_type='contacts' needs `reference` — the structure "
+            "whose contacts count as native; pass it to design_cv"
+        )
+    pairs = _native_pairs(atoms, reference)
+    if not pairs:
+        raise ValueError(
+            f"cv_designer: no native contacts among the {len(atoms)} selected "
+            f"atoms (cutoff {_CONTACT_CUTOFF_NM} nm, sequence separation "
+            f">= {_MIN_SEQUENCE_SEPARATION} residues); the reference may be "
+            f"extended, or the selection too small"
+        )
+    return ContactsCV(label=label, pairs=pairs, r0_nm=_CONTACT_CUTOFF_NM)
+
+
+def _native_pairs(
+    atoms: tuple[int, ...], reference: "md.Trajectory"
+) -> tuple[tuple[int, int], ...]:
+    """Pairs among `atoms` that are in contact in the reference structure.
+
+    mdtraj coordinates are in nanometres, which is also PLUMED's length unit,
+    so the cutoff needs no conversion.
+    """
+    xyz = reference.xyz[0]
+    topology = reference.topology
+    pairs: list[tuple[int, int]] = []
+    for a in range(len(atoms)):
+        for b in range(a + 1, len(atoms)):
+            i, j = atoms[a], atoms[b]
+            sequence_gap = abs(
+                topology.atom(i).residue.index - topology.atom(j).residue.index
+            )
+            if sequence_gap < _MIN_SEQUENCE_SEPARATION:
+                continue
+            if float(np.linalg.norm(xyz[i] - xyz[j])) <= _CONTACT_CUTOFF_NM:
+                pairs.append((i, j))
+    return tuple(pairs)
 
 
 def _write_reference_pdb(

@@ -51,6 +51,7 @@ import numpy as np
 
 from mdpilot.adapters.plumed_writer import (
     CV,
+    ContactsCV,
     DistanceCV,
     GyrationCV,
     MetadynamicsBias,
@@ -80,6 +81,10 @@ _SIGMA_FLOORS: tuple[tuple[type, float], ...] = (
     (GyrationCV, 0.02),
     (TorsionCV, 0.15),
     (RmsdCV, 0.05),
+    # A contact count is dimensionless, not a length. A folded basin spans
+    # roughly two to three formed contacts, so 0.5 gives the same ~5 deposits
+    # across a basin that the length floors above are sized for.
+    (ContactsCV, 0.5),
 )
 
 
@@ -153,6 +158,14 @@ def _cv_series(cv: CV, traj: md.Trajectory) -> np.ndarray:
         # md.rmsd superposes before measuring, matching PLUMED TYPE=OPTIMAL.
         reference = md.load(str(cv.reference_path))
         return md.rmsd(traj.atom_slice(list(cv.atoms)), reference, frame=0)
+    if isinstance(cv, ContactsCV):
+        # The same rational switching function PLUMED applies, evaluated here so
+        # SIGMA is sized in the CV's own units (contacts) rather than in nm.
+        # With MM == 2*NN the closed form 1/(1+x**NN) is exact and has no
+        # singularity at x == 1, where (1-x**NN)/(1-x**MM) is 0/0.
+        distances = md.compute_distances(traj, np.array(cv.pairs))
+        switched = 1.0 / (1.0 + (distances / cv.r0_nm) ** cv.NN)
+        return switched.sum(axis=1)
     raise TypeError(f"bias_designer: unsupported CV type {type(cv).__name__}")
 
 
@@ -179,7 +192,8 @@ def _circular_std(angles: np.ndarray) -> float:
 _WALL_KAPPA_KJ_PER_MOL_NM2 = 1000.0
 
 # CVs measured in nanometres. A wall position in nm is meaningful only for
-# these; a torsion is already bounded on [-pi, pi] and needs no wall.
+# these; a torsion is already bounded on [-pi, pi], and a contact count is
+# bounded on [0, n_pairs] — neither needs a wall.
 _LENGTH_DIMENSIONED = (DistanceCV, GyrationCV, RmsdCV)
 
 

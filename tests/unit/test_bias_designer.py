@@ -257,3 +257,14 @@ def test_no_wall_on_a_torsion() -> None:
     """A wall position in nm is meaningless on a torsion, which is already
     bounded on [-pi, pi]."""
     assert design_upper_wall(TorsionCV(label="phi", atoms=(1, 2, 3, 4)), 0.8) is None
+
+
+def test_contact_count_has_its_own_sigma_floor() -> None:
+    """A contact count is dimensionless, so the nanometre floors do not apply.
+    Sharing the length floor would size hills for this CV a factor of 25 too
+    narrow — the same class of error the torsion floor exists to prevent."""
+    from mdpilot.adapters.plumed_writer import ContactsCV, DistanceCV
+
+    contacts = ContactsCV(label="q", pairs=((0, 5), (1, 6)), r0_nm=0.75)
+    assert sigma_floor(contacts) == 0.5
+    assert sigma_floor(contacts) != sigma_floor(DistanceCV(label="d", atoms=(0, 1)))
