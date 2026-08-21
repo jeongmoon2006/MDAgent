@@ -333,6 +333,9 @@ def metad_report(
     temperature_k: float = _DEFAULT_TEMPERATURE_K,
     stride: int = 10,
     min_recrossings: int = 1,
+    observable: np.ndarray | None = None,
+    observable_name: str | None = None,
+    state_thresholds: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Compact diagnostic bundle for a biased round.
 
@@ -390,7 +393,27 @@ def metad_report(
         "fes_converged": None,
     }
 
-    if series is not None and series.size:
+    # Preferred basis: the states the *task* defines, measured on the coordinate
+    # it defines them on. Fixed for the life of the campaign, so the count means
+    # the same thing every round and across a change of biased CV. The fallback
+    # below re-derives boundaries from the current surface, which F7 and F9
+    # showed is not comparable between rounds — it migrates, disappears when
+    # fewer than two basins resolve, and inflates when the barrier fills and the
+    # two deepest minima collapse together.
+    if (
+        observable is not None
+        and observable.size
+        and state_thresholds is not None
+    ):
+        low, high = float(state_thresholds[0]), float(state_thresholds[1])
+        n = count_recrossings(observable, low, high)
+        report["recrossings"] = n
+        report["barrier_crossed"] = n >= 1
+        report["recrossing_low"] = low
+        report["recrossing_high"] = high
+        report["recrossing_basis"] = "task_states"
+        report["recrossing_observable"] = observable_name
+    elif series is not None and series.size:
         thresholds = basin_thresholds(final, temperature_k)
         if thresholds is not None:
             low, high = thresholds
@@ -410,8 +433,18 @@ def metad_report(
             # `fes_converged` is where min_recrossings belongs.
             report["barrier_crossed"] = n >= 1
         else:
-            report["recrossings"] = 0
-            report["barrier_crossed"] = False
+            # Fewer than two basins resolve, so there is no band to count
+            # across. That is "cannot measure", not "did not cross" — F9: this
+            # branch used to report 0/False on rounds whose own cv_min/cv_max
+            # showed the walker spanning the entire coordinate. None keeps it
+            # distinguishable, and `_fes_converged` already withholds a verdict
+            # on a null count rather than treating it as failure.
+            report["recrossings"] = None
+            report["barrier_crossed"] = None
+        report["recrossing_basis"] = "fes_basins"
+        report["recrossing_observable"] = final.cv_label
+
+    if series is not None and series.size:
         # Where the walker began, so "did it ever come back" is answerable from
         # the report alone rather than only against the task's own thresholds.
         report["cv_start"] = float(series[0])

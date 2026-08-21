@@ -76,6 +76,15 @@ def run(task: dict[str, Any], work_dir: Path, *, dry_run: bool) -> CampaignResul
         max_extra_ns=2.0,
         max_biased_ns=max_biased_ns,
         min_recrossings=int(criterion["min_recrossings"]),
+        # Count recrossings between the states the task defines, on the
+        # coordinate it defines them on, rather than between whichever two
+        # basins are currently deepest on the biased surface. Same thresholds
+        # `verify_done_criterion` uses below, so the number the scientist sees
+        # each round is the number that decides the criterion.
+        state_thresholds=(
+            float(criterion["folded_state_rmsd_angstrom"]),
+            float(criterion["extended_state_rmsd_angstrom"]),
+        ),
         cv_upper_wall_nm=task.get("sampling", {}).get("cv_upper_wall_nm"),
         task_expectation=task["task_expectation"],
         seed=42,

@@ -190,3 +190,74 @@ def test_report_publishes_the_thresholds_its_recrossing_count_used(
     assert report["cv_start"] == pytest.approx(-1.0)
     # The boundaries must bracket the barrier, not sit inside one basin.
     assert -1.0 < report["recrossing_low"] < report["recrossing_high"] < 1.0
+
+
+def test_task_states_anchor_the_count_instead_of_the_shifting_basins(
+    tmp_path: Path,
+) -> None:
+    """F9. The surface-derived band is re-derived every round, so the same
+    trajectory scores differently as the bias fills. A band fixed by the task
+    does not move, and is measured on the task's own coordinate rather than on
+    whichever CV happens to be biased."""
+    hills = _write_hills(tmp_path / "HILLS", _two_basin_centres())
+    series = np.concatenate([np.full(40, s) for s in (-1, 1, -1, 1, -1)])
+    colvar = _write_colvar(tmp_path / "COLVAR", series)
+    # A separate observable, on its own scale, with its own two states.
+    observable = np.concatenate([np.full(40, v) for v in (0.5, 9.0, 0.5)])
+
+    report = metad_report(
+        hills, colvar, tmp_path / "out", stride=30,
+        observable=observable,
+        observable_name="rmsd_ca_to_reference_angstrom",
+        state_thresholds=(1.5, 4.0),
+    )
+
+    assert report["recrossing_basis"] == "task_states"
+    assert report["recrossing_observable"] == "rmsd_ca_to_reference_angstrom"
+    assert (report["recrossing_low"], report["recrossing_high"]) == (1.5, 4.0)
+    # Two transitions on the observable, regardless of what the CV did.
+    assert report["recrossings"] == 2
+    assert report["barrier_crossed"] is True
+
+
+def test_unresolvable_basins_report_no_count_rather_than_zero(
+    tmp_path: Path,
+) -> None:
+    """F9's other half. A single-basin surface offers no band to count across.
+    Reporting 0 there says the walker never crossed, which on run 3 was false
+    in three separate rounds whose own cv_min/cv_max spanned the coordinate."""
+    # Hills in one cluster integrate to a single well.
+    rng = np.random.default_rng(11)
+    hills = _write_hills(tmp_path / "HILLS", rng.normal(0.0, 0.12, 120))
+    colvar = _write_colvar(tmp_path / "COLVAR", rng.normal(0.0, 0.5, 200))
+
+    report = metad_report(hills, colvar, tmp_path / "out", stride=30)
+
+    assert report["n_basins_fes"] == 1
+    assert report["recrossings"] is None
+    assert report["barrier_crossed"] is None
+    # A null count must not read as a failed convergence test either.
+    assert report["fes_converged"] is None
+
+
+def test_anchored_basis_wins_when_both_are_available(tmp_path: Path) -> None:
+    """The surface still resolves two basins here, so both bases could produce
+    a number. The task's states are the one that means the same thing next
+    round, so they take precedence."""
+    hills = _write_hills(tmp_path / "HILLS", _two_basin_centres())
+    series = np.concatenate([np.full(40, s) for s in (-1, 1, -1, 1, -1)])
+    colvar = _write_colvar(tmp_path / "COLVAR", series)
+
+    surface_based = metad_report(hills, colvar, tmp_path / "a", stride=30)
+    anchored = metad_report(
+        hills, colvar, tmp_path / "b", stride=30,
+        observable=np.full(200, 0.5),          # never leaves the folded state
+        observable_name="rmsd_ca_to_reference_angstrom",
+        state_thresholds=(1.5, 4.0),
+    )
+
+    assert surface_based["recrossing_basis"] == "fes_basins"
+    assert surface_based["recrossings"] >= 3
+    assert anchored["recrossing_basis"] == "task_states"
+    assert anchored["recrossings"] == 0        # genuinely zero, not unmeasurable
+    assert anchored["barrier_crossed"] is False

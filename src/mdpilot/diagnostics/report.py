@@ -22,6 +22,29 @@ from mdpilot.diagnostics.exploration import exploration
 _MIN_FRAMES_FOR_STATISTICS = 8
 
 
+OBSERVABLE_NAME = "rmsd_ca_to_reference_angstrom"
+
+
+def campaign_observable(
+    traj: md.Trajectory, top_path: Path
+) -> tuple[np.ndarray, str]:
+    """CA-RMSD to the campaign reference, in Angstrom, plus its name.
+
+    Split out of `make_report` because the biased phase needs the same series:
+    the task defines its states on this coordinate, so a recrossing count
+    anchored to those states has to be measured here rather than on whichever
+    CV the scientist chose to bias. One definition, so the vanilla report, the
+    biased report and the post-hoc done-criterion check cannot drift apart.
+    """
+    ca = traj.topology.select("protein and name CA")
+    if ca.size == 0:
+        raise ValueError("no protein CA atoms found in topology")
+    protein = traj.atom_slice(ca)
+    # Same `ca` indices are valid for both: traj was loaded with this topology.
+    reference = md.load(str(top_path)).atom_slice(ca)
+    return md.rmsd(protein, reference, frame=0) * 10.0, OBSERVABLE_NAME  # nm -> A
+
+
 def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
     """Load a trajectory, compute CA-RMSD to the campaign reference, summarize.
 
@@ -38,13 +61,7 @@ def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
     dcd_path = Path(dcd_path)
     top_path = Path(top_path)
     traj = md.load(str(dcd_path), top=str(top_path))
-    ca = traj.topology.select("protein and name CA")
-    if ca.size == 0:
-        raise ValueError("no protein CA atoms found in topology")
-    protein = traj.atom_slice(ca)
-    # Same `ca` indices are valid for both: traj was loaded with this topology.
-    reference = md.load(str(top_path)).atom_slice(ca)
-    rmsd_angstrom = md.rmsd(protein, reference, frame=0) * 10.0  # nm -> A
+    rmsd_angstrom, observable_name = campaign_observable(traj, top_path)
 
     if traj.n_frames > 1:
         frame_dt_ps = float(np.diff(traj.time).mean())
@@ -55,7 +72,7 @@ def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
 
     return _summarize(
         observable=rmsd_angstrom,
-        observable_name="rmsd_ca_to_reference_angstrom",
+        observable_name=observable_name,
         dcd_path=dcd_path,
         top_path=top_path,
         frame_dt_ps=frame_dt_ps,

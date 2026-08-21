@@ -161,11 +161,20 @@ free-energy surface:
 
 - `fes_drift_kj_per_mol` — how much the surface changed between the last two \
 cumulative estimates. The standard well-tempered convergence test.
-- `recrossings` — barrier crossings between the two deepest basins, counted \
-with hysteresis. `barrier_crossed` is `recrossings >= 1`. The two basins are \
-re-derived from the *current* surface every round, so these boundaries move \
-as the bias fills. `recrossing_low` and `recrossing_high` are the CV values \
-the count was actually taken between; `cv_start` is where the walker began.
+- `recrossings` — barrier crossings, counted with hysteresis between \
+`recrossing_low` and `recrossing_high`. `barrier_crossed` is `recrossings >= \
+1`. `recrossing_basis` says what those boundaries are:
+  - `task_states` — the states your task defines, measured on \
+`recrossing_observable`, which is usually *not* the CV you are biasing. Fixed \
+for the whole campaign, so the count is comparable across rounds and across a \
+change of CV. Trust this one.
+  - `fes_basins` — the two deepest basins of the *current* surface. These move \
+as the bias fills, so a count on this basis means something different every \
+round; compare the boundaries against your task's states before reading it.
+- `recrossings` may be `null`, meaning the count could not be taken at all \
+(fewer than two basins resolved on the surface). That is not the same as zero \
+crossings. Do not treat a null as evidence the walker stayed put — check \
+`cv_min`/`cv_max` against `cv_start` to see how far it has actually moved.
 - `fes_converged` — true only when drift is below kT (≈2.5 kJ/mol at 300 K) \
 AND `recrossings >= 1`. Low drift *alone* is not convergence: a walker that \
 never left its starting basin produces a surface that stops changing \

@@ -43,7 +43,7 @@ from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
 from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.diagnostics.free_energy import metad_report
-from mdpilot.diagnostics.report import make_report
+from mdpilot.diagnostics.report import campaign_observable, make_report
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
 from mdpilot.sampling.bias_designer import design_bias, design_upper_wall
@@ -97,6 +97,7 @@ def run_campaign(
     max_extra_ns: float = 2.0,
     max_biased_ns: float | None = None,
     min_recrossings: int = 1,
+    state_thresholds: tuple[float, float] | None = None,
     max_cv_switches: int = 1,
     cv_upper_wall_nm: float | None = None,
     seed: int = 42,
@@ -109,6 +110,16 @@ def run_campaign(
 
     `adapter` defaults to `OpenMMAdapter(work_dir=work_dir, seed=seed)`.
     Pass a different `MDAdapter` to run through another engine.
+
+    `state_thresholds` is `(folded, extended)` on the campaign observable
+    (CA-RMSD to the campaign reference, in Angstrom) — the states the *task*
+    defines. When given, biased-round recrossings are counted there rather than
+    between the two deepest basins of the current free-energy surface. The
+    surface-derived band moves as the bias fills, vanishes when fewer than two
+    basins resolve, and collapses once the barrier is filled, so a count taken
+    against it means something different every round (F7, F9). A fixed band on
+    the coordinate the task defines its states on is comparable across rounds
+    and across a change of biased CV.
 
     `max_cv_switches` is how many times the scientist may replace the biased
     CV within one campaign. While switches remain, `switch_cv` is offered in
@@ -331,6 +342,9 @@ def run_campaign(
             plumed_dat_path=current_plumed_dat,
             fes_dir=rounds_dir / f"round_{round_idx:03d}_fes",
             min_recrossings=min_recrossings,
+            rounds_dir=rounds_dir,
+            round_index=round_idx,
+            state_thresholds=state_thresholds,
         )
         prior_summaries = [_compact_prior(r) for r in rounds]
         decision = decide(
@@ -543,6 +557,9 @@ def _round_report(
     plumed_dat_path: Path | None,
     fes_dir: Path,
     min_recrossings: int = 1,
+    rounds_dir: Path | None = None,
+    round_index: int | None = None,
+    state_thresholds: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """Diagnostic bundle for one round, chosen by phase.
 
@@ -564,6 +581,18 @@ def _round_report(
         report["phase"] = "vanilla"
         return report
 
+    # Only computed when there are task states to count against: it costs a
+    # trajectory load, and without thresholds nothing consumes the result.
+    observable = observable_name = None
+    if (
+        state_thresholds is not None
+        and rounds_dir is not None
+        and round_index is not None
+    ):
+        observable, observable_name = _accumulated_observable(
+            rounds_dir, round_index, trajectory_path, topology_path
+        )
+
     bias_dir = plumed_dat_path.parent
     report = metad_report(
         bias_dir / _HILLS_NAME,
@@ -571,11 +600,45 @@ def _round_report(
         fes_dir,
         temperature_k=_METAD_TEMPERATURE_K,
         min_recrossings=min_recrossings,
+        observable=observable,
+        observable_name=observable_name,
+        state_thresholds=state_thresholds,
     )
     report["phase"] = "metad"
     report["trajectory_path"] = str(trajectory_path)
     report["plumed_dat_path"] = str(plumed_dat_path)
     return report
+
+
+def _accumulated_observable(
+    rounds_dir: Path,
+    round_index: int,
+    trajectory_path: Path,
+    topology_path: Path,
+) -> tuple[np.ndarray, str]:
+    """The campaign observable over every biased round so far, in order.
+
+    Cumulative, because the surface-derived count it replaces was cumulative:
+    HILLS and COLVAR accumulate across the whole biased phase, so a per-round
+    count would silently change what the number means.
+
+    Each round's series is persisted next to its checkpoint rather than
+    recomputed from the trajectories. The series is a few thousand floats
+    (~16 KB) against a ~117 MB DCD, so concatenating the saved ones costs
+    nothing while re-deriving them every round would mean re-reading the entire
+    biased phase — over a gigabyte by the end of a 20 ns campaign.
+    """
+    traj = md.load(str(trajectory_path), top=str(topology_path))
+    series, name = campaign_observable(traj, topology_path)
+    rounds_dir.mkdir(parents=True, exist_ok=True)
+    np.save(rounds_dir / f"round_{round_index:03d}.obs.npy", series)
+
+    chunks: list[np.ndarray] = []
+    for index in range(1, round_index + 1):
+        path = rounds_dir / f"round_{index:03d}.obs.npy"
+        if path.exists():
+            chunks.append(np.load(path))
+    return (np.concatenate(chunks) if chunks else series), name
 
 
 def _refuse_premature_stop(
