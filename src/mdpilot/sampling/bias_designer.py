@@ -87,6 +87,24 @@ _SIGMA_FLOORS: tuple[tuple[type, float], ...] = (
     (ContactsCV, 0.5),
 )
 
+# The open tail of F4. The floors above catch a spread measured on a trajectory
+# that never left its basin. A *replacement* CV proposed mid-metaD has the
+# opposite pathology: it is sized on a biased trajectory, where the walker has
+# been actively driven across the coordinate, so the spread is inflated and
+# SIGMA comes out too wide. A hill wider than the features it is meant to
+# resolve fills the surface uniformly and resolves nothing — the coordinate
+# looks sampled and the free-energy profile is flat by construction.
+#
+# Sized as "the widest hill that still leaves ~5 deposits across the range the
+# coordinate can span", the same rule the floors use from the other side.
+_SIGMA_CEILINGS: tuple[tuple[type, float], ...] = (
+    (DistanceCV, 0.2),
+    (GyrationCV, 0.2),
+    (RmsdCV, 0.2),
+    (TorsionCV, 1.0),
+    (ContactsCV, 2.0),
+)
+
 
 def design_bias(
     cv: CV,
@@ -107,7 +125,7 @@ def design_bias(
     traj = md.load(str(trajectory_path), top=str(topology_path))
     series = _cv_series(cv, traj)
     spread = _spread(cv, series)
-    sigma, floored = size_sigma(cv, spread)
+    sigma, floored, ceiled = size_sigma(cv, spread)
     height = _HEIGHT_KT_FRACTION * _KB_KJ_PER_MOL_K * temperature_k
     return MetadynamicsBias(
         cv_labels=(cv.label,),
@@ -115,6 +133,7 @@ def design_bias(
         height=height,
         pace=pace,
         sigma_floored=floored,
+        sigma_ceiled=ceiled,
         bias_factor=bias_factor,
         temperature_k=temperature_k,
     )
@@ -128,20 +147,34 @@ def sigma_floor(cv: CV) -> float:
     raise TypeError(f"bias_designer: no SIGMA floor for {type(cv).__name__}")
 
 
-def size_sigma(cv: CV, spread: float) -> tuple[float, bool]:
-    """Hill width from an observed CV spread, and whether the floor bound.
+def sigma_ceiling(cv: CV) -> float:
+    """Widest hill still worth depositing for this CV type."""
+    for cv_type, ceiling in _SIGMA_CEILINGS:
+        if isinstance(cv, cv_type):
+            return ceiling
+    raise TypeError(f"bias_designer: no SIGMA ceiling for {type(cv).__name__}")
 
-    Returns ``(sigma, floored)``. ``floored=True`` means the source trajectory
-    measured narrower than the CV type's physical floor — a signal that the
-    vanilla phase under-sampled this coordinate, not that the coordinate is
-    genuinely that stiff. Callers surface it rather than swallowing it: a
-    silently substituted SIGMA is how F4 went unnoticed in the first place.
+
+def size_sigma(cv: CV, spread: float) -> tuple[float, bool, bool]:
+    """Hill width from an observed CV spread, and which bound clamped it.
+
+    Returns ``(sigma, floored, ceiled)``. ``floored=True`` means the source
+    trajectory measured narrower than the CV type's physical floor — a signal
+    that the source phase under-sampled this coordinate, not that the
+    coordinate is genuinely that stiff. ``ceiled=True`` means it measured
+    *wider* than the widest hill worth depositing, which is what a spread taken
+    from an already-biased trajectory looks like. Callers surface both rather
+    than swallowing them: a silently substituted SIGMA is how F4 went unnoticed
+    in the first place, and the same argument applies from either side.
     """
     measured = spread * _SIGMA_FRACTION
     floor = sigma_floor(cv)
     if measured < floor:
-        return floor, True
-    return measured, False
+        return floor, True, False
+    ceiling = sigma_ceiling(cv)
+    if measured > ceiling:
+        return ceiling, False, True
+    return measured, False, False
 
 
 def _cv_series(cv: CV, traj: md.Trajectory) -> np.ndarray:

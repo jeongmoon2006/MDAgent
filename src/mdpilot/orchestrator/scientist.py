@@ -121,8 +121,33 @@ characteristic timescale in the expectation): vanilla is inadequate. Decide \
 
 === PHASE `metad` — well-tempered metadynamics ===
 
-Action space is two-way: `extend` or `stop`. The campaign has already \
-pivoted; proposing another pivot is not available to you.
+Action space is `extend` or `stop`, and — only when `switch_cv` appears in \
+the `decision` enum of your tool — `switch_cv`. When it is absent the \
+campaign has spent its CV-revision allowance and the choice is not yours to \
+make; do not argue for it. Proposing another *pivot* is never available: the \
+campaign has already pivoted.
+
+`switch_cv` replaces the biased collective variable and starts a fresh bias \
+on the new coordinate. The deposited hills on the old CV are kept as a record \
+but are not carried over — they describe a different coordinate. The compute \
+already spent is *not* refunded: the biased budget is cumulative across CVs, \
+so a switch late in a campaign buys little. Use it when the evidence says the \
+coordinate is wrong, not when the surface is merely still filling:
+
+- the boundaries `recrossings` was counted between sit on the same side of \
+the states your task describes (see the rule below), so the count is not \
+measuring the transition you were asked for;
+- the walker left the region it started in — compare `cv_start` against \
+`cv_min`/`cv_max` — and many rounds have passed without it returning;
+- `recrossings` has stayed at 0 across several rounds while \
+`fes_depth_kj_per_mol` keeps growing, which is a bias filling a basin it \
+cannot escape along this coordinate.
+
+Prefer a coordinate that is bounded on both sides when the failure was a \
+walker that left and did not come back. Justify the replacement in `reason` \
+by naming what the previous CV failed to do, and record the diagnosis in \
+`ledger_note` — the next rounds will be judged on a different coordinate and \
+the history has to explain the discontinuity.
 
 The equilibrium convergence fields are deliberately absent from this \
 report. A biased trajectory is not an equilibrium ensemble — the bias drives \
@@ -354,6 +379,36 @@ _METAD_DECISION_TOOL = {
     },
 }
 
+# The biased action space with CV revision re-opened. Offered only while the
+# campaign has a switch left in its budget: past that, `switch_cv` is dropped
+# from the enum so a further revision is unrepresentable rather than
+# emitted-and-rejected — the same reason a second `switch_to_metad` is absent
+# from `_METAD_DECISION_TOOL`.
+_METAD_SWITCH_TOOL = {
+    "name": "record_decision",
+    "description": (
+        "Record the decision (extend, stop, or switch_cv) for this biased round."
+    ),
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            **_METAD_DECISION_TOOL["input_schema"]["properties"],
+            "decision": {
+                "type": "string",
+                "enum": ["extend", "stop", "switch_cv"],
+                "description": "What to do next with the biased run.",
+            },
+            "metad_proposal": _METAD_PROPOSAL_SCHEMA,
+        },
+        "required": [
+            *_METAD_DECISION_TOOL["input_schema"]["required"],
+            "metad_proposal",
+        ],
+        "additionalProperties": False,
+    },
+}
+
 Phase = Literal["vanilla", "metad"]
 
 _TOOL_FOR_PHASE: dict[str, dict[str, Any]] = {
@@ -388,7 +443,7 @@ class MetadProposal:
 
 @dataclass(frozen=True)
 class Decision:
-    decision: Literal["extend", "stop", "switch_to_metad"]
+    decision: Literal["extend", "stop", "switch_to_metad", "switch_cv"]
     reason: str
     extra_ns: float | None
     ledger_note: str | None = None
@@ -402,15 +457,21 @@ def decide(
     prior_round_summaries: list[dict[str, Any]] | None = None,
     task_expectation: str | None = None,
     phase: Phase = "vanilla",
+    allow_cv_switch: bool = False,
     client: anthropic.Anthropic | None = None,
     model: str = _MODEL,
 ) -> Decision:
     """Single Claude call: diagnostic + context → next-action decision.
 
     `phase` selects the action space: `vanilla` allows extend / stop /
-    switch_to_metad, `metad` allows extend / stop only. It must match the
-    report being passed — an equilibrium bundle with phase="metad" would
-    offer the right actions against the wrong numbers.
+    switch_to_metad, `metad` allows extend / stop. It must match the report
+    being passed — an equilibrium bundle with phase="metad" would offer the
+    right actions against the wrong numbers.
+
+    `allow_cv_switch` adds `switch_cv` to the biased action space. The caller
+    owns that budget: once the campaign has spent its allowance the action is
+    dropped from the enum rather than refused after the fact, so the model
+    never emits a decision the loop will not honour.
     """
     client = client or anthropic.Anthropic()
     if phase not in _TOOL_FOR_PHASE:
@@ -419,6 +480,8 @@ def decide(
             f"{sorted(_TOOL_FOR_PHASE)}"
         )
     tool = _TOOL_FOR_PHASE[phase]
+    if phase == "metad" and allow_cv_switch:
+        tool = _METAD_SWITCH_TOOL
     payload = {
         "round_index": (len(prior_round_summaries) if prior_round_summaries else 0) + 1,
         "diagnostic_report": diagnostic_report,
@@ -455,19 +518,26 @@ def decide(
     )
 
 
+_PROPOSAL_ACTIONS = frozenset({"switch_to_metad", "switch_cv"})
+
+
 def _parse_decision(data: dict[str, Any]) -> Decision:
     decision = data["decision"]
     metad_raw = data.get("metad_proposal")
     metad = MetadProposal.from_dict(metad_raw) if metad_raw else None
 
-    if decision == "switch_to_metad" and metad is None:
+    # Both actions that (re)define the biased coordinate carry a proposal:
+    # `switch_to_metad` opens the biased phase, `switch_cv` replaces the CV
+    # inside it. Everything else must leave it null.
+    if decision in _PROPOSAL_ACTIONS and metad is None:
         raise RuntimeError(
-            "scientist: decision='switch_to_metad' but metad_proposal is null"
+            f"scientist: decision={decision!r} but metad_proposal is null"
         )
-    if decision != "switch_to_metad" and metad is not None:
+    if decision not in _PROPOSAL_ACTIONS and metad is not None:
         raise RuntimeError(
             f"scientist: metad_proposal present with decision={decision!r}; "
-            f"must be null unless decision=='switch_to_metad'"
+            f"must be null unless decision is one of "
+            f"{sorted(_PROPOSAL_ACTIONS)}"
         )
 
     return Decision(

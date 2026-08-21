@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     dcd_path TEXT NOT NULL,
     checkpoint_path TEXT,
     report_json TEXT NOT NULL,
-    decision TEXT NOT NULL CHECK (decision IN ('extend', 'stop', 'switch_to_metad')),
+    decision TEXT NOT NULL CHECK (decision IN ('extend', 'stop', 'switch_to_metad', 'switch_cv')),
     reason TEXT NOT NULL,
     extra_ns REAL,
     metad_proposal_json TEXT,
@@ -110,6 +110,7 @@ def init_campaign(work_dir: Path, config: dict[str, Any]) -> None:
         conn.executescript(_SCHEMA)
         _migrate_rounds_for_metad(conn)
         _migrate_rounds_for_plumed(conn)
+        _migrate_rounds_for_cv_switch(conn)
         row = conn.execute("SELECT config_json FROM campaign WHERE id = 1").fetchone()
         if row is None:
             conn.execute(
@@ -300,6 +301,53 @@ def _migrate_rounds_for_plumed(conn: sqlite3.Connection) -> None:
     if not cols or "plumed_dat_path" in cols:
         return
     conn.execute("ALTER TABLE rounds ADD COLUMN plumed_dat_path TEXT")
+
+
+def _migrate_rounds_for_cv_switch(conn: sqlite3.Connection) -> None:
+    """Widen the ``decision`` CHECK constraint to admit ``switch_cv``.
+
+    A CHECK change again, so rename-create-copy-drop as in the metaD
+    migration. Unlike the other two this adds no column, so idempotency is
+    detected from the stored DDL rather than from ``PRAGMA table_info``. Runs
+    last, so it also covers a table either earlier migration just recreated.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'rounds'"
+    ).fetchone()
+    if row is None or "switch_cv" in (row[0] or ""):
+        return
+    conn.executescript(
+        """
+        BEGIN;
+        ALTER TABLE rounds RENAME TO rounds_pre_cv_switch;
+        CREATE TABLE rounds (
+            round_index INTEGER PRIMARY KEY,
+            n_steps INTEGER NOT NULL,
+            dcd_path TEXT NOT NULL,
+            checkpoint_path TEXT,
+            report_json TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (
+                decision IN ('extend', 'stop', 'switch_to_metad', 'switch_cv')
+            ),
+            reason TEXT NOT NULL,
+            extra_ns REAL,
+            metad_proposal_json TEXT,
+            plumed_dat_path TEXT,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO rounds (
+            round_index, n_steps, dcd_path, checkpoint_path,
+            report_json, decision, reason, extra_ns,
+            metad_proposal_json, plumed_dat_path, created_at
+        )
+        SELECT round_index, n_steps, dcd_path, checkpoint_path,
+               report_json, decision, reason, extra_ns,
+               metad_proposal_json, plumed_dat_path, created_at
+        FROM rounds_pre_cv_switch;
+        DROP TABLE rounds_pre_cv_switch;
+        COMMIT;
+        """
+    )
 
 
 def _now_iso() -> str:

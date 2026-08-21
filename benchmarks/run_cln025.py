@@ -57,7 +57,11 @@ def run(task: dict[str, Any], work_dir: Path, *, dry_run: bool) -> CampaignResul
     else:
         initial_steps = 1 * _STEPS_PER_NS    # 1 ns vanilla, and the first biased round
         max_biased_ns = float(criterion["max_biased_ns"])
-        max_rounds = 15                      # the budget, not this, is the real bound
+        # The budget, not this, is meant to be the real bound. Raised from 15
+        # once `switch_cv` landed: a CV switch spends an extra round at
+        # `initial_steps` and restarts the extend cadence, so a campaign that
+        # revises its coordinate can reach the round cap with budget unspent.
+        max_rounds = 20
         report_interval_steps = 500          # 1 ps/frame
 
     adapter = OpenMMAdapter(

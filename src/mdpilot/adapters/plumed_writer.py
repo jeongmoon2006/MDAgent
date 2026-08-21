@@ -198,6 +198,7 @@ class MetadynamicsBias:
     bias_factor: float = 10.0        # γ, dimensionless; must be > 1
     temperature_k: float = 300.0     # must match the thermostat
     sigma_floored: bool = False      # SIGMA came from the floor, not the data
+    sigma_ceiled: bool = False       # SIGMA came from the ceiling, not the data
     hills_file: str = "HILLS"
     bias_label: str = "metad"
 
@@ -409,6 +410,16 @@ class PlumedInput:
                 "#       trajectory's spread measured narrower than the",
                 "#       narrowest hill worth depositing. Treat the vanilla",
                 "#       phase as having under-sampled this coordinate.",
+            ]
+        if isinstance(self.bias, MetadynamicsBias) and self.bias.sigma_ceiled:
+            # Same argument from the other side: a width taken from an
+            # already-biased trajectory is inflated, and a hill wider than the
+            # features it should resolve flattens the surface by construction.
+            lines += [
+                "# NOTE: SIGMA was lowered to this CV type's ceiling — the",
+                "#       source trajectory's spread measured wider than the",
+                "#       widest hill worth depositing. Expect this when a CV is",
+                "#       sized on a trajectory that was already biased.",
             ]
         lines.append(self._bias_with_resolved_paths().render())
         if self.walls:

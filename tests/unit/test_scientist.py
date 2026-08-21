@@ -272,3 +272,69 @@ def test_tool_schemas_avoid_keywords_strict_mode_rejects() -> None:
         assert tool["strict"] is True
         assert tool["input_schema"]["additionalProperties"] is False
         walk(tool["input_schema"])
+
+
+# ---------- switch_cv action space ----------
+
+def test_plain_biased_tool_cannot_express_a_cv_switch() -> None:
+    """The default biased schema is the one used once the allowance is spent.
+    `switch_cv` must be absent from it, not merely rejected downstream."""
+    from mdpilot.orchestrator.scientist import _METAD_DECISION_TOOL
+
+    schema = _METAD_DECISION_TOOL["input_schema"]
+    assert schema["properties"]["decision"]["enum"] == ["extend", "stop"]
+    assert "metad_proposal" not in schema["properties"]
+
+
+def test_switch_enabled_biased_tool_requires_a_proposal_slot() -> None:
+    from mdpilot.orchestrator.scientist import _METAD_SWITCH_TOOL
+
+    schema = _METAD_SWITCH_TOOL["input_schema"]
+    assert schema["properties"]["decision"]["enum"] == ["extend", "stop", "switch_cv"]
+    # strict mode requires every property to be listed as required; the
+    # nullable type is what makes "no proposal this round" expressible.
+    assert "metad_proposal" in schema["required"]
+    assert schema["properties"]["metad_proposal"]["type"] == ["object", "null"]
+
+
+def test_switch_cv_must_carry_a_proposal() -> None:
+    from mdpilot.orchestrator.scientist import _parse_decision
+
+    with pytest.raises(RuntimeError, match="metad_proposal is null"):
+        _parse_decision({
+            "decision": "switch_cv", "reason": "cv is wrong",
+            "extra_ns": None, "ledger_note": None, "metad_proposal": None,
+        })
+
+
+def test_extend_must_not_carry_a_proposal() -> None:
+    """The cross-field invariant has to hold for the new action too, or an
+    `extend` carrying a stale proposal would look like a silent switch."""
+    from mdpilot.orchestrator.scientist import _parse_decision
+
+    with pytest.raises(RuntimeError, match="must be null unless"):
+        _parse_decision({
+            "decision": "extend", "reason": "still filling",
+            "extra_ns": 1.0, "ledger_note": None,
+            "metad_proposal": {
+                "cv_type": "contacts", "selections": ["name CA"], "label": "q",
+            },
+        })
+
+
+def test_switch_cv_round_trips_with_its_proposal() -> None:
+    from mdpilot.orchestrator.scientist import _parse_decision
+
+    decision = _parse_decision({
+        "decision": "switch_cv",
+        "reason": "recrossings counted entirely inside the unfolded state",
+        "extra_ns": None,
+        "ledger_note": "rmsd_ca is one-way; trying native contacts",
+        "metad_proposal": {
+            "cv_type": "contacts", "selections": ["name CA"], "label": "q_native",
+        },
+    })
+
+    assert decision.decision == "switch_cv"
+    assert decision.metad_proposal is not None
+    assert decision.metad_proposal.cv_type == "contacts"

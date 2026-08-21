@@ -21,6 +21,7 @@ from mdpilot.sampling.bias_designer import (
     _KB_KJ_PER_MOL_K,
     design_bias,
     design_upper_wall,
+    sigma_ceiling,
     sigma_floor,
     size_sigma,
 )
@@ -181,7 +182,7 @@ def test_pinned_cv_gets_the_floor_not_thermal_jitter(tmp_path: Path) -> None:
     nothing. The floor has to bind here.
     """
     cv = GyrationCV(label="rg", atoms=(0, 1, 2))
-    sigma, floored = size_sigma(cv, spread=0.0018 * 3.0)
+    sigma, floored, _ = size_sigma(cv, spread=0.0018 * 3.0)
 
     assert floored is True
     assert sigma == pytest.approx(sigma_floor(cv))
@@ -192,7 +193,7 @@ def test_well_sampled_cv_keeps_its_measured_width() -> None:
     """The floor is a floor, not an override — a CV that genuinely explored a
     wide basin must not be widened to a rule of thumb."""
     cv = GyrationCV(label="rg", atoms=(0, 1, 2))
-    sigma, floored = size_sigma(cv, spread=0.30)
+    sigma, floored, _ = size_sigma(cv, spread=0.30)
 
     assert floored is False
     assert sigma == pytest.approx(0.10)
@@ -205,8 +206,8 @@ def test_floor_binds_below_the_boundary_and_releases_above() -> None:
     cv = DistanceCV(label="d", atoms=(0, 1))
     floor = sigma_floor(cv)
 
-    above, floored_above = size_sigma(cv, spread=floor * 3.0 * 1.05)
-    below, floored_below = size_sigma(cv, spread=floor * 3.0 * 0.95)
+    above, floored_above, _ = size_sigma(cv, spread=floor * 3.0 * 1.05)
+    below, floored_below, _ = size_sigma(cv, spread=floor * 3.0 * 0.95)
 
     assert floored_above is False
     assert above == pytest.approx(floor * 1.05)
@@ -268,3 +269,45 @@ def test_contact_count_has_its_own_sigma_floor() -> None:
     contacts = ContactsCV(label="q", pairs=((0, 5), (1, 6)), r0_nm=0.75)
     assert sigma_floor(contacts) == 0.5
     assert sigma_floor(contacts) != sigma_floor(DistanceCV(label="d", atoms=(0, 1)))
+
+
+def test_sigma_is_capped_from_above_as_well_as_below() -> None:
+    """The open tail of F4. A CV sized on an already-biased trajectory measures
+    a spread inflated by the bias that drove the walker across it; a hill wider
+    than the features it should resolve flattens the surface by construction."""
+    cv = DistanceCV(label="d", atoms=(0, 1))
+    ceiling = sigma_ceiling(cv)
+
+    sigma, floored, ceiled = size_sigma(cv, spread=ceiling * 3.0 * 2.0)
+
+    assert sigma == pytest.approx(ceiling)
+    assert (floored, ceiled) == (False, True)
+
+
+def test_a_measured_width_between_the_bounds_is_left_alone() -> None:
+    cv = DistanceCV(label="d", atoms=(0, 1))
+    midpoint = (sigma_floor(cv) + sigma_ceiling(cv)) / 2.0
+
+    sigma, floored, ceiled = size_sigma(cv, spread=midpoint * 3.0)
+
+    assert sigma == pytest.approx(midpoint)
+    assert (floored, ceiled) == (False, False)
+
+
+def test_a_ceiled_sigma_is_announced_in_the_rendered_input() -> None:
+    """Same contract as the floored note: a substituted width must never be
+    indistinguishable from a measured one when plumed.dat is read back."""
+    from mdpilot.adapters.plumed_writer import MetadynamicsBias, PlumedInput
+
+    cv = DistanceCV(label="d", atoms=(0, 1))
+    rendered = PlumedInput(
+        cvs=(cv,),
+        bias=MetadynamicsBias(
+            cv_labels=("d",), sigma=(0.2,), height=1.2, pace=500,
+            sigma_ceiled=True,
+        ),
+        output_dir=Path("/tmp/x"),
+    ).render()
+
+    assert "lowered to this CV type's ceiling" in rendered
+    assert "raised to this CV type's floor" not in rendered

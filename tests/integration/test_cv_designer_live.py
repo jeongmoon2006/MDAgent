@@ -1,4 +1,4 @@
-"""Rendered CVs against the real PLUMED parser.
+"""Rendered CVs and bias inputs against the real PLUMED parser.
 
 The unit tests check that `cv_designer` resolves selections to the right atom
 indices and that `plumed_writer` formats them as expected. What they cannot
@@ -119,3 +119,47 @@ def test_python_and_plumed_agree_on_the_contact_count(tmp_path: Path) -> None:
     # atol as well as rtol: the extended frame sits at Q ~ 1e-13, where a
     # relative tolerance compares two different roundings of zero.
     np.testing.assert_allclose(from_python, from_plumed, rtol=1e-5, atol=1e-9)
+
+
+def test_a_full_switched_bias_input_is_accepted_by_plumed(tmp_path: Path) -> None:
+    """The composition the `switch_cv` path produces, end to end.
+
+    A CONTACTMAP block uses PLUMED's line-continuation syntax, and the bias and
+    PRINT directives follow it in the same file. Each piece parses alone; this
+    pins that they parse *together*, which is the arrangement `switch_cv`
+    actually writes and the one a unit test on rendered text cannot check.
+    """
+    from mdpilot.orchestrator.loop import _build_plumed_input
+    from mdpilot.orchestrator.scientist import MetadProposal
+
+    native, extended = _native_and_extended()
+    source = md.join([native[0], extended, native[0]])
+    traj_path = tmp_path / "source.dcd"
+    source.save_dcd(str(traj_path))
+
+    text = _build_plumed_input(
+        MetadProposal(cv_type="contacts", selections=("name CA",), label="q_native"),
+        traj_path,
+        _FIXED_PDB,
+        tmp_path,
+    )
+    plumed_dat = tmp_path / "plumed.dat"
+    plumed_dat.write_text(text)
+
+    result = subprocess.run(
+        [
+            "plumed", "driver",
+            "--mf_dcd", str(traj_path),
+            "--natoms", str(source.n_atoms),
+            "--plumed", str(plumed_dat),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    combined = result.stdout + result.stderr
+    assert "Action CONTACTMAP" in combined, combined
+    assert "Action METAD" in combined, combined
+    assert (tmp_path / "HILLS").exists()
+    # A bounded CV takes no upper wall, and there is nothing to bound.
+    assert "UPPER_WALLS" not in text

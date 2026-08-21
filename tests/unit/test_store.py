@@ -365,3 +365,76 @@ def test_pre_plumed_db_gains_column_and_keeps_rows(tmp_path: Path) -> None:
         plumed_dat_path=tmp_path / "plumed.dat",
     )
     assert store.list_rounds(tmp_path)[-1].plumed_dat_path == tmp_path / "plumed.dat"
+
+
+def test_pre_switch_cv_database_is_migrated_in_place(tmp_path: Path) -> None:
+    """A campaign started before CV revision existed must accept a switch_cv
+    round after upgrading, without losing the rounds already recorded. SQLite
+    cannot ALTER a CHECK constraint, so this is a rename-create-copy-drop and
+    the copy is the part that can silently drop data."""
+    import sqlite3
+
+    from mdpilot.memory.store import _connect, _migrate_rounds_for_cv_switch
+
+    work_dir = tmp_path / "campaign"
+    work_dir.mkdir(parents=True)
+    with _connect(work_dir) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE rounds (
+                round_index INTEGER PRIMARY KEY,
+                n_steps INTEGER NOT NULL,
+                dcd_path TEXT NOT NULL,
+                checkpoint_path TEXT,
+                report_json TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK (
+                    decision IN ('extend', 'stop', 'switch_to_metad')
+                ),
+                reason TEXT NOT NULL,
+                extra_ns REAL,
+                metad_proposal_json TEXT,
+                plumed_dat_path TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO rounds VALUES
+                (1, 100, 'a.dcd', 'a.chk', '{}', 'extend', 'r', 0.5, NULL, NULL, 'now');
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO rounds VALUES (2, 100, 'b.dcd', NULL, '{}', "
+                "'switch_cv', 'r', NULL, NULL, NULL, 'now')"
+            )
+        conn.rollback()
+
+        _migrate_rounds_for_cv_switch(conn)
+
+        conn.execute(
+            "INSERT INTO rounds VALUES (2, 100, 'b.dcd', NULL, '{}', "
+            "'switch_cv', 'r', NULL, NULL, NULL, 'now')"
+        )
+        assert conn.execute("SELECT COUNT(*) FROM rounds").fetchone()[0] == 2
+        # The pre-existing round survived the copy.
+        assert conn.execute(
+            "SELECT dcd_path FROM rounds WHERE round_index = 1"
+        ).fetchone()[0] == "a.dcd"
+
+
+def test_cv_switch_migration_is_idempotent(tmp_path: Path) -> None:
+    """It keys on the stored DDL rather than a new column, so a second run must
+    detect that the constraint is already wide and do nothing."""
+    from mdpilot.memory.store import _connect, _migrate_rounds_for_cv_switch, init_campaign
+
+    work_dir = tmp_path / "campaign"
+    init_campaign(work_dir, {"seed": 1})
+    with _connect(work_dir) as conn:
+        before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'rounds'"
+        ).fetchone()[0]
+        _migrate_rounds_for_cv_switch(conn)
+        _migrate_rounds_for_cv_switch(conn)
+        after = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'rounds'"
+        ).fetchone()[0]
+    assert before == after
+    assert "switch_cv" in after

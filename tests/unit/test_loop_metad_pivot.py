@@ -97,17 +97,22 @@ def _stub_collaborators(monkeypatch, decisions: list[Decision]) -> dict:
     """Patch decide / both report builders / _build_plumed_input.
 
     Returns a record of what the loop asked for: `plumed_texts` (one entry per
-    rendered bias) and `phases` (the phase passed to each decide call), so
+    rendered bias), `phases` (the phase passed to each decide call),
+    `allow_cv_switch` (whether CV revision was on the table that round) and
+    `cv_labels` (the label of each CV the loop asked to have rendered), so
     tests can assert the loop routed each round to the right contract.
     """
     queue = list(decisions)
-    record: dict = {"plumed_texts": [], "phases": []}
+    record: dict = {
+        "plumed_texts": [], "phases": [], "allow_cv_switch": [], "cv_labels": [],
+    }
 
     monkeypatch.setattr(loop_mod, "make_report", lambda *a, **k: dict(_REPORT))
     monkeypatch.setattr(loop_mod, "metad_report", lambda *a, **k: dict(_METAD_REPORT))
 
     def fake_decide(report, **kwargs):  # noqa: ANN001
         record["phases"].append(kwargs.get("phase"))
+        record["allow_cv_switch"].append(kwargs.get("allow_cv_switch"))
         return queue.pop(0)
 
     monkeypatch.setattr(loop_mod, "decide", fake_decide)
@@ -115,6 +120,7 @@ def _stub_collaborators(monkeypatch, decisions: list[Decision]) -> dict:
     def fake_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
         text = "PLUMED-TEXT\n"
         record["plumed_texts"].append(text)
+        record["cv_labels"].append(proposal.label)
         return text
 
     monkeypatch.setattr(loop_mod, "_build_plumed_input", fake_build)
@@ -643,3 +649,183 @@ def test_prior_summaries_carry_the_boundaries_a_recrossing_count_used(
         assert summary["recrossings"] == 3
         assert summary["recrossing_low"] == -0.4
         assert summary["recrossing_high"] == 0.6
+
+
+# ---------- switch_cv: CV revision inside the biased phase ----------
+
+def _replacement() -> MetadProposal:
+    return MetadProposal(
+        cv_type="contacts", selections=("name CA",), label="q_native"
+    )
+
+
+def _switch_cv() -> Decision:
+    return Decision(
+        decision="switch_cv",
+        reason="recrossings counted between boundaries both above the task's "
+               "extended threshold; the walker never returned to cv_start",
+        extra_ns=None,
+        metad_proposal=_replacement(),
+    )
+
+
+def _hills(work_dir: Path) -> Path:
+    return work_dir / "HILLS"
+
+
+def test_switch_cv_rebuilds_the_bias_on_the_replacement_cv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core of CV revision: a second biased adapter is built against the
+    new proposal, and the campaign continues in the same call rather than
+    terminating for a human to restart."""
+    _stub_collaborators(monkeypatch, [_switch(), _switch_cv(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    built: list[_FakeAdapter] = []
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        a = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+        built.append(a)
+        return a
+
+    result = run_campaign(
+        work_dir=tmp_path / "campaign",
+        adapter=base,
+        biased_adapter_factory=factory,
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    # Two biased adapters: the pivot's, and the replacement's.
+    assert len(built) == 2
+    assert result.stop_reason == "scientist_said_stop"
+    assert [r.decision.decision for r in result.rounds] == [
+        "switch_to_metad", "switch_cv", "stop",
+    ]
+    # The round after the switch is still biased.
+    assert result.rounds[2].plumed_dat_path is not None
+
+
+def test_switch_cv_clears_the_outgoing_hills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hills on the old coordinate must not carry into the new bias — PLUMED
+    would read them back as if they described the new CV. The round snapshot
+    is what preserves them."""
+    _stub_collaborators(monkeypatch, [_switch(), _switch_cv(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    work_dir = tmp_path / "campaign"
+
+    def factory(plumed_input: str) -> _FakeAdapter:
+        # Simulate PLUMED depositing as soon as a biased adapter starts.
+        _hills(work_dir).parent.mkdir(parents=True, exist_ok=True)
+        _hills(work_dir).write_text("old-cv hills")
+        return _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), plumed_input=plumed_input)
+
+    run_campaign(
+        work_dir=work_dir,
+        adapter=base,
+        biased_adapter_factory=factory,
+        max_rounds=5,
+        **_run_kwargs(),
+    )
+
+    # The replacement factory rewrote HILLS after the clear, so what matters is
+    # that the *snapshot* of the pre-switch round survives as the record.
+    snapshot = work_dir / "rounds" / "round_002.hills"
+    assert snapshot.exists()
+    assert snapshot.read_text() == "old-cv hills"
+
+
+def test_switch_cv_is_withdrawn_once_the_allowance_is_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the cap the action is dropped from the tool schema rather than
+    refused after the fact, so the model never emits a decision the loop will
+    not honour — the same reason a second switch_to_metad is unrepresentable."""
+    record = _stub_collaborators(
+        monkeypatch, [_switch(), _switch_cv(), _extend(), _stop()]
+    )
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+
+    run_campaign(
+        work_dir=tmp_path / "campaign",
+        adapter=base,
+        biased_adapter_factory=lambda p: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=p
+        ),
+        max_rounds=6,
+        max_cv_switches=1,
+        **_run_kwargs(),
+    )
+
+    # Round 1 vanilla: not offered. Round 2 biased with one switch left: offered.
+    # Rounds 3+ biased with the allowance spent: withdrawn.
+    assert record["allow_cv_switch"] == [False, True, False, False]
+
+
+def test_switch_cv_allowance_is_recomputed_from_disk_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart must not hand the scientist a second allowance, for the same
+    reason it must not hand it a second biased budget."""
+    work_dir = tmp_path / "campaign"
+    factory = lambda p: _FakeAdapter(  # noqa: E731
+        tmp_path, spec=SystemSpec.trpcage(), plumed_input=p
+    )
+
+    _stub_collaborators(monkeypatch, [_switch(), _switch_cv()])
+    run_campaign(
+        work_dir=work_dir,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        max_rounds=2,          # stop right after the switch round
+        max_cv_switches=1,
+        **_run_kwargs(),
+    )
+
+    record = _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=work_dir,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        max_rounds=4,
+        max_cv_switches=1,
+        **_run_kwargs(),
+    )
+
+    assert record["allow_cv_switch"] == [False]
+
+
+def test_resumed_switch_cv_round_builds_the_replacement_not_the_rejected_cv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Branch-ordering guard. A switch_cv round is itself biased, so the
+    generic `plumed_dat_path is not None` resume branch matches it too — and
+    would restart the campaign on the coordinate the scientist just rejected,
+    with RESTART reading its hills back."""
+    work_dir = tmp_path / "campaign"
+    factory = lambda p: _FakeAdapter(  # noqa: E731
+        tmp_path, spec=SystemSpec.trpcage(), plumed_input=p
+    )
+
+    _stub_collaborators(monkeypatch, [_switch(), _switch_cv()])
+    run_campaign(
+        work_dir=work_dir,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        max_rounds=2,
+        **_run_kwargs(),
+    )
+
+    record = _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=work_dir,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=factory,
+        max_rounds=4,
+        **_run_kwargs(),
+    )
+
+    # The bias rebuilt on resume is the replacement CV, not the original.
+    assert record["cv_labels"] == [_replacement().label]

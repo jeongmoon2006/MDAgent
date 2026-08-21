@@ -97,6 +97,7 @@ def run_campaign(
     max_extra_ns: float = 2.0,
     max_biased_ns: float | None = None,
     min_recrossings: int = 1,
+    max_cv_switches: int = 1,
     cv_upper_wall_nm: float | None = None,
     seed: int = 42,
     report_interval_steps: int = 500,    # 1 ps/frame at 2 fs
@@ -108,6 +109,12 @@ def run_campaign(
 
     `adapter` defaults to `OpenMMAdapter(work_dir=work_dir, seed=seed)`.
     Pass a different `MDAdapter` to run through another engine.
+
+    `max_cv_switches` is how many times the scientist may replace the biased
+    CV within one campaign. While switches remain, `switch_cv` is offered in
+    the biased action space; once they are spent it is dropped from the tool
+    schema, so a further revision is unrepresentable rather than emitted and
+    then refused. Counted across resumes from the persisted rounds.
 
     `max_rounds`, `max_extra_ns` and `max_biased_ns` are loop-control bounds
     and may differ between invocations; the physics-bound params (seed,
@@ -225,6 +232,29 @@ def run_campaign(
         current_plumed_dat = plumed_dat_path
         start_round = last.round_index + 1
         n_steps = initial_steps
+    elif last.decision == "switch_cv":
+        # CV-revision resume. Ordered *before* the generic biased branch below:
+        # a switch_cv round is itself biased, so `plumed_dat_path is not None`
+        # would match first and resume the campaign on the CV the scientist
+        # just rejected, with RESTART reading its hills back.
+        if last.metad_proposal is None:
+            raise RuntimeError(
+                f"round {last.round_index} decided switch_cv but stored no "
+                f"metad_proposal; cannot build the replacement bias"
+            )
+        _clear_bias_state(plumed_dat_path.parent)
+        adapter = _pivot_to_metad(
+            MetadProposal.from_dict(last.metad_proposal),
+            source_trajectory=last.dcd_path,
+            topology_path=adapter.topology_path,
+            factory=biased_adapter_factory,
+            plumed_dat_path=plumed_dat_path,
+            cv_upper_wall_nm=cv_upper_wall_nm,
+        )
+        in_metad = True
+        current_plumed_dat = plumed_dat_path
+        start_round = last.round_index + 1
+        n_steps = initial_steps
     elif last.plumed_dat_path is not None:
         # Mid-metaD-phase resume: rebuild the biased adapter from the persisted
         # plumed.dat and continue from that round's (biased) checkpoint. The
@@ -257,6 +287,9 @@ def run_campaign(
     biased_steps_run = sum(
         r.n_steps for r in prior_rows if r.plumed_dat_path is not None
     )
+    # Same reasoning as the biased-step meter: recomputed from disk so a
+    # restart cannot buy the scientist a second allowance of CV switches.
+    cv_switches_used = sum(1 for r in prior_rows if r.decision == "switch_cv")
     biased_step_budget = (
         int(max_biased_ns * _STEPS_PER_NS) if max_biased_ns is not None else None
     )
@@ -306,6 +339,7 @@ def run_campaign(
             hypothesis_ledger=[f"R{n.round_index}: {n.text}" for n in ledger_notes],
             task_expectation=task_expectation,
             phase="metad" if in_metad else "vanilla",
+            allow_cv_switch=in_metad and cv_switches_used < max_cv_switches,
         )
 
         override_note: str | None = None
@@ -371,6 +405,26 @@ def run_campaign(
                 cv_upper_wall_nm=cv_upper_wall_nm,
             )
             in_metad = True
+            current_plumed_dat = plumed_dat_path
+            n_steps = initial_steps
+            continue
+
+        if decision.decision == "switch_cv":
+            assert decision.metad_proposal is not None  # guaranteed by the parser
+            # The replacement CV is sized on *this* round's trajectory, which
+            # was run under the outgoing bias. That spread is inflated by the
+            # bias that drove the walker across the old coordinate, which is
+            # what `_SIGMA_CEILINGS` in bias_designer exists to catch.
+            _clear_bias_state(plumed_dat_path.parent)
+            adapter = _pivot_to_metad(
+                decision.metad_proposal,
+                source_trajectory=dcd,
+                topology_path=adapter.topology_path,
+                factory=biased_adapter_factory,
+                plumed_dat_path=plumed_dat_path,
+                cv_upper_wall_nm=cv_upper_wall_nm,
+            )
+            cv_switches_used += 1
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
             continue
@@ -448,6 +502,20 @@ def _snapshot_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> 
         src = bias_dir / name
         if src.exists():
             shutil.copy2(src, _bias_snapshot_path(rounds_dir, round_index, name))
+
+
+def _clear_bias_state(bias_dir: Path) -> None:
+    """Drop the live HILLS/COLVAR so a new CV starts from zero bias.
+
+    Hills deposited on the previous coordinate must not carry over: they
+    describe a different CV and PLUMED would read them back as if they did
+    not. Deleting rather than archiving is deliberate — the outgoing bias is
+    already preserved at `rounds/round_NNN.hills` by `_snapshot_bias_state`,
+    and delete is idempotent, so a resume that re-enters this path cannot
+    accumulate half-written archives of an interrupted round.
+    """
+    for name in _BIAS_STATE_FILES:
+        (bias_dir / name).unlink(missing_ok=True)
 
 
 def _restore_bias_state(bias_dir: Path, rounds_dir: Path, round_index: int) -> None:
@@ -672,6 +740,10 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
     }
     if r.plumed_dat_path is not None:
         base.update(
+            # Which coordinate this round was judged on. Across a switch_cv the
+            # history holds counts from two different CVs, and a bare list of
+            # recrossings would invite exactly the comparison F7 was about.
+            cv_label=r.report.get("cv_label"),
             fes_drift_kj_per_mol=r.report.get("fes_drift_kj_per_mol"),
             recrossings=r.report.get("recrossings"),
             # The boundaries move as the surface fills, so a count carried
