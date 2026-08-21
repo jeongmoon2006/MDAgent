@@ -160,6 +160,7 @@ def _full_config(tmp_path: Path) -> dict:
         "engine": "_FakeAdapter",
         "task_expectation": None,
         "cv_upper_wall_nm": None,
+        "state_thresholds": None,
     }
 
 
@@ -829,3 +830,96 @@ def test_resumed_switch_cv_round_builds_the_replacement_not_the_rejected_cv(
 
     # The bias rebuilt on resume is the replacement CV, not the original.
     assert record["cv_labels"] == [_replacement().label]
+
+
+# ---------- strictness: a biased phase needs the task's states ----------
+
+def test_a_campaign_that_can_pivot_must_supply_state_thresholds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without them the biased phase would fall back to counting between the
+    two deepest basins of the current surface, which F9 showed is not
+    comparable round to round. `task_expectation` is the sole input gating
+    `switch_to_metad`, so it is the predicate for "can reach a biased phase"."""
+    _stub_collaborators(monkeypatch, [_stop()])
+
+    with pytest.raises(ValueError, match="state_thresholds is None"):
+        run_campaign(
+            work_dir=tmp_path / "campaign",
+            adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+            task_expectation="cross the barrier",
+            **_run_kwargs(),
+        )
+
+
+def test_the_guard_fires_before_any_simulation_is_paid_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raising at the pivot instead would throw away the whole vanilla phase —
+    hours of GPU time on a real campaign."""
+    _stub_collaborators(monkeypatch, [_stop()])
+    adapter = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+
+    with pytest.raises(ValueError):
+        run_campaign(
+            work_dir=tmp_path / "campaign",
+            adapter=adapter,
+            task_expectation="cross the barrier",
+            **_run_kwargs(),
+        )
+
+    assert adapter.run_calls == []
+    assert not (tmp_path / "campaign" / "rounds").exists()
+
+
+def test_a_pure_convergence_campaign_needs_no_state_thresholds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strict, not indiscriminate. With no task_expectation the scientist
+    cannot propose a pivot, so no biased phase can occur and there is nothing
+    for the thresholds to anchor."""
+    _stub_collaborators(monkeypatch, [_stop()])
+
+    result = run_campaign(
+        work_dir=tmp_path / "campaign",
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        **_run_kwargs(),
+    )
+
+    assert result.stop_reason == "scientist_said_stop"
+
+
+def test_inverted_state_thresholds_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`count_recrossings` returns 0 for an inverted band rather than raising,
+    so a swapped pair would read as a campaign that never crossed."""
+    _stub_collaborators(monkeypatch, [_stop()])
+
+    with pytest.raises(ValueError, match="extended > folded"):
+        run_campaign(
+            work_dir=tmp_path / "campaign",
+            adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+            task_expectation="cross the barrier",
+            state_thresholds=(4.0, 1.5),
+            **_run_kwargs(),
+        )
+
+
+def test_state_thresholds_are_locked_against_a_changed_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resuming with a different band would splice two definitions of "a
+    transition" into one campaign's history."""
+    work_dir = tmp_path / "campaign"
+    kwargs = dict(
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        task_expectation="cross the barrier",
+        **_run_kwargs(),
+    )
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(work_dir=work_dir, state_thresholds=(1.5, 4.0), **kwargs)
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    with pytest.raises(ValueError, match="different config"):
+        run_campaign(work_dir=work_dir, state_thresholds=(2.0, 5.0), **kwargs)

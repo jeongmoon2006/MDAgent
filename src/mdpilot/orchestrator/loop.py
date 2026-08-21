@@ -153,6 +153,34 @@ def run_campaign(
     over the same `SystemSpec` with `plumed_input` set. Inject to run the
     biased phase through a different engine (or a fake, in tests).
     """
+    # A biased phase without task states would fall back to counting
+    # recrossings between the two deepest basins of the current surface, which
+    # F7 and F9 showed is not comparable between rounds — it migrates, vanishes
+    # when fewer than two basins resolve, and inflates when the barrier fills.
+    # `task_expectation` is the sole input gating `switch_to_metad`, so it is
+    # exactly the predicate for "this campaign can reach a biased phase".
+    # Refused here, before any MD is paid for, rather than at the pivot.
+    if task_expectation is not None and state_thresholds is None:
+        raise ValueError(
+            "run_campaign: task_expectation is set, so this campaign can pivot "
+            "to metadynamics, but state_thresholds is None. A biased phase "
+            "needs the task's own state definitions to count recrossings "
+            "against; without them the count is taken between whichever two "
+            "basins are currently deepest, which means something different "
+            "every round. Pass state_thresholds=(folded, extended) on the "
+            "campaign observable (CA-RMSD to the campaign reference, in "
+            "Angstrom)."
+        )
+    if state_thresholds is not None:
+        low, high = state_thresholds
+        if not high > low:
+            raise ValueError(
+                f"run_campaign: state_thresholds must be (folded, extended) "
+                f"with extended > folded; got {state_thresholds!r}. "
+                f"`count_recrossings` silently returns 0 for an inverted band, "
+                f"so a swapped pair would read as a run that never crossed."
+            )
+
     work_dir = Path(work_dir)
     rounds_dir = work_dir / "rounds"
     rounds_dir.mkdir(parents=True, exist_ok=True)
@@ -186,6 +214,13 @@ def run_campaign(
         # rather than a loop-control bound: changing it on resume would join two
         # halves of a campaign sampled under different Hamiltonians.
         "cv_upper_wall_nm": cv_upper_wall_nm,
+        # The band every biased-round recrossing count is taken against.
+        # Resuming with a different one would splice two definitions of
+        # "a transition" into a single campaign's history. Listed as a list
+        # rather than a tuple so the JSON round-trip is stable.
+        "state_thresholds": (
+            list(state_thresholds) if state_thresholds is not None else None
+        ),
     }
     store.init_campaign(work_dir, config)
     prior_rows = store.list_rounds(work_dir)

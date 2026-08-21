@@ -34,6 +34,7 @@ def _full_config(cfg: dict, *, engine: str = "OpenMMAdapter") -> dict:
         "engine": engine,
         "task_expectation": None,
         "cv_upper_wall_nm": None,
+        "state_thresholds": None,
     }
 
 

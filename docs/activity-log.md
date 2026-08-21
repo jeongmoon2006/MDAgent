@@ -141,7 +141,7 @@ Three separate defects, found by auditing run 2's own output rather than by a te
 ### F8 — `seed` does not make system construction reproducible (2026-08-20)
 `Modeller.addSolvent` takes no seed and places ions by "randomly selecting a water molecule". Two campaigns built from the same `SystemSpec` and the same `seed=42` produced **4874 vs 4889 atoms**. The campaign-local cache makes this invisible *within* a run, so nothing is broken, but `seed` covers only the integrator, barostat and initial velocities — not solvation. Any comparison between two campaigns is a comparison between two different systems unless the cached system is reused explicitly (as run 2 did, reusing run 1's).
 
-### F9 — `recrossings` is not comparable across rounds, and conflates "none" with "unmeasurable" (2026-08-21)
+### F9 — `recrossings` is not comparable across rounds, and conflates "none" with "unmeasurable" (2026-08-21) — FIXED 2026-08-21
 Run 3 exercised the full failure range of this diagnostic inside a single campaign, on a coordinate the walker was demonstrably diffusing across:
 
 | round | 2 | 3-6 | 7 | 8 | 9 | 10 | 11 | 12 |
@@ -157,7 +157,17 @@ Two distinct defects, both rooted in the band being re-derived from the current 
 
 **Consequence beyond reporting.** `_fes_converged` requires `drift < kT AND recrossings >= min_recrossings`. Defect 1 makes convergence unreachable while the surface reads single-basin regardless of drift; defect 2 holds the recrossing gate wide open on diffusive noise, so if drift ever dipped below kT with a collapsed band the loop would declare convergence on a count that means nothing. Combined with `_refuse_premature_stop`, both roads lead to budget exhaustion.
 
-**What to trust instead.** The post-hoc CA-RMSD check in `verify_done_criterion`, which uses fixed physical thresholds from the task rather than boundaries derived from the evolving surface. It is what settled run 3 (`rmsd_recrossings = 3`), and it agreed with a mid-run hand computation over rounds 2-5. Not yet fixed — the fix wants a decision on whether the band should be anchored (task-supplied states, or the first biased round's basins held fixed) rather than re-derived, which is the same question F7 left open.
+**Fix — the band is anchored to the task's states.** User chose task-supplied states over freezing the first round's basins. The wrinkle: the task defines its states in CA-RMSD Angstrom while the biased CV may be in any units at all (run 3's was a contact count), so anchoring cannot mean translating the thresholds into CV space. It means **counting on the coordinate the task defines its states on**, whatever is being biased — effectively promoting `verify_done_criterion` from a post-hoc check into the loop, so the number the scientist sees each round is the number that decides the criterion.
+
+- `report.campaign_observable()` is split out of `make_report` so the vanilla report, the biased report and the post-hoc check share one definition of CA-RMSD-to-campaign-reference and cannot drift apart.
+- `metad_report` takes `(observable, observable_name, state_thresholds)`; when present it counts there and sets `recrossing_basis="task_states"`. Absent, it falls back to the surface-derived band and says `recrossing_basis="fes_basins"`, so a count is never readable without knowing which basis produced it.
+- The unresolvable case now returns `None`, not `0`. `_fes_converged` already withholds a verdict on a null count, so a single-basin round extends rather than reading as "never crossed".
+- The count stays **cumulative** across biased rounds, matching the HILLS/COLVAR semantics it replaces. Each round's series is persisted to `rounds/round_NNN.obs.npy` (~16 KB against a ~117 MB DCD) and concatenated, rather than re-deriving from the trajectories every round — which by the end of a 20 ns campaign would mean re-reading over a gigabyte.
+- Computed only when thresholds are supplied, so a campaign without them behaves exactly as before.
+
+**Verified by replaying run 3's stored rounds.** Anchored: `1,1,1,2,3,3,3,3,3,3,3` — monotone, no unmeasurable rounds, ending at 3 and agreeing exactly with `done_criterion.json`. Reported at the time: `1,2,2,2,2,None,None,30,None,22,26`. That series *decreases*, which is arithmetically impossible for a cumulative transition count and is the clearest evidence it was not measuring one quantity. The anchored count crosses `min_recrossings=2` at round 5, matching the mid-run hand computation.
+
+**Still open from F7:** nothing forces a task to supply `state_thresholds`. A campaign without them silently falls back to the surface-derived band with all of F9's behaviour intact, marked only by `recrossing_basis`.
 
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
