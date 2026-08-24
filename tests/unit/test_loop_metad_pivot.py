@@ -25,10 +25,20 @@ from mdpilot.orchestrator.scientist import Decision, MetadProposal
 class _FakeAdapter:
     """Minimal MDAdapter that writes marker files and records calls."""
 
-    def __init__(self, work_dir: Path, *, spec: SystemSpec, plumed_input: str | None = None):
+    def __init__(
+        self,
+        work_dir: Path,
+        *,
+        spec: SystemSpec,
+        plumed_input: str | None = None,
+        timestep_fs: float = 2.0,
+        temperature_k: float = 300.0,
+    ):
         self._work_dir = Path(work_dir)
         self._spec = spec
         self.plumed_input = plumed_input
+        self._timestep_fs = timestep_fs
+        self._temperature_k = temperature_k
         self.run_calls: list[int] = []
         self.loaded: list[Path] = []
         self.started = False
@@ -37,6 +47,14 @@ class _FakeAdapter:
     @property
     def spec(self) -> SystemSpec:
         return self._spec
+
+    @property
+    def timestep_fs(self) -> float:
+        return self._timestep_fs
+
+    @property
+    def temperature_k(self) -> float:
+        return self._temperature_k
 
     @property
     def trajectory_extension(self) -> str:
@@ -161,6 +179,7 @@ def _full_config(tmp_path: Path) -> dict:
         "task_expectation": None,
         "cv_upper_wall_nm": None,
         "state_thresholds": None,
+        "min_recrossings": 1,
     }
 
 
@@ -877,7 +896,15 @@ def test_a_pure_convergence_campaign_needs_no_state_thresholds(
 ) -> None:
     """Strict, not indiscriminate. With no task_expectation the scientist
     cannot propose a pivot, so no biased phase can occur and there is nothing
-    for the thresholds to anchor."""
+    for the thresholds to anchor.
+
+    What makes that premise true is
+    `test_a_campaign_with_no_expectation_cannot_express_a_pivot` in
+    test_scientist.py: `switch_to_metad` leaves the tool enum entirely. Before
+    that it was only asserted here and discouraged in the prompt, so the
+    action stayed emittable and a pivot could still reach a biased phase with
+    no band to count recrossings against.
+    """
     _stub_collaborators(monkeypatch, [_stop()])
 
     result = run_campaign(
@@ -923,3 +950,92 @@ def test_state_thresholds_are_locked_against_a_changed_resume(
     _stub_collaborators(monkeypatch, [_stop()])
     with pytest.raises(ValueError, match="different config"):
         run_campaign(work_dir=work_dir, state_thresholds=(2.0, 5.0), **kwargs)
+
+
+def test_min_recrossings_is_locked_against_a_changed_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same definition. `state_thresholds` says where the
+    states are; `min_recrossings` says how many transitions between them count
+    as done — it is the threshold `fes_converged` compares against, and
+    `_refuse_premature_stop` reads that verdict to decide whether the scientist
+    may stop. Changing it mid-campaign re-judges rounds already decided under
+    the old value.
+    """
+    work_dir = tmp_path / "campaign"
+    kwargs = dict(
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        task_expectation="cross the barrier",
+        state_thresholds=(1.5, 4.0),
+        **_run_kwargs(),
+    )
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(work_dir=work_dir, min_recrossings=2, **kwargs)
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    with pytest.raises(ValueError, match="different config"):
+        run_campaign(work_dir=work_dir, min_recrossings=1, **kwargs)
+
+
+# ---------- the loop reads its physics constants off the adapter ----------
+
+def test_round_length_follows_the_adapter_timestep(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`extra_ns` is nanoseconds, and the step count has to be derived from the
+    engine's own dt. Against a hardcoded 2 fs, an engine at 4 fs would have run
+    every round at twice the requested length with `extra_ns` silently no
+    longer meaning nanoseconds anywhere in the campaign record.
+    """
+    _stub_collaborators(monkeypatch, [_extend(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), timestep_fs=4.0)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        max_rounds=2,
+        max_extra_ns=2.0,
+        **_run_kwargs(),
+    )
+
+    # `_extend()` asks for 0.5 ns. At 4 fs that is 125_000 steps, not the
+    # 250_000 a 2 fs assumption would have produced.
+    assert base.run_calls == [100, 125_000]
+
+
+def test_biased_phase_uses_the_adapter_thermostat_temperature(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """PLUMED's `METAD ... TEMP=` must match the thermostat or the
+    well-tempered scaling factor is computed against the wrong temperature and
+    the bias converges to something other than -(1 - 1/gamma)F(s) — with no
+    error anywhere. The same temperature sets the kT the free-energy
+    convergence threshold is taken against.
+    """
+    record = _stub_collaborators(monkeypatch, [_switch(), _stop()])
+    seen: dict = {}
+
+    def spy_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
+        seen["build"] = kwargs["temperature_k"]
+        record["cv_labels"].append(proposal.label)
+        return "PLUMED-TEXT\n"
+
+    def spy_metad_report(*_args, **kwargs):
+        seen["report"] = kwargs["temperature_k"]
+        return dict(_METAD_REPORT)
+
+    monkeypatch.setattr(loop_mod, "_build_plumed_input", spy_build)
+    monkeypatch.setattr(loop_mod, "metad_report", spy_metad_report)
+
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), temperature_k=277.0)
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text, temperature_k=277.0
+        ),
+        max_rounds=3,
+        **_run_kwargs(),
+    )
+
+    assert seen == {"build": 277.0, "report": 277.0}

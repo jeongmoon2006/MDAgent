@@ -276,6 +276,15 @@ class GROMACSAdapter:
         return self._spec
 
     @property
+    def timestep_fs(self) -> float:
+        # GROMACS states `dt` in picoseconds; the Protocol is in femtoseconds.
+        return _TIMESTEP_PS * 1000.0
+
+    @property
+    def temperature_k(self) -> float:
+        return _TEMPERATURE_K
+
+    @property
     def trajectory_extension(self) -> str:
         return ".xtc"
 

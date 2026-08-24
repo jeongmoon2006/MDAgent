@@ -19,10 +19,14 @@ Implementation notes:
       than merely discouraged. A second `switch_to_metad` is out of scope (the
       loop ends the campaign for human review), so it is dropped from the
       biased tool schema instead of being emitted and rejected.
-- Action space (vanilla): `extend | stop | switch_to_metad`. On `switch_to_metad`
-  the model also returns a `MetadProposal` — a structured CV proposal in the
-  same shape `cv_designer.CVProposal` consumes (cv_type, MDTraj selection
-  strings, label). Bias parameters (sigma, height, pace) are *not* in the
+- Action space (vanilla): `extend | stop`, plus `switch_to_metad` when a
+  `task_expectation` was supplied — that string is the only thing the pivot
+  rule compares against, so without it the campaign is a pure convergence task
+  and the action is dropped from the enum rather than left available and
+  discouraged in prose. On `switch_to_metad` the model also returns a
+  `MetadProposal` — a structured CV proposal in the same shape
+  `cv_designer.CVProposal` consumes (cv_type, MDTraj selection strings,
+  label). Bias parameters (sigma, height, pace) are *not* in the
   model's output: they are physics-unit numbers, derivable deterministically
   from the prior trajectory and from rule-of-thumb constants; a small helper
   in `sampling/` will fill them at the point of use (step 4 of the M4 plan).
@@ -88,7 +92,8 @@ transition).
 
 === PHASE `vanilla` — unbiased MD ===
 
-Action space is three-way:
+Action space is `extend` or `stop`, and — only when `switch_to_metad` appears \
+in the `decision` enum of your tool — `switch_to_metad`:
 
 - `extend` — run more vanilla MD; the trajectory needs more time.
 - `stop` — the observable has converged for the task at hand; the campaign \
@@ -96,6 +101,12 @@ ends.
 - `switch_to_metad` — vanilla MD is *inadequate*: the system is pinned in a \
 single basin AND the task requires a transition the budget cannot reach. \
 Propose a collective variable for metadynamics.
+
+`switch_to_metad` is offered only when `task_expectation` is non-null. A \
+campaign with no stated expectation is a pure convergence task: there is no \
+required transition to judge the budget against, so the pivot is not yours to \
+make and the action is absent from your tool. When it is absent, do not argue \
+for it.
 
 Report fields. Convergence: `plateau_reached`, `ess`, `tau_int_frames`, \
 `statistical_inefficiency_*`. Exploration: `bimodality_coefficient`, \
@@ -418,6 +429,46 @@ _METAD_SWITCH_TOOL = {
     },
 }
 
+# The vanilla action space for a campaign that cannot pivot. `task_expectation`
+# is the sole input the `switch_to_metad` rule compares against — it is where
+# the required transition and the characteristic timescale are stated — so with
+# no expectation there is nothing to judge "the budget cannot reach it" on.
+# Dropping the action from the enum makes the pivot unrepresentable rather than
+# merely discouraged by the prompt, the same argument as `_METAD_DECISION_TOOL`
+# for a second pivot and `_METAD_SWITCH_TOOL` for a spent CV-revision budget.
+#
+# This is load-bearing beyond tidiness: a pivot from a campaign with no
+# expectation also has no `state_thresholds` (`run_campaign` only requires them
+# when `task_expectation` is set), so the biased phase would fall back to
+# counting recrossings between the two deepest basins of the current surface —
+# the F9 behaviour that fallback exists to keep unreachable.
+_CONVERGENCE_TOOL = {
+    "name": "record_decision",
+    "description": "Record the decision (extend or stop) for this round.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            **{
+                k: v
+                for k, v in _DECISION_TOOL["input_schema"]["properties"].items()
+                if k != "metad_proposal"
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["extend", "stop"],
+                "description": "What to do next with the trajectory.",
+            },
+        },
+        "required": [
+            k
+            for k in _DECISION_TOOL["input_schema"]["required"]
+            if k != "metad_proposal"
+        ],
+        "additionalProperties": False,
+    },
+}
+
 Phase = Literal["vanilla", "metad"]
 
 _TOOL_FOR_PHASE: dict[str, dict[str, Any]] = {
@@ -477,6 +528,13 @@ def decide(
     being passed — an equilibrium bundle with phase="metad" would offer the
     right actions against the wrong numbers.
 
+    `task_expectation` also gates the pivot. It is the only input the
+    switch_to_metad rule has to compare against, so with none supplied the
+    campaign is a pure convergence task and `switch_to_metad` is dropped from
+    the vanilla enum. Not merely tidier: a pivot from such a campaign also has
+    no `state_thresholds`, and the biased phase would then count recrossings
+    against whichever two basins are currently deepest (F9).
+
     `allow_cv_switch` adds `switch_cv` to the biased action space. The caller
     owns that budget: once the campaign has spent its allowance the action is
     dropped from the enum rather than refused after the fact, so the model
@@ -489,7 +547,9 @@ def decide(
             f"{sorted(_TOOL_FOR_PHASE)}"
         )
     tool = _TOOL_FOR_PHASE[phase]
-    if phase == "metad" and allow_cv_switch:
+    if phase == "vanilla" and task_expectation is None:
+        tool = _CONVERGENCE_TOOL
+    elif phase == "metad" and allow_cv_switch:
         tool = _METAD_SWITCH_TOOL
     payload = {
         "round_index": (len(prior_round_summaries) if prior_round_summaries else 0) + 1,

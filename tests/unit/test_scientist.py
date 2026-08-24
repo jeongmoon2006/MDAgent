@@ -282,6 +282,66 @@ def test_tool_schemas_avoid_keywords_strict_mode_rejects() -> None:
         walk(tool["input_schema"])
 
 
+# ---------- switch_to_metad is gated on task_expectation ----------
+
+def test_a_campaign_with_no_expectation_cannot_express_a_pivot() -> None:
+    """`task_expectation` is the only input the switch_to_metad rule compares
+    against — the required transition and its timescale live in that string.
+    With none supplied there is nothing to judge "the budget cannot reach it"
+    on, so the action leaves the enum entirely.
+
+    Load-bearing beyond tidiness: `run_campaign` only requires
+    `state_thresholds` when `task_expectation` is set, so a pivot reached from
+    a campaign without one lands in a biased phase that counts recrossings
+    between whichever two basins are currently deepest (F9).
+    """
+    fake = _FakeClient(
+        tool_input={"decision": "extend", "reason": "ess=8", "extra_ns": 0.5,
+                    "ledger_note": None}
+    )
+    decide({"phase": "vanilla", "ess": 8}, client=fake, task_expectation=None)
+
+    schema = fake.last_request["tools"][0]["input_schema"]
+    assert schema["properties"]["decision"]["enum"] == ["extend", "stop"]
+    assert "metad_proposal" not in schema["properties"]
+    assert "metad_proposal" not in schema["required"]
+
+
+def test_a_campaign_with_an_expectation_keeps_the_pivot() -> None:
+    fake = _FakeClient(
+        tool_input={"decision": "extend", "reason": "ess=8", "extra_ns": 0.5,
+                    "ledger_note": None, "metad_proposal": None}
+    )
+    decide(
+        {"phase": "vanilla", "ess": 8},
+        client=fake,
+        task_expectation="fold the hairpin; 20 ns budget",
+    )
+
+    schema = fake.last_request["tools"][0]["input_schema"]
+    assert schema["properties"]["decision"]["enum"] == [
+        "extend", "stop", "switch_to_metad",
+    ]
+    assert schema["properties"]["metad_proposal"]["type"] == ["object", "null"]
+
+
+def test_the_convergence_tool_keeps_every_non_pivot_field() -> None:
+    """Dropping the pivot must not quietly drop `ledger_note` or `extra_ns`
+    with it — strict mode requires every property to be listed as required, so
+    a missing one is a 400 rather than a silently narrower action."""
+    from mdpilot.orchestrator.scientist import _CONVERGENCE_TOOL, _DECISION_TOOL
+
+    convergence = _CONVERGENCE_TOOL["input_schema"]
+    full = _DECISION_TOOL["input_schema"]
+
+    assert set(convergence["properties"]) == set(full["properties"]) - {
+        "metad_proposal"
+    }
+    assert set(convergence["required"]) == set(convergence["properties"])
+    assert _CONVERGENCE_TOOL["strict"] is True
+    assert _CONVERGENCE_TOOL["name"] == "record_decision"
+
+
 # ---------- switch_cv action space ----------
 
 def test_plain_biased_tool_cannot_express_a_cv_switch() -> None:

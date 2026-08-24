@@ -243,6 +243,14 @@ class OpenMMAdapter:
         return self._spec
 
     @property
+    def timestep_fs(self) -> float:
+        return _TIMESTEP_FS
+
+    @property
+    def temperature_k(self) -> float:
+        return _TEMPERATURE_K
+
+    @property
     def trajectory_extension(self) -> str:
         return ".dcd"
 

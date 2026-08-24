@@ -312,6 +312,72 @@ def test_barrier_crossed_is_not_gated_on_min_recrossings(tmp_path: Path) -> None
                           300.0, min_recrossings=2) is False  # not yet converged
 
 
+def test_drift_baseline_is_never_the_final_surface_itself() -> None:
+    """`n // 2` is the *last* index when there are exactly two estimates, so
+    the surface was compared against itself and drift came out 0.0 by
+    construction. The baseline has to stay strictly below the last index."""
+    from mdpilot.diagnostics.free_energy import _baseline_index
+
+    for n in range(2, 12):
+        assert _baseline_index(n) < n - 1
+    assert _baseline_index(2) == 0        # the only choice left
+    assert _baseline_index(3) == 1
+    assert _baseline_index(10) == 5       # unchanged where the clamp is slack
+
+
+def test_two_estimates_still_measure_a_real_drift(tmp_path: Path, monkeypatch) -> None:
+    """The regression this guards: a first biased round short enough to yield
+    two estimates reported drift=0.0 on a surface still moving by tens of
+    kJ/mol, and `_fes_converged` needs only low drift plus one recrossing — so
+    `fes_converged=true` came back and `_refuse_premature_stop` let the
+    scientist's `stop` through with the budget unspent.
+    """
+    from mdpilot.diagnostics import free_energy as fe
+
+    early = _write_fes(tmp_path / "early.dat", _double_well(barrier=20.0))
+    late = _write_fes(tmp_path / "late.dat", _double_well(barrier=40.0))
+    monkeypatch.setattr(fe, "sum_hills", lambda *a, **k: [early, late])
+
+    # One folded -> extended transition on the task's own coordinate, so the
+    # recrossing half of the convergence gate is satisfied and only drift is
+    # left to decide the verdict.
+    report = fe.metad_report(
+        tmp_path / "HILLS",
+        None,
+        tmp_path / "out",
+        observable=np.repeat([1.0, 6.0], 50),
+        observable_name="rmsd_ca_to_reference_angstrom",
+        state_thresholds=(2.0, 5.0),
+    )
+
+    assert report["n_fes_estimates"] == 2
+    assert report["recrossings"] == 1
+    assert report["fes_drift_kj_per_mol"] == pytest.approx(
+        fes_drift_kj_per_mol(load_fes(early), load_fes(late))
+    )
+    assert report["fes_drift_kj_per_mol"] > _KT_300
+    assert report["fes_converged"] is False
+
+
+def _fake_plumed(monkeypatch, out: Path, bodies: list[str]) -> None:
+    """Stand in for `plumed sum_hills --stride`: write one surface per block.
+
+    The files are written *by the call*, as the real binary does, rather than
+    pre-placed in `out_dir` — `sum_hills` clears stale surfaces before invoking
+    plumed, so anything staged beforehand is (correctly) gone by the time the
+    subprocess would run.
+    """
+    from mdpilot.diagnostics import free_energy as fe
+
+    def run(*_args, **_kwargs):
+        for i, body in enumerate(bodies):
+            (out / f"fes.dat{i}.dat").write_text(body)
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr(fe, "plumed_available", lambda: True)
+    monkeypatch.setattr(fe.subprocess, "run", run)
+
+
 def test_sum_hills_drops_a_trailing_duplicate_surface(tmp_path: Path, monkeypatch) -> None:
     """When the hill count is a multiple of --stride, sum_hills emits the final
     complete surface *and* an identical last strided one. Comparing that pair
@@ -321,16 +387,39 @@ def test_sum_hills_drops_a_trailing_duplicate_surface(tmp_path: Path, monkeypatc
 
     out = tmp_path / "out"
     out.mkdir()
-    body = "#! FIELDS cv file.free\n0.0 0.0\n1.0 5.0\n"
-    for i in range(3):
-        (out / f"fes.dat{i}.dat").write_text(body if i < 1 else "#! FIELDS cv file.free\n0.0 0.0\n1.0 7.0\n")
+    first = "#! FIELDS cv file.free\n0.0 0.0\n1.0 5.0\n"
+    rest = "#! FIELDS cv file.free\n0.0 0.0\n1.0 7.0\n"
     # fes.dat1 and fes.dat2 are byte-identical -> the trailing duplicate.
-    monkeypatch.setattr(fe, "plumed_available", lambda: True)
-    monkeypatch.setattr(fe.subprocess, "run",
-                        lambda *a, **k: type("R", (), {"returncode": 0, "stderr": ""})())
+    _fake_plumed(monkeypatch, out, [first, rest, rest])
 
     surfaces = fe.sum_hills(tmp_path / "HILLS", out, stride=10)
     assert [p.name for p in surfaces] == ["fes.dat0.dat", "fes.dat1.dat"]
+
+
+def test_sum_hills_clears_surfaces_from_an_earlier_attempt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A round re-run after a crash integrates the *restored* (shorter) HILLS,
+    so it writes fewer indexed surfaces than the aborted attempt did. Without
+    cleanup the leftover higher indices survive, `indexed.sort()` puts one of
+    them last, and `surfaces[-1]` — the profile every statistic is taken on —
+    is a surface from the previous attempt.
+    """
+    from mdpilot.diagnostics import free_energy as fe
+
+    out = tmp_path / "out"
+    out.mkdir()
+    for i in range(5):                      # leftovers from the aborted attempt
+        (out / f"fes.dat{i}.dat").write_text("#! FIELDS cv file.free\n0.0 99.0\n")
+    (out / "fes.dat").write_text("#! FIELDS cv file.free\n0.0 99.0\n")
+
+    body = "#! FIELDS cv file.free\n0.0 0.0\n1.0 5.0\n"
+    _fake_plumed(monkeypatch, out, [body, body.replace("5.0", "6.0")])
+
+    surfaces = fe.sum_hills(tmp_path / "HILLS", out, stride=10)
+
+    assert [p.name for p in surfaces] == ["fes.dat0.dat", "fes.dat1.dat"]
+    assert load_fes(surfaces[-1]).free_energy.max() == pytest.approx(6.0)
 
 
 # ---------- restriction to the sampled region ----------

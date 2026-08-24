@@ -49,9 +49,7 @@ from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
 from mdpilot.sampling.bias_designer import design_bias, design_upper_wall
 from mdpilot.sampling.cv_designer import CVProposal, design_cv
 
-_TIMESTEP_FS = 2.0  # matches the OpenMM adapter's integrator timestep
-_STEPS_PER_NS = int(1_000_000.0 / _TIMESTEP_FS)  # 500_000 steps/ns at 2 fs
-_METAD_TEMPERATURE_K = 300.0  # matches the adapters' thermostat; follows SystemSpec when temperature does
+_FS_PER_NS = 1_000_000.0
 _PLUMED_DAT_NAME = "plumed.dat"  # canonical bias artifact (the OpenMM adapter also writes here)
 # PLUMED's own outputs, alongside plumed.dat. These names must match the
 # defaults `_build_plumed_input` leaves on MetadynamicsBias.hills_file and
@@ -68,6 +66,23 @@ StopReason = Literal[
 
 # Given a rendered plumed.dat string, build an adapter that runs biased MD.
 BiasedAdapterFactory = Callable[[str], MDAdapter]
+
+
+def steps_per_ns_for(adapter: MDAdapter) -> int:
+    """Steps in one nanosecond at this engine's timestep (500_000 at 2 fs).
+
+    Read from the adapter rather than hardcoded. `extra_ns`, `max_extra_ns`
+    and `max_biased_ns` are all stated in nanoseconds and converted here, so a
+    constant that merely happened to match both adapters would have made every
+    round the wrong length on an engine at a different timestep — with
+    `extra_ns` quietly no longer meaning nanoseconds anywhere in the campaign
+    record.
+
+    Public because `benchmarks/run_cln025.py` states its budget in nanoseconds
+    too, and a second copy of the conversion is exactly the drift this exists
+    to remove.
+    """
+    return max(int(round(_FS_PER_NS / adapter.timestep_fs)), 1)
 
 
 @dataclass(frozen=True)
@@ -127,10 +142,14 @@ def run_campaign(
     schema, so a further revision is unrepresentable rather than emitted and
     then refused. Counted across resumes from the persisted rounds.
 
-    `max_rounds`, `max_extra_ns` and `max_biased_ns` are loop-control bounds
-    and may differ between invocations; the physics-bound params (seed,
-    initial_steps, report_interval_steps, equilibration_steps) are locked at
-    first init and a mismatch on resume raises.
+    `max_rounds`, `max_extra_ns`, `max_biased_ns` and `max_cv_switches` are
+    loop-control bounds and may differ between invocations. Everything that
+    defines what the campaign *is* — seed, initial_steps,
+    report_interval_steps, equilibration_steps, the system spec, the engine,
+    task_expectation, cv_upper_wall_nm, state_thresholds and min_recrossings —
+    is locked at first init and a mismatch on resume raises. The timestep and
+    thermostat temperature are read from the adapter and so are covered by the
+    engine lock.
 
     `max_biased_ns` caps *cumulative* simulation time in the metadynamics
     phase, counting across rounds and across resumes (it is recomputed from
@@ -190,6 +209,13 @@ def run_campaign(
         adapter = OpenMMAdapter(work_dir=work_dir, seed=seed)
 
     base_spec = adapter.spec
+    # Captured once, from the vanilla adapter. The biased adapter is built by
+    # `_default_biased_factory` over the same engine (and an injected factory
+    # is documented as engine-matching, since the CV's atom indices are
+    # resolved against this adapter's topology), so one reading holds for the
+    # whole campaign.
+    steps_per_ns = steps_per_ns_for(adapter)
+    temperature_k = adapter.temperature_k
 
     if biased_adapter_factory is None:
         biased_adapter_factory = _default_biased_factory(
@@ -221,6 +247,14 @@ def run_campaign(
         "state_thresholds": (
             list(state_thresholds) if state_thresholds is not None else None
         ),
+        # The other half of that same definition: `state_thresholds` says where
+        # the states are, `min_recrossings` says how many transitions between
+        # them count as done. It is the threshold `fes_converged` compares the
+        # count against, and `_refuse_premature_stop` reads that verdict to
+        # decide whether the scientist may stop — so resuming with a different
+        # one changes when the campaign is allowed to end, retroactively, for
+        # rounds already judged under the old value.
+        "min_recrossings": min_recrossings,
     }
     store.init_campaign(work_dir, config)
     prior_rows = store.list_rounds(work_dir)
@@ -272,6 +306,7 @@ def run_campaign(
             topology_path=adapter.topology_path,
             factory=biased_adapter_factory,
             plumed_dat_path=plumed_dat_path,
+            temperature_k=temperature_k,
             cv_upper_wall_nm=cv_upper_wall_nm,
         )
         in_metad = True
@@ -295,6 +330,7 @@ def run_campaign(
             topology_path=adapter.topology_path,
             factory=biased_adapter_factory,
             plumed_dat_path=plumed_dat_path,
+            temperature_k=temperature_k,
             cv_upper_wall_nm=cv_upper_wall_nm,
         )
         in_metad = True
@@ -320,13 +356,13 @@ def run_campaign(
         in_metad = True
         current_plumed_dat = last.plumed_dat_path
         start_round = last.round_index + 1
-        n_steps = _extend_steps(last.extra_ns, max_extra_ns)
+        n_steps = _extend_steps(last.extra_ns, max_extra_ns, steps_per_ns)
     else:
         # Vanilla resume.
         _require_checkpoint(last)
         adapter.load_checkpoint(last.checkpoint_path)  # type: ignore[arg-type]
         start_round = last.round_index + 1
-        n_steps = _extend_steps(last.extra_ns, max_extra_ns)
+        n_steps = _extend_steps(last.extra_ns, max_extra_ns, steps_per_ns)
 
     # Cumulative biased steps already spent, so a resume continues the meter
     # rather than restarting it.
@@ -337,7 +373,7 @@ def run_campaign(
     # restart cannot buy the scientist a second allowance of CV switches.
     cv_switches_used = sum(1 for r in prior_rows if r.decision == "switch_cv")
     biased_step_budget = (
-        int(max_biased_ns * _STEPS_PER_NS) if max_biased_ns is not None else None
+        int(max_biased_ns * steps_per_ns) if max_biased_ns is not None else None
     )
 
     ledger_notes: list[store.LedgerNote] = list(store.list_ledger_notes(work_dir))
@@ -375,6 +411,7 @@ def run_campaign(
             dcd,
             adapter.topology_path,
             plumed_dat_path=current_plumed_dat,
+            temperature_k=temperature_k,
             fes_dir=rounds_dir / f"round_{round_idx:03d}_fes",
             min_recrossings=min_recrossings,
             rounds_dir=rounds_dir,
@@ -451,6 +488,7 @@ def run_campaign(
                 topology_path=adapter.topology_path,
                 factory=biased_adapter_factory,
                 plumed_dat_path=plumed_dat_path,
+                temperature_k=temperature_k,
                 cv_upper_wall_nm=cv_upper_wall_nm,
             )
             in_metad = True
@@ -471,6 +509,7 @@ def run_campaign(
                 topology_path=adapter.topology_path,
                 factory=biased_adapter_factory,
                 plumed_dat_path=plumed_dat_path,
+                temperature_k=temperature_k,
                 cv_upper_wall_nm=cv_upper_wall_nm,
             )
             cv_switches_used += 1
@@ -478,7 +517,7 @@ def run_campaign(
             n_steps = initial_steps
             continue
 
-        n_steps = _extend_steps(decision.extra_ns, max_extra_ns)
+        n_steps = _extend_steps(decision.extra_ns, max_extra_ns, steps_per_ns)
 
     return CampaignResult(work_dir, tuple(rounds), "max_rounds_reached")
 
@@ -590,6 +629,7 @@ def _round_report(
     topology_path: Path,
     *,
     plumed_dat_path: Path | None,
+    temperature_k: float,
     fes_dir: Path,
     min_recrossings: int = 1,
     rounds_dir: Path | None = None,
@@ -633,7 +673,7 @@ def _round_report(
         bias_dir / _HILLS_NAME,
         bias_dir / _COLVAR_NAME,
         fes_dir,
-        temperature_k=_METAD_TEMPERATURE_K,
+        temperature_k=temperature_k,
         min_recrossings=min_recrossings,
         observable=observable,
         observable_name=observable_name,
@@ -711,14 +751,16 @@ def _refuse_premature_stop(
     return replace(decision, decision="extend", extra_ns=decision.extra_ns or 0.5), note
 
 
-def _extend_steps(extra_ns: float | None, max_extra_ns: float) -> int:
+def _extend_steps(
+    extra_ns: float | None, max_extra_ns: float, steps_per_ns: int
+) -> int:
     """Steps for an extend round, clamped to the caller's `max_extra_ns`.
 
     What SQLite stores is the model's raw request, so the clamp has to be
     re-applied on every read. Applying it only in the live loop made a resumed
     campaign run a longer round than the uninterrupted one would have.
     """
-    return max(int(min(extra_ns or 0.5, max_extra_ns) * _STEPS_PER_NS), 1)
+    return max(int(min(extra_ns or 0.5, max_extra_ns) * steps_per_ns), 1)
 
 
 def _pivot_to_metad(
@@ -728,6 +770,7 @@ def _pivot_to_metad(
     topology_path: Path,
     factory: BiasedAdapterFactory,
     plumed_dat_path: Path,
+    temperature_k: float,
     cv_upper_wall_nm: float | None = None,
 ) -> MDAdapter:
     """Resolve a CV proposal into a biased, started adapter.
@@ -743,6 +786,7 @@ def _pivot_to_metad(
         source_trajectory,
         topology_path,
         plumed_dat_path.parent,
+        temperature_k=temperature_k,
         cv_upper_wall_nm=cv_upper_wall_nm,
     )
     plumed_dat_path.write_text(plumed_input)
@@ -757,6 +801,8 @@ def _build_plumed_input(
     trajectory_path: Path,
     topology_path: Path,
     output_dir: Path,
+    *,
+    temperature_k: float,
     cv_upper_wall_nm: float | None = None,
 ) -> str:
     """Proposal → resolved CV → sized bias → rendered plumed.dat text.
@@ -782,7 +828,7 @@ def _build_plumed_input(
         output_dir=output_dir,
     )
     bias = design_bias(
-        cv, trajectory_path, topology_path, temperature_k=_METAD_TEMPERATURE_K
+        cv, trajectory_path, topology_path, temperature_k=temperature_k
     )
     wall = design_upper_wall(cv, cv_upper_wall_nm)
     return PlumedInput(
