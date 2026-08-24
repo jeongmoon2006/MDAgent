@@ -311,3 +311,37 @@ def test_a_ceiled_sigma_is_announced_in_the_rendered_input() -> None:
 
     assert "lowered to this CV type's ceiling" in rendered
     assert "raised to this CV type's floor" not in rendered
+
+
+def test_contact_count_matches_the_rational_switch_plumed_evaluates() -> None:
+    """`_cv_series` uses the closed form 1/(1+x**NN) where PLUMED evaluates
+    (1-x**NN)/(1-x**MM). They are equal only for MM == 2*NN, and a drift
+    between them would size SIGMA against a coordinate the run does not bias.
+
+    `test_cv_designer_live` pins this against the real binary, but that file
+    skips without a PLUMED runtime — including in the venv the README installs.
+    This keeps the identity covered in the default environment.
+    """
+    from mdpilot.adapters.plumed_writer import ContactsCV
+    from mdpilot.sampling.bias_designer import _cv_series
+
+    assert ContactsCV.MM == 2 * ContactsCV.NN
+
+    top = md.Topology()
+    chain = top.add_chain()
+    for resid in range(1, 3):
+        res = top.add_residue("ALA", chain, resSeq=resid)
+        top.add_atom("CA", md.element.carbon, res)
+    # One pair, placed at exactly R_0 in frame 0 and at 2*R_0 in frame 1.
+    r0 = 0.75
+    xyz = np.zeros((2, 2, 3), dtype=np.float32)
+    xyz[0, 1, 0] = r0
+    xyz[1, 1, 0] = 2.0 * r0
+    traj = md.Trajectory(xyz, top)
+
+    series = _cv_series(ContactsCV(label="q", pairs=((0, 1),), r0_nm=r0), traj)
+
+    # At r == R_0 the rational switch is 0.5 by construction, whichever form
+    # you evaluate; at r == 2*R_0 it is 1/(1+2**6) = 1/65.
+    assert series[0] == pytest.approx(0.5)
+    assert series[1] == pytest.approx(1.0 / 65.0)

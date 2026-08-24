@@ -326,3 +326,13 @@ def test_contacts_rejects_an_empty_map() -> None:
 
     with _pytest.raises(ValueError, match="at least 1 contact pair"):
         ContactsCV(label="q", pairs=(), r0_nm=0.75)
+
+
+def test_contacts_rejects_a_nonpositive_r0() -> None:
+    """R_0 is the denominator of the switching function; zero or negative makes
+    it undefined rather than merely unusual."""
+    from mdpilot.adapters.plumed_writer import ContactsCV
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="r0_nm must be positive"):
+        ContactsCV(label="q", pairs=((0, 5),), r0_nm=0.0)

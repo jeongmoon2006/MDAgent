@@ -69,7 +69,7 @@ Per-round artifacts land in `campaigns/demo/rounds/`.
 ## Tests
 
 ```sh
-pytest tests/unit          # 130 tests, ~4 s — no API key, no MD
+pytest tests/unit          # 219 tests, ~22 s — no API key, no MD
 pytest tests/integration   # live MD; PLUMED and API-key tests skip if unavailable
 ```
 

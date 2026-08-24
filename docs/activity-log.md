@@ -167,7 +167,9 @@ Two distinct defects, both rooted in the band being re-derived from the current 
 
 **Verified by replaying run 3's stored rounds.** Anchored: `1,1,1,2,3,3,3,3,3,3,3` — monotone, no unmeasurable rounds, ending at 3 and agreeing exactly with `done_criterion.json`. Reported at the time: `1,2,2,2,2,None,None,30,None,22,26`. That series *decreases*, which is arithmetically impossible for a cumulative transition count and is the clearest evidence it was not measuring one quantity. The anchored count crosses `min_recrossings=2` at round 5, matching the mid-run hand computation.
 
-**Still open from F7:** nothing forces a task to supply `state_thresholds`. A campaign without them silently falls back to the surface-derived band with all of F9's behaviour intact, marked only by `recrossing_basis`.
+**Made strict (same day).** The fallback is no longer reachable by accident. `run_campaign` refuses at entry when `task_expectation` is set — the sole input gating `switch_to_metad`, so exactly the predicate for "this campaign can reach a biased phase" — and `state_thresholds` is None. Argument-only validation, so it raises before any filesystem or engine work rather than at the pivot, which would have thrown away the whole vanilla phase. A pure convergence task (no `task_expectation`, hence no possible pivot) still needs nothing. Inverted thresholds are refused too: `count_recrossings` returns 0 rather than raising for a band with `high <= low`, so a swapped pair would have read as a campaign that never crossed. `state_thresholds` joins the locked config alongside `task_expectation` and `cv_upper_wall_nm` — resuming with a different band would splice two definitions of "a transition" into one campaign's history.
+
+*Consequence:* campaigns created before this (runs 1-3) carry no `state_thresholds` key and will fail the config guard on resume. All three are finished, so this costs nothing, but a resume of any of them now needs the key added to its `campaign` row.
 
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.

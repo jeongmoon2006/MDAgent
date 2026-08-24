@@ -297,3 +297,43 @@ def test_contacts_refuses_a_reference_with_no_contacts() -> None:
             top,
             reference=extended,
         )
+
+
+def test_contacts_needs_at_least_two_atoms() -> None:
+    """A single atom has no pair to be in contact with. Caught on arity rather
+    than falling through to the "no native contacts" refusal, which would
+    misdescribe the cause as a bad reference."""
+    reference = _hairpin_frame()
+    prop = CVProposal(
+        cv_type="contacts", selections=("resSeq 1 and name CA",), label="q"
+    )
+
+    with pytest.raises(ValueError, match=">=2 atoms"):
+        design_cv(prop, reference.topology, reference=reference)
+
+
+def test_contacts_pairs_are_measured_under_the_minimum_image_convention() -> None:
+    """The native set has to be defined under the same convention that
+    evaluates it. `bias_designer._cv_series` and PLUMED's CONTACTMAP both apply
+    PBC, so a pair separated by nearly a box length is a *contact*, not a
+    2.4 nm miss. Measuring raw displacements here would silently drop it.
+    """
+    import numpy as np
+
+    top = _mini_peptide()
+    xyz = np.full((1, top.n_atoms, 3), 5.0, dtype=np.float32)
+    # res0 and res4 CAs sit 2.4 nm apart by raw displacement, but 0.6 nm apart
+    # across the periodic boundary of a 3 nm box.
+    xyz[0, 1] = (0.1, 0.0, 0.0)
+    xyz[0, 17] = (2.5, 0.0, 0.0)
+    wrapped = md.Trajectory(xyz, top)
+    wrapped.unitcell_lengths = np.array([[3.0, 3.0, 3.0]], dtype=np.float32)
+    wrapped.unitcell_angles = np.array([[90.0, 90.0, 90.0]], dtype=np.float32)
+
+    cv = design_cv(
+        CVProposal(cv_type="contacts", selections=("name CA",), label="q"),
+        top,
+        reference=wrapped,
+    )
+
+    assert (1, 17) in cv.pairs

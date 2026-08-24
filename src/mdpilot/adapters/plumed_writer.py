@@ -170,6 +170,18 @@ class ContactsCV:
         return "\n".join(lines)
 
 
+# The closed form `bias_designer` evaluates in Python is equal to the rational
+# switch PLUMED evaluates here *only* when MM == 2*NN. Stated as code rather
+# than left to the comment above: changing either exponent is silent in both
+# modules, and the two evaluations would then disagree on a live campaign with
+# no error anywhere — SIGMA sized against a coordinate the run does not bias.
+if ContactsCV.MM != 2 * ContactsCV.NN:
+    raise AssertionError(
+        f"ContactsCV: bias_designer's closed-form switching function requires "
+        f"MM == 2*NN (got NN={ContactsCV.NN}, MM={ContactsCV.MM})"
+    )
+
+
 CV = Union[DistanceCV, TorsionCV, GyrationCV, RmsdCV, ContactsCV]
 
 

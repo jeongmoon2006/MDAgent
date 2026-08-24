@@ -8,7 +8,7 @@ not set).
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 import pytest
 
@@ -227,6 +227,14 @@ def test_decision_tool_schema_includes_metad_proposal() -> None:
     from mdpilot.sampling.cv_designer import _CV_TYPES
 
     assert sub["cv_type"]["enum"] == list(_CV_TYPES)
+    # Third copy of the same vocabulary. It annotates the dataclass the parsed
+    # decision lands in, so it documents the contract without constraining it
+    # at runtime — which is exactly why it silently fell a type behind the
+    # other two when `contacts` was added.
+    # `get_type_hints`, not `__annotations__`: this module uses
+    # `from __future__ import annotations`, so the raw annotation is a string.
+    hints = get_type_hints(MetadProposal)
+    assert set(get_args(hints["cv_type"])) == set(_CV_TYPES)
 
 
 def test_metad_proposal_round_trips_through_dict() -> None:

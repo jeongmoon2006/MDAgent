@@ -430,7 +430,7 @@ _TOOL_FOR_PHASE: dict[str, dict[str, Any]] = {
 class MetadProposal:
     """Structured metaD CV proposal. Mirrors `sampling.cv_designer.CVProposal`."""
 
-    cv_type: Literal["distance", "torsion", "gyration", "rmsd"]
+    cv_type: Literal["distance", "torsion", "gyration", "rmsd", "contacts"]
     selections: tuple[str, ...]
     label: str
 

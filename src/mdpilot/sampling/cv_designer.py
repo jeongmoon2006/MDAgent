@@ -233,21 +233,35 @@ def _native_pairs(
 
     mdtraj coordinates are in nanometres, which is also PLUMED's length unit,
     so the cutoff needs no conversion.
+
+    Distances come from ``md.compute_distances``, which applies the minimum
+    image convention when the reference carries a unit cell. That matters
+    because this is one of *three* places the same pair distance gets measured:
+    here (which pairs are native), in ``bias_designer._cv_series`` (sizing
+    SIGMA), and in PLUMED's own ``CONTACTMAP`` at run time. The other two apply
+    PBC, so measuring raw displacements here would define the native set under
+    a different convention than the one that evaluates it. The reference is
+    written by the adapter with ``enforcePeriodicBox=True``, which wraps per
+    *molecule* — a single chain stays whole, but two chains are wrapped
+    independently, so an interchain native contact is exactly the case a raw
+    displacement would miss.
     """
-    xyz = reference.xyz[0]
     topology = reference.topology
-    pairs: list[tuple[int, int]] = []
-    for a in range(len(atoms)):
-        for b in range(a + 1, len(atoms)):
-            i, j = atoms[a], atoms[b]
-            sequence_gap = abs(
-                topology.atom(i).residue.index - topology.atom(j).residue.index
-            )
-            if sequence_gap < _MIN_SEQUENCE_SEPARATION:
-                continue
-            if float(np.linalg.norm(xyz[i] - xyz[j])) <= _CONTACT_CUTOFF_NM:
-                pairs.append((i, j))
-    return tuple(pairs)
+    candidates = [
+        (i, j)
+        for a, i in enumerate(atoms)
+        for j in atoms[a + 1 :]
+        if abs(topology.atom(i).residue.index - topology.atom(j).residue.index)
+        >= _MIN_SEQUENCE_SEPARATION
+    ]
+    if not candidates:
+        return ()
+    distances = md.compute_distances(reference[0], np.array(candidates))[0]
+    return tuple(
+        pair
+        for pair, d in zip(candidates, distances)
+        if d <= _CONTACT_CUTOFF_NM
+    )
 
 
 def _write_reference_pdb(
