@@ -198,6 +198,28 @@ This is the same defect as the trailing-duplicate surface `sum_hills` already po
 
 ## 2. Session journal
 
+### 2026-08-25 — Prompt knowledge base: the scientist retrieves its rules per round
+Branch `test`. `scientist.py` held one static system prompt covering both phases and the whole CV vocabulary, sent unchanged every round: 10,835 chars / ~2,900 tokens, of which roughly half described actions the round could not take. Split into six Markdown chunks under `src/mdpilot/knowledge/`, assembled per round by `build_system_prompt`.
+
+**Retrieval is by key, not similarity.** The keys are the facts that already select the tool schema — phase, whether the tool carries a `metad_proposal` field, whether `switch_cv` is offered. `can_propose_cv` is read off the selected schema rather than re-derived from `(phase, task_expectation, allow_cv_switch)`, so the vocabulary is present exactly when the field that consumes it is and the two cannot drift.
+
+| round type | ~tokens | vs before |
+|---|---|---|
+| vanilla, pivot possible | 1,650 | −44% |
+| vanilla, pure convergence | 1,030 | −65% |
+| metad, no switch left | 1,470 | −50% |
+| metad, switch offered | 2,455 | −16% |
+
+**No retrieval *within* `cv_vocabulary`, deliberately.** The obvious next filter is "show only the relevant CV types", and it is wrong: the scientist is choosing among them. `cln025_folding.yaml` already says pre-selecting a CV "would decide the science the agent exists to decide", and runs 1 and 3 differed only in the model picking `contacts` over `rmsd` unprompted. The chunk is retrieved whole or not at all.
+
+**Two latent prompt defects surfaced by the split**, both from text that assumed every round saw everything:
+- `reason` instructed the model to cite `plateau_reached`, `ess`, `exploring`, `n_basins`, `bimodality_coefficient` — all vanilla-only fields that `phase_metad` explicitly says are absent. Every biased round since the phase split was being asked for numbers it had been told it would not get. Now phase-neutral.
+- `role` said the report was "Phase-dependent; see below" and described a two-phase prompt. Reworded to say the round carries one phase's rules only.
+
+**Caching.** Four assemblies, constant within a campaign phase, so each caches after its first round; the pivot invalidates the prefix on the one round the assembly changes anyway. The smallest assembly (pure-convergence vanilla, ~1.0k tokens) sits on Sonnet 4.6's 1024-token minimum cacheable prefix and may not cache — the one case where trimming can cost more than it saves, and also the cheapest round to send uncached.
+
+Content moved verbatim: each chunk was verified whitespace-normalised-identical to the section it replaced before any edit was applied. `[tool.setuptools.package-data]` added — without it a non-editable install ships the code and none of the prose, and every `decide()` fails on the first chunk read; verified by building a wheel and loading a chunk from a clean install. 247 unit tests pass (8 new).
+
 ### 2026-08-24 — External review pass: two convergence-path defects, and the loop stops guessing at physics constants
 Branch `test`. A full read of the tree surfaced two defects on the path that decides when a campaign is allowed to end, plus three structural gaps. No campaign was re-run; everything here is unit-covered.
 

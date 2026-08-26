@@ -1,3 +1,5 @@
+=== PHASE `metad` — well-tempered metadynamics ===
+
 Action space is `extend` or `stop`, and — only when `switch_cv` appears in the
 `decision` enum of your tool — `switch_cv`. When it is absent the campaign has
 spent its CV-revision allowance and the choice is not yours to make; do not

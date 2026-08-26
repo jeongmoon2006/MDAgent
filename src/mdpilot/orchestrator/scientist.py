@@ -42,12 +42,21 @@ Implementation notes:
   `metad_proposal` is a nullable object so the discriminated union stays in
   one tool call; the cross-field invariant (`metad_proposal` non-null iff
   decision == switch_to_metad) is enforced in `decide()`'s parser.
-- Caching: `cache_control` on the system prompt. Sonnet 4.6's minimum
-  cacheable prefix is 1024 tokens; the two-phase prompt is around that size,
-  so caching may now actually engage. Note the render order is tools →
-  system → messages, so swapping the tool at the pivot invalidates the
-  system prefix for one round. That happens once per campaign and is not
-  worth designing around.
+- Prompt assembly: the system prompt is retrieved per round from the
+  Markdown knowledge base in `mdpilot/knowledge/`, keyed on the same facts
+  that select the tool schema (phase, whether a CV proposal is possible,
+  whether a CV switch is offered). A round is never shown rules it cannot
+  act on — a biased round gets no equilibrium rubric, a pure-convergence
+  campaign gets no CV vocabulary. See `build_system_prompt`.
+- Caching: `cache_control` on the assembled system prompt. There are four
+  possible assemblies and the prompt is constant within a campaign phase, so
+  each variant caches after its first round. Sonnet 4.6's minimum cacheable
+  prefix is 1024 tokens and the smallest assembly (a pure-convergence vanilla
+  round, ~1.0k) sits on that boundary — it may not cache, which is the one
+  place trimming can cost more than it saves, and it is also the cheapest
+  round to send uncached. Note the render order is tools → system →
+  messages, so swapping the tool at the pivot invalidates the system prefix
+  for one round — the same round the assembly changes anyway.
 """
 
 from __future__ import annotations

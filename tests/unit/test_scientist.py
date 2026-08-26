@@ -428,7 +428,7 @@ def _stub(**overrides: Any) -> _FakeClient:
 def test_chunks_are_readable_and_unknown_keys_raise() -> None:
     from mdpilot.orchestrator.scientist import _chunk
 
-    assert "collective variable" in _chunk("cv_vocabulary").lower()
+    assert "`cv_type` — one of" in _chunk("cv_vocabulary")
     with pytest.raises(FileNotFoundError, match="no knowledge chunk 'nope'"):
         _chunk("nope")
 

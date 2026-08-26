@@ -81,6 +81,14 @@ mdpilot/
 │   │   ├── scientist.py               # the single LLM call per round
 │   │   └── loop.py                    # the mechanical campaign state machine
 │   │
+│   ├── knowledge/                     # the scientist's prompt, as retrievable prose
+│   │   ├── role.md                    # who it is + the four structured inputs
+│   │   ├── phase_vanilla.md           # equilibrium rubric + pivot rule
+│   │   ├── phase_metad.md             # free-energy rubric
+│   │   ├── action_switch_cv.md        # when to revise the biased coordinate
+│   │   ├── cv_vocabulary.md           # CV types, arities, bounded-vs-unbounded
+│   │   └── output_contract.md         # extra_ns / ledger_note / reason
+│   │
 │   ├── diagnostics/                   # mechanical convergence + adequacy (no LLM)
 │   │   ├── block_averaging.py         # Flyvbjerg-Petersen SEM plateau
 │   │   ├── autocorrelation.py         # Geyer IMPS tau_int + ESS

@@ -1,3 +1,5 @@
+=== PHASE `vanilla` — unbiased MD ===
+
 Action space is `extend` or `stop`, and — only when `switch_to_metad` appears
 in the `decision` enum of your tool — `switch_to_metad`:
 
