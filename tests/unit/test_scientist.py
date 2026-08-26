@@ -406,3 +406,120 @@ def test_switch_cv_round_trips_with_its_proposal() -> None:
     assert decision.decision == "switch_cv"
     assert decision.metad_proposal is not None
     assert decision.metad_proposal.cv_type == "contacts"
+
+
+# ---------- knowledge-base retrieval ----------
+#
+# The prompt is assembled per round from `mdpilot/knowledge/*.md`. What matters
+# is not that a chunk *can* be loaded but that guidance the round cannot act on
+# is absent, and that guidance it needs is never dropped silently.
+
+def _system_text(fake: _FakeClient) -> str:
+    assert fake.last_request is not None
+    return fake.last_request["system"][0]["text"]
+
+
+def _stub(**overrides: Any) -> _FakeClient:
+    payload: dict[str, Any] = {"decision": "extend", "reason": "stub", "extra_ns": 0.5}
+    payload.update(overrides)
+    return _FakeClient(tool_input=payload)
+
+
+def test_chunks_are_readable_and_unknown_keys_raise() -> None:
+    from mdpilot.orchestrator.scientist import _chunk
+
+    assert "collective variable" in _chunk("cv_vocabulary").lower()
+    with pytest.raises(FileNotFoundError, match="no knowledge chunk 'nope'"):
+        _chunk("nope")
+
+
+def test_keys_are_ordered_with_the_always_on_chunks_first() -> None:
+    """Assembly order is the shared cache prefix; role must lead every variant."""
+    from mdpilot.orchestrator.scientist import knowledge_keys
+
+    for phase in ("vanilla", "metad"):
+        for propose in (True, False):
+            for switch in (True, False):
+                keys = knowledge_keys(
+                    phase, can_propose_cv=propose, allow_cv_switch=switch
+                )
+                assert keys[0] == "role"
+                assert keys[1] == f"phase_{phase}"
+                assert keys[-1] == "output_contract"
+
+
+def test_a_biased_round_is_not_shown_the_vanilla_rubric() -> None:
+    """The equilibrium rubric names ess/plateau_reached, which the biased report
+    omits on purpose. Sending it invites exactly the category error the phase
+    split exists to prevent."""
+    fake = _stub()
+    decide({"phase": "metad", "fes_converged": False}, phase="metad", client=fake)
+    text = _system_text(fake)
+    assert "PHASE `metad`" in text
+    assert "PHASE `vanilla`" not in text
+    assert "plateau_reached AND well_sampled" not in text
+
+
+def test_a_vanilla_round_is_not_shown_the_free_energy_rubric() -> None:
+    fake = _stub()
+    decide({"ess": 8}, task_expectation="fold it", client=fake)
+    text = _system_text(fake)
+    assert "PHASE `vanilla`" in text
+    assert "PHASE `metad`" not in text
+    assert "fes_drift_kj_per_mol" not in text
+
+
+def test_cv_vocabulary_travels_with_the_metad_proposal_field() -> None:
+    """The vocabulary is present exactly when the tool can carry a proposal —
+    the invariant `decide` derives the key from. Checked against the schema
+    rather than restated, so the two cannot drift."""
+    for kwargs in (
+        {"task_expectation": "fold it"},                       # vanilla, may pivot
+        {},                                                    # vanilla, convergence only
+        {"phase": "metad"},                                    # biased, no switch left
+        {"phase": "metad", "allow_cv_switch": True},           # biased, switch offered
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        req = fake.last_request
+        assert req is not None
+        carries_proposal = "metad_proposal" in req["tools"][0]["input_schema"]["properties"]
+        has_vocabulary = "`cv_type` — one of" in req["system"][0]["text"]
+        assert carries_proposal == has_vocabulary, kwargs
+
+
+def test_switch_cv_guidance_appears_only_while_the_allowance_lasts() -> None:
+    spent = _stub()
+    decide({"stub": True}, phase="metad", client=spent)
+    assert "`switch_cv` replaces the biased" not in _system_text(spent)
+
+    offered = _stub()
+    decide({"stub": True}, phase="metad", allow_cv_switch=True, client=offered)
+    assert "`switch_cv` replaces the biased" in _system_text(offered)
+
+
+def test_the_unbounded_cv_warning_survives_every_round_that_can_propose_one() -> None:
+    """F6: RMSD-to-native is unbounded above and cost two campaigns. Whenever a
+    CV can be proposed, the round must carry that warning."""
+    for kwargs in (
+        {"task_expectation": "fold it"},
+        {"phase": "metad", "allow_cv_switch": True},
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        assert "unbounded above" in _system_text(fake), kwargs
+
+
+def test_retrieval_shortens_the_prompt_against_sending_everything() -> None:
+    from mdpilot.orchestrator.scientist import build_system_prompt
+
+    widest = build_system_prompt("metad", can_propose_cv=True, allow_cv_switch=True)
+    for phase, propose, switch in (
+        ("vanilla", True, False),
+        ("vanilla", False, False),
+        ("metad", False, False),
+    ):
+        got = build_system_prompt(
+            phase, can_propose_cv=propose, allow_cv_switch=switch
+        )
+        assert len(got) < len(widest)
