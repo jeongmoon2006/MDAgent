@@ -39,29 +39,21 @@ observable:
   selection: "protein and name CA"
   reference: campaign_topology   # post-equilibration structure, constant across rounds
 
-# Free-form campaign-level expectation passed to run_campaign(task_expectation=...).
-# Written for the scientist, not for humans: it must state what has to be
-# accomplished, the characteristic timescale, and the budget, because those are
-# what the switch_to_metad rule compares against.
-task_expectation: |
-  Target: chignolin variant CLN025 (PDB 5AWL), a 10-residue beta-hairpin, in
-  TIP3P water at 300 K. The simulation starts from the folded native structure.
-
-  Objective: sample the folding/unfolding transition in both directions and
-  recover the free-energy surface along the slow coordinate.
-
-  Required transition: the campaign must connect the extended state (CA-RMSD to
-  the native structure > 4.0 A) and the native beta-hairpin state (CA-RMSD <
-  1.5 A), and must then cross back. A full A -> B -> A recrossing is required,
-  not a single one-way event: a one-way crossing leaves the reverse barrier
-  unsampled and the free-energy surface under-filled on one side.
-
-  Characteristic timescale: the CLN025 folding time is 0.6-1.0 microseconds.
-
-  Compute budget: 20 ns for the biased phase. Vanilla MD is therefore short of
-  the folding time by roughly two orders of magnitude. Unbiased runs under
-  50 ns are expected to stay trapped in whichever basin they start from, which
-  here is the folded state.
+# Campaign expectation. `task_expectation` — the string threaded into every
+# scientist.decide() call, and the only input gating `switch_to_metad` — is
+# RENDERED from these fields plus done_criterion below, not authored. It used to
+# be free prose that restated the thresholds, the round-trip requirement and the
+# budget in words; three of those four numbers existed twice, with nothing
+# linking the copies. Only `objective` and the timescale are genuinely free.
+expectation:
+  objective: |
+    Sample the folding/unfolding transition in both directions and recover the
+    free-energy surface along the slow coordinate.
+  # The one decision-driving number that exists nowhere else, so it carries a
+  # citation. The scientist compares cumulative simulation time against it to
+  # judge whether the budget can reach the transition.
+  characteristic_timescale_ns: 800.0
+  timescale_source: "CLN025 folding time 0.6-1.0 us; Lindorff-Larsen et al. 2011, Science 334:517"
 
 # Enhanced-sampling bounds. The position is a task-level fact (what counts as
 # unfolded), not something the scientist or a magic constant should decide; the
@@ -89,7 +81,12 @@ sampling:
 # decide.
 done_criterion:
   pivot_required: true
-  min_recrossings: 2                 # A -> B -> A, per count_recrossings semantics
-  extended_state_rmsd_angstrom: 4.0  # A basin
-  folded_state_rmsd_angstrom: 1.5    # B basin
+  # The two states, named, on the campaign observable. `low`/`high` are
+  # positions on that coordinate, not folding-specific roles — a ligand-binding
+  # campaign names them "bound"/"unbound" on a distance and the mechanics are
+  # unchanged. `count_recrossings` counts transitions between the two bands.
+  states:
+    low:  { name: "native beta-hairpin", threshold: 1.5 }
+    high: { name: "extended",            threshold: 4.0 }
+  min_recrossings: 2                 # 2 = a full A -> B -> A round trip
   max_biased_ns: 20.0

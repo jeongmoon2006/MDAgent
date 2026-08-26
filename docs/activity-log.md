@@ -198,6 +198,41 @@ This is the same defect as the trailing-duplicate surface `sum_hills` already po
 
 ## 2. Session journal
 
+### 2026-08-25 (later) — `Ensemble` on the spec: temperature and timestep become campaign parameters
+Branch `test`. First slice of making setup tunable. `_TEMPERATURE_K` and `_TIMESTEP_FS` / `_TIMESTEP_PS` were adapter class constants — in the GROMACS case interpolated into the mdp templates *at import*, so no campaign could reach them. They now live on `SystemSpec.ensemble`.
+
+**Why the spec and not an adapter keyword argument.** `run_campaign` already locks `adapter.spec.to_dict()` into the campaign config, so every field added to the spec is covered by the resume guard for free. An adapter keyword would need its own config key, and `run_campaign`'s docstring had been asserting that temperature and timestep were "covered by the engine lock" — true only while they were immutable class constants. That coverage would have vanished silently the moment they became settable, and a campaign could have been resumed at a different temperature with the guard none the wiser. Test: `test_ensemble_mismatch_on_resume_is_rejected`.
+
+**Backward compatibility.** `SystemSpec.to_dict()` emits `ensemble` only when it differs from the default, because `store.init_campaign` compares config JSON byte-for-byte. Verified against the real `campaigns/cln025_metad` and `_run3` databases: both still rebuild an identical `system_spec`. The same rule is used for the new `bias_pace` / `bias_factor` config keys.
+
+**Scope, deliberately two fields.** Water model, force field, padding, ionic strength and pressure stay hardcoded per adapter; they get fields when a campaign needs them, per the rule `SystemSpec` already follows. `timestep_fs > 2.5` raises rather than silently integrating unstably — neither adapter implements HMR and both constrain h-bonds only.
+
+**Also landed:** `bias_pace` / `bias_factor` pass-through on `run_campaign`. `design_bias` already accepted both; the loop never passed them, so no campaign could change the shape of its own bias. `None` means "let `bias_designer` decide", so its defaults stay the single definition. Worth exercising: γ=10 flattens barriers to ~γ·kT ≈ 25 kJ/mol, and the CLN025 surface reached `fes_depth ≈ 41 kJ/mol`.
+
+259 unit tests pass (7 new).
+
+### 2026-08-25 — Prompt knowledge base: the scientist retrieves its rules per round
+Branch `test`. `scientist.py` held one static system prompt covering both phases and the whole CV vocabulary, sent unchanged every round: 10,835 chars / ~2,900 tokens, of which roughly half described actions the round could not take. Split into six Markdown chunks under `src/mdpilot/knowledge/`, assembled per round by `build_system_prompt`.
+
+**Retrieval is by key, not similarity.** The keys are the facts that already select the tool schema — phase, whether the tool carries a `metad_proposal` field, whether `switch_cv` is offered. `can_propose_cv` is read off the selected schema rather than re-derived from `(phase, task_expectation, allow_cv_switch)`, so the vocabulary is present exactly when the field that consumes it is and the two cannot drift.
+
+| round type | ~tokens | vs before |
+|---|---|---|
+| vanilla, pivot possible | 1,650 | −44% |
+| vanilla, pure convergence | 1,030 | −65% |
+| metad, no switch left | 1,470 | −50% |
+| metad, switch offered | 2,455 | −16% |
+
+**No retrieval *within* `cv_vocabulary`, deliberately.** The obvious next filter is "show only the relevant CV types", and it is wrong: the scientist is choosing among them. `cln025_folding.yaml` already says pre-selecting a CV "would decide the science the agent exists to decide", and runs 1 and 3 differed only in the model picking `contacts` over `rmsd` unprompted. The chunk is retrieved whole or not at all.
+
+**Two latent prompt defects surfaced by the split**, both from text that assumed every round saw everything:
+- `reason` instructed the model to cite `plateau_reached`, `ess`, `exploring`, `n_basins`, `bimodality_coefficient` — all vanilla-only fields that `phase_metad` explicitly says are absent. Every biased round since the phase split was being asked for numbers it had been told it would not get. Now phase-neutral.
+- `role` said the report was "Phase-dependent; see below" and described a two-phase prompt. Reworded to say the round carries one phase's rules only.
+
+**Caching.** Four assemblies, constant within a campaign phase, so each caches after its first round; the pivot invalidates the prefix on the one round the assembly changes anyway. All four clear Sonnet 4.6's 1024-token minimum, including the smallest: `cache_control` sits on the system block but the cached prefix is tools → system, so the ~715-token tool schema counts toward it. A pure-convergence vanilla round measures a 1,014-token system block and a 1,729-token prefix, and caches (`cache_read_input_tokens` 1,413 on the second call, measured 2026-08-25). Retrieval cannot trim a round out of the cache — an earlier draft of this entry said it could, having compared the system block against the minimum rather than the prefix.
+
+Content moved verbatim: each chunk was verified whitespace-normalised-identical to the section it replaced before any edit was applied. `[tool.setuptools.package-data]` added — without it a non-editable install ships the code and none of the prose, and every `decide()` fails on the first chunk read; verified by building a wheel and loading a chunk from a clean install. 247 unit tests pass (8 new).
+
 ### 2026-08-24 — External review pass: two convergence-path defects, and the loop stops guessing at physics constants
 Branch `test`. A full read of the tree surfaced two defects on the path that decides when a campaign is allowed to end, plus three structural gaps. No campaign was re-run; everything here is unit-covered.
 

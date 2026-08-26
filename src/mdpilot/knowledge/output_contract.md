@@ -1,7 +1,7 @@
 Sizing `extra_ns` when extending: proportional to the gap — 0.5 ns when
 borderline, up to 2.0 ns when far (vanilla: ess<5 or no plateau; metad: drift
-well above kT or zero recrossings). When `stop` or `switch_to_metad`,
-`extra_ns` must be null.
+well above kT or zero recrossings). When `stop`, `switch_to_metad` or
+`switch_cv`, `extra_ns` must be null.
 
 For `ledger_note`: record insights worth carrying across rounds — a hypothesis
 about the slow coordinate, the reason for an unusual CV choice, a rate

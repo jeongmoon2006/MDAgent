@@ -135,3 +135,31 @@ def test_engine_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
             **cfg,
         )
     assert not (tmp_path / "setup").exists()
+
+
+def test_ensemble_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
+    """Temperature and timestep live on the spec precisely so this raises.
+
+    As adapter class constants they were covered only by the engine-name lock,
+    and that coverage would have evaporated the moment they became settable —
+    a campaign could then have been resumed at a different temperature with
+    the guard none the wiser.
+    """
+    import pytest
+
+    from mdpilot.adapters.openmm_adapter import OpenMMAdapter
+    from mdpilot.adapters.system_spec import Ensemble
+
+    cfg = _config_kwargs()
+    store.init_campaign(tmp_path, _full_config(cfg))  # default ensemble persisted
+
+    for changed in (Ensemble(temperature_k=240.0), Ensemble(timestep_fs=1.0)):
+        adapter = OpenMMAdapter(
+            work_dir=tmp_path,
+            seed=cfg["seed"],
+            spec=SystemSpec(pdb_id="1L2Y", ensemble=changed),
+        )
+        with pytest.raises(ValueError, match="different config"):
+            run_campaign(work_dir=tmp_path, max_rounds=1, adapter=adapter, **cfg)
+    # Refused before any engine setup was paid for.
+    assert not (tmp_path / "inputs").exists()

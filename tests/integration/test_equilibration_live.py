@@ -20,8 +20,8 @@ import numpy as np
 import pytest
 from openmm import MonteCarloBarostat, XmlSerializer, unit
 
-from mdpilot.adapters.openmm_adapter import _TEMPERATURE_K, OpenMMAdapter
-from mdpilot.adapters.system_spec import SystemSpec
+from mdpilot.adapters.openmm_adapter import OpenMMAdapter
+from mdpilot.adapters.system_spec import Ensemble, SystemSpec
 
 _GAS_CONSTANT_KJ_PER_MOL_K = 0.0083144621
 _FIXED_PDB = Path("benchmarks/data/trpcage/1L2Y_fixed.pdb")
@@ -99,7 +99,7 @@ def test_cached_system_carries_the_barostat_into_production(equilibrated) -> Non
     assert len(barostats) == 1
     assert barostats[0].getDefaultTemperature().value_in_unit(
         unit.kelvin
-    ) == pytest.approx(_TEMPERATURE_K)
+    ) == pytest.approx(Ensemble().temperature_k)
 
 
 def test_cached_state_has_a_periodic_box(equilibrated) -> None:

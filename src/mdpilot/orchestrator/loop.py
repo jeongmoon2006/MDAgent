@@ -115,6 +115,8 @@ def run_campaign(
     state_thresholds: tuple[float, float] | None = None,
     max_cv_switches: int = 1,
     cv_upper_wall_nm: float | None = None,
+    bias_pace: int | None = None,
+    bias_factor: float | None = None,
     seed: int = 42,
     report_interval_steps: int = 500,    # 1 ps/frame at 2 fs
     equilibration_steps: int = 0,
@@ -146,10 +148,12 @@ def run_campaign(
     loop-control bounds and may differ between invocations. Everything that
     defines what the campaign *is* — seed, initial_steps,
     report_interval_steps, equilibration_steps, the system spec, the engine,
-    task_expectation, cv_upper_wall_nm, state_thresholds and min_recrossings —
-    is locked at first init and a mismatch on resume raises. The timestep and
-    thermostat temperature are read from the adapter and so are covered by the
-    engine lock.
+    task_expectation, cv_upper_wall_nm, state_thresholds, min_recrossings and
+    the bias shape — is locked at first init and a mismatch on resume raises.
+    The thermostat temperature and timestep live on `spec.ensemble` and so are
+    covered by the system-spec half of that lock; they used to be adapter class
+    constants covered only by the engine-name lock, which would have stopped
+    covering them the moment they became settable.
 
     `max_biased_ns` caps *cumulative* simulation time in the metadynamics
     phase, counting across rounds and across resumes (it is recomputed from
@@ -166,6 +170,14 @@ def run_campaign(
     characteristic timescale, the compute budget. Required for campaigns
     where the scientist may need to choose `switch_to_metad`; otherwise the
     LLM has no basis to judge "the budget cannot reach the transition."
+
+    `bias_pace` and `bias_factor` override the METAD deposition stride and the
+    well-tempered gamma that `sampling.bias_designer` would otherwise pick.
+    Left at None the designer's own defaults apply, so there is one source of
+    truth for them rather than a second copy in this signature. Both are
+    biased-phase physics and lock with the rest of the campaign config.
+    gamma=10 flattens barriers up to ~gamma*kT; a surface deeper than that
+    wants a larger one.
 
     `biased_adapter_factory` builds the adapter used after a `switch_to_metad`
     pivot from a rendered plumed.dat string. Defaults to an `OpenMMAdapter`
@@ -256,6 +268,15 @@ def run_campaign(
         # rounds already judged under the old value.
         "min_recrossings": min_recrossings,
     }
+    # Bias shape is biased-phase physics: resuming under a different gamma or
+    # deposition stride would join two differently-filled surfaces into one
+    # `sum_hills` integration. Added to the lock only when set, for the same
+    # reason `SystemSpec.to_dict` omits a default ensemble — an unconditional
+    # key would make every campaign recorded before this existed unresumable.
+    if bias_pace is not None:
+        config["bias_pace"] = bias_pace
+    if bias_factor is not None:
+        config["bias_factor"] = bias_factor
     store.init_campaign(work_dir, config)
     prior_rows = store.list_rounds(work_dir)
     rounds: list[RoundResult] = [_row_to_result(r) for r in prior_rows]
@@ -308,6 +329,8 @@ def run_campaign(
             plumed_dat_path=plumed_dat_path,
             temperature_k=temperature_k,
             cv_upper_wall_nm=cv_upper_wall_nm,
+            bias_pace=bias_pace,
+            bias_factor=bias_factor,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
@@ -332,6 +355,8 @@ def run_campaign(
             plumed_dat_path=plumed_dat_path,
             temperature_k=temperature_k,
             cv_upper_wall_nm=cv_upper_wall_nm,
+            bias_pace=bias_pace,
+            bias_factor=bias_factor,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
@@ -490,6 +515,8 @@ def run_campaign(
                 plumed_dat_path=plumed_dat_path,
                 temperature_k=temperature_k,
                 cv_upper_wall_nm=cv_upper_wall_nm,
+                bias_pace=bias_pace,
+                bias_factor=bias_factor,
             )
             in_metad = True
             current_plumed_dat = plumed_dat_path
@@ -511,6 +538,8 @@ def run_campaign(
                 plumed_dat_path=plumed_dat_path,
                 temperature_k=temperature_k,
                 cv_upper_wall_nm=cv_upper_wall_nm,
+                bias_pace=bias_pace,
+                bias_factor=bias_factor,
             )
             cv_switches_used += 1
             current_plumed_dat = plumed_dat_path
@@ -772,6 +801,8 @@ def _pivot_to_metad(
     plumed_dat_path: Path,
     temperature_k: float,
     cv_upper_wall_nm: float | None = None,
+    bias_pace: int | None = None,
+    bias_factor: float | None = None,
 ) -> MDAdapter:
     """Resolve a CV proposal into a biased, started adapter.
 
@@ -788,6 +819,8 @@ def _pivot_to_metad(
         plumed_dat_path.parent,
         temperature_k=temperature_k,
         cv_upper_wall_nm=cv_upper_wall_nm,
+        bias_pace=bias_pace,
+        bias_factor=bias_factor,
     )
     plumed_dat_path.write_text(plumed_input)
     biased = factory(plumed_input)
@@ -804,6 +837,8 @@ def _build_plumed_input(
     *,
     temperature_k: float,
     cv_upper_wall_nm: float | None = None,
+    bias_pace: int | None = None,
+    bias_factor: float | None = None,
 ) -> str:
     """Proposal → resolved CV → sized bias → rendered plumed.dat text.
 
@@ -827,8 +862,15 @@ def _build_plumed_input(
         reference=reference,
         output_dir=output_dir,
     )
+    # None means "let bias_designer decide", so its defaults stay the single
+    # definition of PACE and BIASFACTOR rather than being restated here.
+    overrides = {
+        k: v
+        for k, v in (("pace", bias_pace), ("bias_factor", bias_factor))
+        if v is not None
+    }
     bias = design_bias(
-        cv, trajectory_path, topology_path, temperature_k=temperature_k
+        cv, trajectory_path, topology_path, temperature_k=temperature_k, **overrides
     )
     wall = design_upper_wall(cv, cv_upper_wall_nm)
     return PlumedInput(

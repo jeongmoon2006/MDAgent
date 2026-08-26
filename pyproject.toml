@@ -28,3 +28,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The scientist's prompt is assembled at runtime from `mdpilot/knowledge/*.md`.
+# Without this a wheel installs the code and none of the prose, and every
+# decide() call fails on the first chunk read.
+[tool.setuptools.package-data]
+mdpilot = ["knowledge/*.md"]

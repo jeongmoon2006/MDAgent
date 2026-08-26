@@ -1039,3 +1039,79 @@ def test_biased_phase_uses_the_adapter_thermostat_temperature(
     )
 
     assert seen == {"build": 277.0, "report": 277.0}
+
+
+# ---------- bias shape overrides ----------
+#
+# PACE and BIASFACTOR were already keyword arguments on `design_bias`; the loop
+# simply never passed them, so no campaign could change the shape of its own
+# bias. These pin the threading and the resume lock that has to come with it.
+
+def _two_atom_traj(tmp_path: Path) -> tuple[Path, Path]:
+    import mdtraj as md
+    import numpy as np
+
+    top = md.Topology()
+    res = top.add_residue("ALA", top.add_chain(), resSeq=1)
+    top.add_atom("A", md.element.carbon, res)
+    top.add_atom("B", md.element.carbon, res)
+    xyz = np.zeros((20, 2, 3))
+    xyz[:, 1, 0] = np.linspace(0.9, 1.4, 20)   # a real, non-degenerate spread
+    traj = md.Trajectory(xyz=xyz.astype(np.float32), topology=top)
+    pdb, dcd = tmp_path / "top.pdb", tmp_path / "traj.dcd"
+    traj[0].save_pdb(str(pdb))
+    traj.save_dcd(str(dcd))
+    return dcd, pdb
+
+
+def _render(tmp_path: Path, **overrides) -> str:
+    from mdpilot.orchestrator.loop import _build_plumed_input
+
+    dcd, pdb = _two_atom_traj(tmp_path)
+    return _build_plumed_input(
+        MetadProposal(cv_type="distance", selections=("name A", "name B"), label="d"),
+        dcd,
+        pdb,
+        tmp_path.resolve(),
+        temperature_k=300.0,
+        **overrides,
+    )
+
+
+def test_bias_overrides_reach_the_rendered_plumed_dat(tmp_path: Path) -> None:
+    rendered = _render(tmp_path, bias_pace=200, bias_factor=15.0)
+
+    assert "PACE=200" in rendered
+    assert "BIASFACTOR=15" in rendered
+
+
+def test_unset_bias_overrides_leave_the_designer_defaults(tmp_path: Path) -> None:
+    """None means "let bias_designer decide" — the loop must not restate its
+    defaults, or the two drift apart silently."""
+    from mdpilot.sampling.bias_designer import _DEFAULT_BIAS_FACTOR, _DEFAULT_PACE
+
+    rendered = _render(tmp_path)
+
+    assert f"PACE={_DEFAULT_PACE}" in rendered
+    assert f"BIASFACTOR={_DEFAULT_BIAS_FACTOR:g}" in rendered
+
+
+def test_bias_shape_locks_into_the_campaign_config_only_when_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Biased-phase physics, so it has to lock — but adding the keys
+    unconditionally would break resume for every campaign predating them."""
+    from mdpilot.memory import store
+
+    for kwargs, expected in (
+        ({}, False),
+        ({"bias_factor": 15.0}, True),
+    ):
+        work = tmp_path / f"c{int(expected)}"
+        _stub_collaborators(monkeypatch, [_stop()])
+        adapter = _FakeAdapter(work, spec=SystemSpec.trpcage())
+        run_campaign(
+            work_dir=work, adapter=adapter, max_rounds=1, **_run_kwargs(), **kwargs
+        )
+        config = store.get_campaign_config(work)
+        assert ("bias_factor" in config) is expected, kwargs

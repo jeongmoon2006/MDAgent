@@ -10,8 +10,9 @@ minimized structure. Velocities are seeded explicitly with
 `setVelocitiesToTemperature` at the first heating stage rather than left at
 zero for the thermostat to warm up — that zero-velocity start was a real
 physical mismatch with the GROMACS adapter, which has always generated
-velocities via `gen-vel`. Both engines now reach 300 K over an equivalent
-50 K → 300 K ramp under the same stochastic (Langevin / `sd`) thermostat.
+velocities via `gen-vel`. Both engines reach the ensemble temperature over
+an equivalent ramp from 50 K under the same stochastic (Langevin / `sd`)
+thermostat.
 
 The barostat added for the NPT stage stays in the cached `System`, so
 production runs NPT as well; the box is therefore free to fluctuate rather
@@ -58,13 +59,14 @@ from mdpilot.adapters.system_spec import SystemSpec
 _FORCEFIELD_FILES = ("amber14-all.xml", "amber14/tip3p.xml")
 _PADDING_NM = 1.0
 _SALT_M = 0.15
-_TEMPERATURE_K = 300.0
 _FRICTION_PER_PS = 1.0
-_TIMESTEP_FS = 2.0
 _NONBONDED_CUTOFF_NM = 1.0
+# Thermostat temperature and integrator timestep are NOT here: they come from
+# `spec.ensemble`, so they are locked by the campaign config on resume. The
+# rest of this block is still fixed per adapter.
 
-# Equilibration. Heating ramps from _HEAT_START_K to _TEMPERATURE_K in
-# _HEAT_STAGES equal steps under the production thermostat; NPT then relaxes
+# Equilibration. Heating ramps from _HEAT_START_K to the ensemble temperature
+# in _HEAT_STAGES equal steps under the production thermostat; NPT then relaxes
 # the density at 1 bar. Both stage lengths are constructor-overridable so the
 # test suite can run the pipeline without paying 200 ps of CPU MD.
 _HEAT_START_K = 50.0
@@ -198,9 +200,9 @@ def _prepare_plumed_force(plumed_input: str, work_dir: Path):
 
 class OpenMMAdapter:
     """MDAdapter: direct OpenMM execution. System chosen by SystemSpec; the
-    integrator/forcefield/box/ions choices are still hardcoded (AMBER14,
-    TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs,
-    MonteCarloBarostat at 1 bar).
+    forcefield/box/ions choices are still hardcoded (AMBER14, TIP3P, 1 nm
+    padding, 0.15 M NaCl, LangevinMiddle, MonteCarloBarostat at 1 bar).
+    Thermostat temperature and timestep come from ``spec.ensemble``.
 
     ``platform`` pins the OpenMM platform by name; left at None the adapter
     picks the fastest one that actually works (GPU when present, CPU
@@ -244,11 +246,11 @@ class OpenMMAdapter:
 
     @property
     def timestep_fs(self) -> float:
-        return _TIMESTEP_FS
+        return self._spec.ensemble.timestep_fs
 
     @property
     def temperature_k(self) -> float:
-        return _TEMPERATURE_K
+        return self._spec.ensemble.temperature_k
 
     @property
     def trajectory_extension(self) -> str:
@@ -366,7 +368,7 @@ class OpenMMAdapter:
     def _heat_nvt(
         self, sim: app.Simulation, integrator: LangevinMiddleIntegrator
     ) -> None:
-        """Ramp the thermostat from _HEAT_START_K to _TEMPERATURE_K in equal
+        """Ramp the thermostat from _HEAT_START_K to the ensemble temperature in equal
         stages. A staircase rather than a continuous ramp: the temperature can
         only change between `step()` calls, and _HEAT_STAGES steps is fine
         enough for a small solvated protein. No positional restraints — at
@@ -376,7 +378,7 @@ class OpenMMAdapter:
             return
         per_stage = max(self._nvt_steps // _HEAT_STAGES, 1)
         for stage in range(1, _HEAT_STAGES + 1):
-            target = _HEAT_START_K + (_TEMPERATURE_K - _HEAT_START_K) * (
+            target = _HEAT_START_K + (self.temperature_k - _HEAT_START_K) * (
                 stage / _HEAT_STAGES
             )
             integrator.setTemperature(target * unit.kelvin)
@@ -420,7 +422,7 @@ class OpenMMAdapter:
     def _make_barostat(self) -> MonteCarloBarostat:
         barostat = MonteCarloBarostat(
             _PRESSURE_BAR * unit.bar,
-            _TEMPERATURE_K * unit.kelvin,
+            self.temperature_k * unit.kelvin,
             _BAROSTAT_INTERVAL,
         )
         # Volume moves are Monte Carlo; seed them so runs stay reproducible.
@@ -447,12 +449,19 @@ class OpenMMAdapter:
         shutil.copy(cached_topology, self._topology_path)
 
     def _make_integrator(
-        self, temperature_k: float = _TEMPERATURE_K
+        self, temperature_k: float | None = None
     ) -> LangevinMiddleIntegrator:
+        """Production integrator, or one pinned to a heating-stage temperature.
+
+        `temperature_k=None` means the ensemble's own temperature. The timestep
+        is never overridden: it defines what a step is worth, and the loop
+        converts nanoseconds to steps against `adapter.timestep_fs`.
+        """
         integrator = LangevinMiddleIntegrator(
-            temperature_k * unit.kelvin,
+            (self.temperature_k if temperature_k is None else temperature_k)
+            * unit.kelvin,
             _FRICTION_PER_PS / unit.picosecond,
-            _TIMESTEP_FS * unit.femtosecond,
+            self._spec.ensemble.timestep_fs * unit.femtosecond,
         )
         integrator.setRandomNumberSeed(self._seed)
         return integrator

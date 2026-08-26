@@ -30,9 +30,9 @@ from mdpilot.adapters.openmm_adapter import (
     _HEAT_STAGES,
     _HEAT_START_K,
     _PRESSURE_BAR,
-    _TEMPERATURE_K,
     OpenMMAdapter,
 )
+from mdpilot.adapters.system_spec import Ensemble, SystemSpec
 
 
 class _FakeIntegrator:
@@ -62,9 +62,9 @@ def test_heating_ramp_ends_at_target_temperature(tmp_path: Path) -> None:
     assert len(integrator.temperatures_k) == _HEAT_STAGES
     # The last stage must be the production temperature exactly — an NPT stage
     # that inherits 290 K would relax the density at the wrong state point.
-    assert integrator.temperatures_k[-1] == pytest.approx(_TEMPERATURE_K)
+    assert integrator.temperatures_k[-1] == pytest.approx(adapter.temperature_k)
     assert integrator.temperatures_k[0] > _HEAT_START_K
-    assert integrator.temperatures_k[0] < _TEMPERATURE_K
+    assert integrator.temperatures_k[0] < adapter.temperature_k
 
 
 def test_heating_ramp_is_monotonic(tmp_path: Path) -> None:
@@ -109,7 +109,7 @@ def test_barostat_carries_pressure_temperature_and_seed(tmp_path: Path) -> None:
     )
     assert barostat.getDefaultTemperature().value_in_unit(
         unit.kelvin
-    ) == pytest.approx(_TEMPERATURE_K)
+    ) == pytest.approx(adapter.temperature_k)
     assert barostat.getFrequency() == _BAROSTAT_INTERVAL
     # Volume moves are Monte Carlo; an unseeded barostat would break the
     # project's seeded-determinism contract.
@@ -119,10 +119,12 @@ def test_barostat_carries_pressure_temperature_and_seed(tmp_path: Path) -> None:
 # ---------- GROMACS: mdp content ----------
 
 def test_nvt_mdp_anneals_from_start_to_target_and_generates_velocities() -> None:
-    mdp = _NVT_MDP_TEMPLATE.format(nsteps=50_000, anneal_ps="100", seed=42)
+    mdp = _NVT_MDP_TEMPLATE.format(
+        nsteps=50_000, anneal_ps="100", seed=42, ref_t=300.0, dt_ps=0.002
+    )
 
     assert "annealing            = single" in mdp
-    assert f"annealing-temp       = {_HEAT_START_K} {_TEMPERATURE_K}" in mdp
+    assert f"annealing-temp       = {_HEAT_START_K} 300.0" in mdp
     assert "annealing-time       = 0 100" in mdp
     assert "gen-vel              = yes" in mdp
     assert f"gen-temp             = {_HEAT_START_K}" in mdp
@@ -131,7 +133,9 @@ def test_nvt_mdp_anneals_from_start_to_target_and_generates_velocities() -> None
 
 
 def test_npt_mdp_couples_pressure_and_continues_from_nvt() -> None:
-    mdp = _NPT_MDP_TEMPLATE.format(nsteps=50_000, seed=42)
+    mdp = _NPT_MDP_TEMPLATE.format(
+        nsteps=50_000, seed=42, ref_t=300.0, dt_ps=0.002
+    )
 
     assert "pcoupl               = C-rescale" in mdp
     assert "ref-p                = 1.0" in mdp
@@ -141,7 +145,9 @@ def test_npt_mdp_couples_pressure_and_continues_from_nvt() -> None:
 
 
 def test_production_mdp_keeps_the_barostat_on() -> None:
-    mdp = _MD_MDP_TEMPLATE.format(nsteps=1000, report_interval=500, seed=42)
+    mdp = _MD_MDP_TEMPLATE.format(
+        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, dt_ps=0.002
+    )
 
     assert "pcoupl               = C-rescale" in mdp
     assert "ref-p                = 1.0" in mdp
@@ -150,7 +156,9 @@ def test_production_mdp_keeps_the_barostat_on() -> None:
 def test_production_mdp_cold_start_override_still_matches() -> None:
     """`run_steps` rewrites two exact lines for the equilibration-disabled
     path. If the template's spacing drifts, that surgery silently no-ops."""
-    mdp = _MD_MDP_TEMPLATE.format(nsteps=1000, report_interval=500, seed=42)
+    mdp = _MD_MDP_TEMPLATE.format(
+        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, dt_ps=0.002
+    )
 
     assert "gen-vel              = no" in mdp
     assert "continuation         = yes" in mdp
@@ -214,3 +222,48 @@ def test_final_setup_tag_falls_back_to_em_when_equilibration_disabled(
 ) -> None:
     adapter = GROMACSAdapter(work_dir=tmp_path, nvt_steps=0, npt_steps=0)
     assert adapter._final_setup_tag() == "em"
+
+
+# ---------- the ensemble actually reaches the engine ----------
+
+def test_openmm_heating_ramp_targets_a_non_default_ensemble(tmp_path: Path) -> None:
+    """Temperature used to be a module constant, so the ramp always ended at
+    300 K whatever the campaign asked for."""
+    adapter = OpenMMAdapter(
+        work_dir=tmp_path,
+        spec=SystemSpec(pdb_id="1L2Y", ensemble=Ensemble(temperature_k=240.0)),
+        nvt_steps=6000,
+        npt_steps=0,
+    )
+    integrator, sim = _FakeIntegrator(), _FakeSim()
+
+    adapter._heat_nvt(sim, integrator)  # type: ignore[arg-type]
+
+    assert adapter.temperature_k == 240.0
+    assert integrator.temperatures_k[-1] == pytest.approx(240.0)
+    assert adapter._make_barostat().getDefaultTemperature().value_in_unit(
+        unit.kelvin
+    ) == pytest.approx(240.0)
+
+
+def test_openmm_integrator_uses_the_ensemble_timestep(tmp_path: Path) -> None:
+    adapter = OpenMMAdapter(
+        work_dir=tmp_path,
+        spec=SystemSpec(pdb_id="1L2Y", ensemble=Ensemble(timestep_fs=1.0)),
+    )
+
+    assert adapter.timestep_fs == 1.0
+    assert adapter._make_integrator().getStepSize().value_in_unit(
+        unit.femtosecond
+    ) == pytest.approx(1.0)
+
+
+def test_gromacs_mdp_renders_the_ensemble_not_a_baked_constant() -> None:
+    """`ref-t` and `dt` were f-string-interpolated at import, so no campaign
+    could change them. They are format placeholders now."""
+    mdp = _MD_MDP_TEMPLATE.format(
+        nsteps=1000, report_interval=500, seed=42, ref_t=240.0, dt_ps=0.001
+    )
+
+    assert "ref-t                = 240.0" in mdp
+    assert "dt                   = 0.001" in mdp

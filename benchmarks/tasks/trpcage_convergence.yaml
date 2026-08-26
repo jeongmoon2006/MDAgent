@@ -31,9 +31,8 @@ observable:
   reference: campaign_topology   # post-equilibration structure, constant across rounds
 
 diagnostics:
-  - block_averaging
-  - autocorrelation
-  target_ess: 50
+  methods: [block_averaging, autocorrelation]
+  target_ess: 50            # must match autocorrelation()'s own default
 
 # Done criterion (per ROADMAP.md, Milestone 1):
 # Scientist correctly says "extend" on a planted under-converged trajectory

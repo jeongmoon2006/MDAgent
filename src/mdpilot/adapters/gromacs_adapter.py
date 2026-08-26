@@ -1,8 +1,8 @@
 """GROMACS implementation of `MDAdapter`.
 
 Trp-cage in TIP3P + 0.15 M NaCl, amber99sb-ildn force field, stochastic-
-dynamics integrator (Langevin equivalent) at 300 K, C-rescale barostat at
-1 bar. The system-level parameters intentionally mirror those in
+dynamics integrator (Langevin equivalent), C-rescale barostat at 1 bar.
+Thermostat temperature and timestep come from ``spec.ensemble``. The system-level parameters intentionally mirror those in
 `openmm_adapter` so that the same convergence rubric can be applied to
 trajectories produced by either engine; small force-field-level differences
 (amber99sb-ildn vs amber14-all) are accepted.
@@ -39,9 +39,11 @@ _WATER_MODEL = "tip3p"
 _BOX_TYPE = "cubic"
 _PADDING_NM = 1.0
 _SALT_CONC_M = 0.15
-_TEMPERATURE_K = 300.0
 _TAU_T_PS = 1.0          # inverse friction; 1/friction_per_ps with friction = 1 ps^-1
-_TIMESTEP_PS = 0.002     # 2 fs
+# Thermostat temperature (`ref-t`, `annealing-temp`, `gen-temp`) and timestep
+# (`dt`) come from `spec.ensemble` and are rendered into the mdp at run time,
+# so they are locked by the campaign config on resume. They were previously
+# baked into these templates at import, which made them unreachable.
 _CUTOFF_NM = 1.0
 _PRESSURE_BAR = 1.0
 _TAU_P_PS = 2.0
@@ -90,7 +92,7 @@ pbc           = xyz
 _NVT_MDP_TEMPLATE = f"""\
 ; equilibration stage 1 — staged heating, NVT, Langevin (sd) integrator
 integrator           = sd
-dt                   = {_TIMESTEP_PS}
+dt                   = {{dt_ps}}
 nsteps               = {{nsteps}}
 
 nstxout              = 0
@@ -101,13 +103,13 @@ nstenergy            = 500
 
 tc-grps              = System
 tau-t                = {_TAU_T_PS}
-ref-t                = {_TEMPERATURE_K}
+ref-t                = {{ref_t}}
 
-; ramp {_HEAT_START_K:g} K -> {_TEMPERATURE_K:g} K across the whole stage
+; ramp {_HEAT_START_K:g} K -> {{ref_t}} K across the whole stage
 annealing            = single
 annealing-npoints    = 2
 annealing-time       = 0 {{anneal_ps}}
-annealing-temp       = {_HEAT_START_K} {_TEMPERATURE_K}
+annealing-temp       = {_HEAT_START_K} {{ref_t}}
 
 constraints          = h-bonds
 constraint-algorithm = LINCS
@@ -132,7 +134,7 @@ continuation         = no
 _NPT_MDP_TEMPLATE = f"""\
 ; equilibration stage 2 — density relaxation, NPT, C-rescale barostat
 integrator           = sd
-dt                   = {_TIMESTEP_PS}
+dt                   = {{dt_ps}}
 nsteps               = {{nsteps}}
 
 nstxout              = 0
@@ -143,7 +145,7 @@ nstenergy            = 500
 
 tc-grps              = System
 tau-t                = {_TAU_T_PS}
-ref-t                = {_TEMPERATURE_K}
+ref-t                = {{ref_t}}
 
 pcoupl               = C-rescale
 pcoupltype           = isotropic
@@ -172,7 +174,7 @@ continuation         = yes
 _MD_MDP_TEMPLATE = f"""\
 ; production MD, NPT, Langevin (sd) integrator + C-rescale barostat
 integrator           = sd
-dt                   = {_TIMESTEP_PS}
+dt                   = {{dt_ps}}
 nsteps               = {{nsteps}}
 
 nstxout-compressed   = {{report_interval}}
@@ -185,7 +187,7 @@ nstfout              = 0
 
 tc-grps              = System
 tau-t                = {_TAU_T_PS}
-ref-t                = {_TEMPERATURE_K}
+ref-t                = {{ref_t}}
 
 pcoupl               = C-rescale
 pcoupltype           = isotropic
@@ -241,7 +243,8 @@ def _run_gmx(
 class GROMACSAdapter:
     """MDAdapter: subprocess-driven GROMACS execution. System chosen by
     SystemSpec; the forcefield/water/integrator choices stay hardcoded
-    (amber99sb-ildn, TIP3P, sd at 300 K, 2 fs, C-rescale barostat at 1 bar).
+    (amber99sb-ildn, TIP3P, sd, C-rescale barostat at 1 bar); temperature and
+    timestep come from ``spec.ensemble``.
 
     ``nvt_steps`` / ``npt_steps`` size the two equilibration stages. Setting
     *both* to 0 skips equilibration entirely and falls back to the legacy
@@ -272,17 +275,23 @@ class GROMACSAdapter:
         self._started = False
 
     @property
+    def _timestep_ps(self) -> float:
+        """The mdp `dt`. GROMACS states the timestep in picoseconds; the
+        `MDAdapter` contract states it in femtoseconds. One conversion, here."""
+        return self._spec.ensemble.timestep_fs / 1000.0
+
+    @property
     def spec(self) -> SystemSpec:
         return self._spec
 
     @property
     def timestep_fs(self) -> float:
         # GROMACS states `dt` in picoseconds; the Protocol is in femtoseconds.
-        return _TIMESTEP_PS * 1000.0
+        return self._spec.ensemble.timestep_fs
 
     @property
     def temperature_k(self) -> float:
-        return _TEMPERATURE_K
+        return self._spec.ensemble.temperature_k
 
     @property
     def trajectory_extension(self) -> str:
@@ -455,6 +464,8 @@ class GROMACSAdapter:
                 nsteps=n_steps,
                 report_interval=(report_interval_steps if trajectory_path is not None else 0),
                 seed=self._seed,
+                ref_t=self.temperature_k,
+                dt_ps=self._timestep_ps,
             )
         )
 
@@ -479,7 +490,9 @@ class GROMACSAdapter:
                 nsteps=n_steps,
                 report_interval=(report_interval_steps if trajectory_path is not None else 0),
                 seed=self._seed,
-            ).replace("gen-vel              = no", f"gen-vel              = yes\ngen-temp             = {_TEMPERATURE_K}\ngen-seed             = {self._seed}") \
+                ref_t=self.temperature_k,
+                dt_ps=self._timestep_ps,
+            ).replace("gen-vel              = no", f"gen-vel              = yes\ngen-temp             = {self.temperature_k}\ngen-seed             = {self._seed}") \
              .replace("continuation         = yes", "continuation         = no")
             mdp_path.write_text(cold_mdp)
         _run_gmx(*grompp_args, cwd=run_dir)
@@ -542,8 +555,10 @@ class GROMACSAdapter:
 
         (self._setup_dir / "nvt.mdp").write_text(
             _NVT_MDP_TEMPLATE.format(
+                ref_t=self.temperature_k,
+                dt_ps=self._timestep_ps,
                 nsteps=nvt_steps,
-                anneal_ps=f"{nvt_steps * _TIMESTEP_PS:g}",
+                anneal_ps=f"{nvt_steps * self._timestep_ps:g}",
                 seed=self._seed,
             )
         )
@@ -559,7 +574,12 @@ class GROMACSAdapter:
         _run_gmx("mdrun", "-deffnm", "nvt", "-ntmpi", "1", cwd=self._setup_dir)
 
         (self._setup_dir / "npt.mdp").write_text(
-            _NPT_MDP_TEMPLATE.format(nsteps=npt_steps, seed=self._seed)
+            _NPT_MDP_TEMPLATE.format(
+                nsteps=npt_steps,
+                seed=self._seed,
+                ref_t=self.temperature_k,
+                dt_ps=self._timestep_ps,
+            )
         )
         # -t carries velocities and RNG state out of the heating stage.
         _run_gmx(

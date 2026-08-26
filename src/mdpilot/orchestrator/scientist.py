@@ -42,12 +42,26 @@ Implementation notes:
   `metad_proposal` is a nullable object so the discriminated union stays in
   one tool call; the cross-field invariant (`metad_proposal` non-null iff
   decision == switch_to_metad) is enforced in `decide()`'s parser.
-- Caching: `cache_control` on the system prompt. Sonnet 4.6's minimum
-  cacheable prefix is 1024 tokens; the two-phase prompt is around that size,
-  so caching may now actually engage. Note the render order is tools →
-  system → messages, so swapping the tool at the pivot invalidates the
-  system prefix for one round. That happens once per campaign and is not
-  worth designing around.
+- Prompt assembly: the system prompt is retrieved per round from the
+  Markdown knowledge base in `mdpilot/knowledge/`, keyed on the same facts
+  that select the tool schema (phase, whether a CV proposal is possible,
+  whether a CV switch is offered). A round is never shown rules it cannot
+  act on — a biased round gets no equilibrium rubric, a pure-convergence
+  campaign gets no CV vocabulary. See `build_system_prompt`.
+- Caching: `cache_control` on the assembled system prompt. There are four
+  possible assemblies and the prompt is constant within a campaign phase, so
+  each variant caches after its first round. The render order is tools →
+  system → messages, so a breakpoint on the system block caches the tool
+  schema *with* it: the ~715-token tool sits inside the cached prefix, not
+  before it. That is what keeps even the smallest assembly clear of Sonnet
+  4.6's 1024-token minimum — a pure-convergence vanilla round is a
+  1,014-token system block but a 1,729-token prefix, and it does cache
+  (measured `cache_read_input_tokens` 1,413 on the second call). Retrieval
+  therefore never trims a round out of the cache; an earlier note here
+  claiming the smallest assembly might miss it compared the system block
+  against the minimum instead of the prefix. That same render order is why
+  swapping the tool at the pivot invalidates the prefix for one round — the
+  same round the assembly changes anyway.
 """
 
 from __future__ import annotations
