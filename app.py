@@ -74,6 +74,16 @@ def format_event(name: str, payload: dict[str, Any]) -> list[str]:
                 )
             ),
         ]
+    if name == "preflight_ok":
+        bands = p.get("state_thresholds")
+        return [
+            line(
+                f"   preflight  {p.get('residues')} residues  ·  "
+                f"{p.get('observable')} = {p.get('first_value'):.3g} on the "
+                f"starting structure"
+                + (f"  (bands {bands[0]:g}/{bands[1]:g})" if bands else "")
+            )
+        ]
     if name == "round_start":
         return [
             line(
@@ -269,10 +279,20 @@ def start_campaign(run: CampaignRun, task_path: Path, overrides: dict[str, Any])
             task = load_task_file(task_path)
             run.note(f"task file accepted: {task.name}  (sha {task.sha256[:12]})")
             run.note(f"observable {task.observable_name}  ·  {task.spec.forcefield}")
+            kwargs = task.run_kwargs(**overrides)
+            adapter = task.build_adapter(
+                run.work_dir, seed=int(kwargs.get("seed", 42))
+            )
+            run.note(
+                f"system {task.spec.pdb_id or task.spec.structure_path}  ·  "
+                f"{task.spec.ensemble.temperature_k:g} K  ·  "
+                f"padding {task.spec.padding_nm} nm"
+            )
             result = run_campaign(
                 work_dir=run.work_dir,
+                adapter=adapter,
                 on_event=run.observe,
-                **task.run_kwargs(**overrides),
+                **kwargs,
             )
             run.stop_reason = result.stop_reason
         except Exception as exc:  # surfaced in the log, not swallowed
@@ -344,7 +364,7 @@ def render_configurator() -> None:
         height=110,
         placeholder="I want to study Chignolin folding and unfolding…",
     )
-    if st.button("Draft task file", type="secondary", use_container_width=True,
+    if st.button("Draft task file", type="secondary", width="stretch",
                  disabled=not objective.strip()):
         notes: list[str] = []
         try:
@@ -380,7 +400,7 @@ def render_configurator() -> None:
     run = st.session_state.get("run")
     busy = run is not None and run.running
 
-    if st.button("🔒 Lock & Run Campaign", type="primary", use_container_width=True,
+    if st.button("🔒 Lock & Run Campaign", type="primary", width="stretch",
                  disabled=busy or not st.session_state.get("yaml", "").strip()):
         work_dir = CAMPAIGNS / name
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -436,9 +456,23 @@ def render_viewer() -> None:
     if not known:
         st.caption("No campaigns on disk yet.")
         return
-    default = st.session_state.get("viewing", "")
-    index = known.index(Path(default).name) if Path(default).name in known else len(known) - 1
-    campaign = st.selectbox("Campaign", known, index=index)
+    # Agent-driven mode follows *this session's* campaign. With none, nothing
+    # is selected and nothing renders: falling back to the newest directory on
+    # disk meant a fresh page opened onto an animating trajectory from an
+    # unrelated old run that nobody had asked to see.
+    session_campaign = Path(st.session_state.get("viewing", "")).name
+    campaign = st.selectbox(
+        "Campaign",
+        known,
+        index=known.index(session_campaign) if session_campaign in known else None,
+        placeholder="Select a campaign to inspect…",
+    )
+    if campaign is None:
+        st.caption(
+            "Idle. This follows the campaign you lock in ① automatically; "
+            "to look at an earlier one, pick it above."
+        )
+        return
     work_dir = CAMPAIGNS / campaign
 
     rows = completed_rounds(work_dir)
@@ -479,6 +513,10 @@ def render_viewer() -> None:
                 view.setBackgroundColor("0x111418")
                 view.zoomTo()
                 view.animate({"loop": "forward", "interval": 90})
+                # `st.iframe` is the named replacement for
+                # `components.html`, but it takes a URL or Path rather than
+                # an HTML string, so it cannot embed an inline py3Dmol view.
+                # Revisit when Streamlit offers a string-taking successor.
                 components.html(view._make_html(), height=440)
                 st.caption("Solvent stripped; frames strided for display.")
             except Exception as exc:
@@ -490,7 +528,7 @@ def render_viewer() -> None:
             st.info("No free-energy surface — this round was unbiased.")
         else:
             try:
-                st.pyplot(fes_figure(fes_path), use_container_width=True)
+                st.pyplot(fes_figure(fes_path), width="stretch")
                 st.caption(fes_path.name)
             except Exception as exc:
                 st.warning(f"Could not plot the surface: {type(exc).__name__}: {exc}")

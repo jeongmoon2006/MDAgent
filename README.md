@@ -80,7 +80,8 @@ Run it in the conda environment — the app starts real campaigns, so it needs
 the same PLUMED-capable environment metadynamics does. The left column calls
 the setup agent (needs `ANTHROPIC_API_KEY`); the middle streams
 `run_campaign`'s event log; the right renders trajectories and free-energy
-surfaces straight out of `campaigns/`, for any past campaign, running or not.
+surfaces straight out of `campaigns/`. It starts idle and follows whichever
+campaign you lock; pick one from its dropdown to inspect an earlier run.
 
 Run bounds in the left column default to shakedown sizes on purpose — a click
 should not start a 20 ns campaign.

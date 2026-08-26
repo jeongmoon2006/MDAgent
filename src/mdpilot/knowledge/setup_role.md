@@ -46,6 +46,18 @@ request only asks whether a transition happens at all.
 something else. The timestep may not exceed 2.5 fs — no hydrogen mass
 repartitioning is implemented.
 
+**Do not raise the temperature to accelerate sampling.** That reflex belongs to
+unbiased MD. This campaign may pivot to metadynamics, and it is the bias that
+crosses the barrier — an elevated temperature does not sample the same surface
+faster, it samples a *different* surface, and the one the researcher asked
+about is almost always the one at their stated conditions. Two further reasons
+it is not the free win it looks like: a force field's melting temperature is
+not the experimental one, so "run at Tm" cannot be set from a paper's number
+without measuring where the model actually melts; and a hotter run populates
+more extended conformations, which is what makes a solute meet its own periodic
+image. Raise it only when melting behaviour is itself the question, and say so
+in the description.
+
 **Force field and box**: choose a combination from the selection guide below,
 and leave `padding_nm` at 1.5 unless the campaign will drive the system much
 further apart than it starts — padding is applied to the *starting* structure,

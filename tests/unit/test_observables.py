@@ -152,12 +152,27 @@ def test_a_malformed_spec_is_refused() -> None:
         ObservableSpec(cv_type="rmsd", selections=("name CA",), name="x", scale=0.0)
 
 
-def test_wrong_arity_is_refused_by_the_cv_layer(system) -> None:
-    """Arity rules live in `cv_designer` and are not restated here."""
-    traj, top_path = system
-    spec = ObservableSpec(
-        cv_type="distance", selections=("name CA",), name="d"
-    )
+def test_wrong_arity_is_refused_before_a_structure_is_ever_fetched() -> None:
+    """Arity is pure schema — knowable without a topology. It used to surface
+    only once `cv_designer` resolved the selections, i.e. after a structure had
+    been downloaded and solvated."""
+    with pytest.raises(ValueError, match="cv_type='distance' takes 2"):
+        ObservableSpec(cv_type="distance", selections=("name CA",), name="d")
 
-    with pytest.raises(ValueError, match="distance requires 2 selections"):
-        campaign_observable(traj, top_path, spec)
+    with pytest.raises(ValueError, match="cv_type='torsion' takes 4"):
+        ObservableSpec(cv_type="torsion", selections=("a", "b"), name="t")
+
+
+def test_the_contacts_arity_message_explains_the_mistake_people_make() -> None:
+    """A setup agent asked for "contacts between the two strands" and wrote one
+    selection per strand. `contacts` forms pairs *within* one group, so that is
+    a single selection covering both."""
+    with pytest.raises(ValueError) as excinfo:
+        ObservableSpec(
+            cv_type="contacts",
+            selections=("resid 1 2 3 4", "resid 6 7 8 9"),
+            name="hairpin_native_contacts",
+        )
+
+    assert "within* one atom group" in str(excinfo.value)
+    assert "not as one selection per strand" in str(excinfo.value)

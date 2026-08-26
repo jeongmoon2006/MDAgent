@@ -34,7 +34,6 @@ from typing import Any
 import mdtraj as md
 import numpy as np
 
-from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.diagnostics.free_energy import count_recrossings
 from mdpilot.orchestrator.loop import CampaignResult, run_campaign, steps_per_ns_for
 from mdpilot.task_file import TaskFile, load_task_file
@@ -59,7 +58,7 @@ def run(task: TaskFile, work_dir: Path, *, dry_run: bool) -> tuple[CampaignResul
     reports round lengths in nanoseconds, and it is the adapter — not this
     file — that knows the timestep.
     """
-    adapter = OpenMMAdapter(work_dir=work_dir, seed=42, spec=task.spec)
+    adapter = task.build_adapter(work_dir, seed=42)
     steps_per_ns = steps_per_ns_for(adapter)
 
     if dry_run:

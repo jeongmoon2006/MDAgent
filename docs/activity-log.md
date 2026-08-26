@@ -248,6 +248,25 @@ Measured on the completed campaigns, not inferred. Box is cubic, L ≈ 3.66 nm (
 
 **Known gaps, stated in the guide rather than worked around:** no TIP4P/Ice ships with OpenMM (so the D6 ice showcase needs a parameter file this project does not carry), no OPC solvation, and no small-molecule force field (GAFF/OpenFF), so protein-ligand systems still cannot be parameterised. The setup agent is instructed to propose the closest listed combination and name the gap.
 
+### F12 — A task file's system spec was silently discarded, and the wrong molecule ran for 40 minutes (2026-08-26, **corrected 2026-08-26**)
+**This entry originally blamed the setup agent for proposing the wrong PDB. That was wrong, and the correction is the more useful finding.**
+
+First campaign launched from the Streamlit UI. The task file said chignolin, `starting_pdb: 2RVD`. What ran was 1L2Y — Trp-cage, 20 residues, `NLYIQWLKDGGPSSGRPPPS`.
+
+**`2RVD` is chignolin.** Fetched directly: `TYR-TYR-ASP-PRO-GLU-THR-GLY-THR-TRP-TYR` = YYDPETGTWY, 10 residues, CLN025. The agent's identifier was correct.
+
+**The cause was `app.py` calling `run_campaign` with no adapter.** `run_kwargs` deliberately excludes the system spec — the spec belongs to the adapter, which the caller constructs. `run_campaign(adapter=None)` then falls back to `OpenMMAdapter(work_dir, seed)`, whose default is `SystemSpec.trpcage()`. So the *entire* `system:` and `integrator:` block was discarded — PDB, force field, padding, and temperature (340 K requested, 300 K run) — with nothing anywhere recording that the file had been ignored. The stored config proves it: `system_spec: {'pdb_id': '1L2Y', ...}`, and `inputs/1L2Y_fixed.pdb` sits in the work directory. `benchmarks/run_cln025.py` had always done it correctly (`spec=task.spec`); the app did not.
+
+**Fixed by removing the footgun, not just the instance.** `TaskFile.build_adapter(work_dir, seed=...)` constructs the adapter from the file's own spec; both the app and the benchmark runner use it, so the two halves of a task file — what to simulate and how to judge it — are no longer separable by accident. A test asserts the spec reaches the engine.
+
+**What was genuine agent drift, and still stands.** The observable was named `native_contacts_fraction` with `scale: 1` — an absolute count, 938-2140, against thresholds of 0.3 and 0.7. Every frame read as the same state, so `recrossings` was fixed at 0, `fes_converged` could never be true, and `_refuse_premature_stop` converted every `stop` into an `extend`. That half of the original entry is correct.
+
+**And part of *that* was also ours.** `ObservableSpec.normalize` was added to the spec and the loader but not to the setup agent's tool schema, so the agent could not express a fraction at all and could only reach for `scale`. Fixed; with `normalize` available it now emits `normalize: true` on the first attempt.
+
+**A third, separate agent error, now caught at load.** A later draft wrote two selections for a `contacts` observable — one per hairpin strand. `contacts` forms native pairs *within* one group. Arity is pure schema and needs no topology, so it moved from `cv_designer` (which only finds out after a structure has been fetched and solvated) into `ObservableSpec.__post_init__`, with a message that explains the specific mistake.
+
+**What the pre-flight checks are actually worth.** `check_residue_count` did fire on this campaign — the description said 10 residues, the built structure had 20. It caught a real inconsistency at round zero. What it could not tell anyone is *why*, and the obvious reading — "the agent picked the wrong PDB" — was the wrong one. A check that compares two artifacts tells you they disagree; it does not tell you which is at fault, and the first explanation that fits is not evidence.
+
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
 - Do not build a persistent multi-agent system; subagents are ephemeral function calls returning structured artifacts, not prose.
@@ -258,6 +277,24 @@ Measured on the completed campaigns, not inferred. Box is cubic, L ≈ 3.66 nm (
 ---
 
 ## 2. Session journal
+
+### 2026-08-26 (latest) — Correcting F12: the app was dropping the system spec
+Branch `test`. Traced the "wrong molecule" campaign properly instead of accepting the first explanation that fit. `2RVD` is chignolin; the agent was right. `app.py` called `run_campaign` without an adapter, so the default `SystemSpec.trpcage()` (1L2Y) was used and the task file's whole `system:`/`integrator:` block — PDB, force field, padding, 340 K — was discarded silently. F12 rewritten.
+
+`TaskFile.build_adapter` now owns that construction so it cannot be forgotten; `app.py` and `benchmarks/run_cln025.py` both use it. Two other real defects fixed in the same pass: `observable_normalize` was missing from the setup agent's tool schema (so the agent literally could not express a fraction, which is why it kept emitting raw counts), and observable arity moved into `ObservableSpec.__post_init__` where it needs no topology — a `contacts` observable with one selection per strand now fails at load with a message explaining that contacts form pairs within a single group.
+
+375 unit tests pass (4 new).
+
+### 2026-08-26 (late) — Pre-flight checks, after a campaign ran 40 minutes toward an unreachable criterion
+Branch `test`. Recorded as F12. `mdpilot/preflight.py` runs after `adapter.start()` and before the first step: `check_residue_count` compares the description's claim against the fetched structure, `check_observable_scale` compares the observable's value on the starting structure against its own state thresholds. Both raise; a `preflight_ok` event carries the numbers into the UI log.
+
+`ObservableSpec.normalize` (contacts only) divides by the native-pair count, so a task file can say "fraction" and mean it. `description` is threaded into `run_campaign` for the check and deliberately kept *out* of the locked config — editing prose must not stop a resume.
+
+`_FakeAdapter` now writes a real four-residue PDB rather than the string "PDB", so every loop test exercises the pre-flight path a real adapter takes. Two loop tests assert MD never started: `adapter.run_calls == []`.
+
+Test data is the real thing — the drifted description, `2061.0`, and `(0.3, 0.7)` are the values from `campaigns/ui_campaign`. Parametrised cases pin the cases that must *not* fire: a folded start above its band, an unfolded start below it, CA-RMSD reading exactly 0 against its own reference, and an ambiguous description ("a 10-residue core inside a 30-residue construct") which is not treated as a claim at all.
+
+371 unit tests pass (22 new).
 
 ### 2026-08-26 (night) — Streamlit control surface (`app.py`)
 Branch `test`. **This overrides a stated scope decision**: `ROADMAP.md` lists a web UI under *Deliberately out of scope* — "Terminal + notebooks only until at least Milestone 6". Recorded here rather than left implicit. The justification is that the thing MDPilot is *about* — the scientist deciding, mid-campaign, whether to extend, stop or pivot — reads poorly as a terminal transcript, and a three-column view makes the reasoning legible next to the trajectory and surface it was taken on. It is a view over the existing backend and adds no science: every number it shows is read from `campaigns/<name>/`.

@@ -45,6 +45,7 @@ from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
 from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.diagnostics.free_energy import metad_report
 from mdpilot.diagnostics.report import make_report
+from mdpilot import preflight
 from mdpilot.observables import ObservableSpec, campaign_observable
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
@@ -135,6 +136,7 @@ def run_campaign(
     bias_pace: int | None = None,
     bias_factor: float | None = None,
     observable: ObservableSpec | None = None,
+    description: str | None = None,
     on_event: CampaignEvent | None = None,
     seed: int = 42,
     report_interval_steps: int = 500,    # 1 ps/frame at 2 fs
@@ -205,6 +207,11 @@ def run_campaign(
     biased-phase physics and lock with the rest of the campaign config.
     gamma=10 flattens barriers up to ~gamma*kT; a surface deeper than that
     wants a larger one.
+
+    `description` is prose about the system, used only by the pre-flight
+    checks — it is compared against the structure that was actually fetched.
+    It is deliberately *not* part of the locked config: editing prose must not
+    stop a campaign resuming.
 
     `on_event` is an optional observer called with `(name, payload)` as the
     campaign progresses — `campaign_start`, `round_start`, `simulated`,
@@ -338,6 +345,28 @@ def run_campaign(
     # minimized state + topology exist for a biased adapter to reuse.
     adapter.prepare()
     adapter.start()
+
+    # Pre-flight, on the starting structure, before a single step is
+    # integrated. These compare across the one seam no schema can check: what
+    # the task file *says* against what was actually built, and the
+    # observable's own magnitude against the bands it will be judged in. A
+    # campaign that cannot reach its own done criterion should cost seconds,
+    # not the forty minutes it once did.
+    preflight.check_residue_count(adapter.topology_path, description)
+    reference = md.load(str(adapter.topology_path))
+    first_value, observable_name = campaign_observable(
+        reference, adapter.topology_path, observable
+    )
+    preflight.check_observable_scale(
+        float(first_value[0]), state_thresholds, observable_name
+    )
+    _emit(
+        on_event, "preflight_ok",
+        residues=sum(1 for r in reference.topology.residues if r.is_protein),
+        observable=observable_name,
+        first_value=float(first_value[0]),
+        state_thresholds=list(state_thresholds) if state_thresholds else None,
+    )
 
     in_metad = False
     current_plumed_dat: Path | None = None

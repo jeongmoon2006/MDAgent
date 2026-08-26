@@ -50,6 +50,8 @@ def test_cln025_produces_the_kwargs_the_runner_hand_assembled() -> None:
         "min_recrossings": 2,
         "max_biased_ns": 20.0,
         "state_thresholds": (1.5, 4.0),
+        # Prose, carried only for the pre-flight structure check.
+        "description": task.campaign["description"],
     }
     # (low, high) on the observable — the order run_campaign refuses inverted.
     assert task.campaign["state_thresholds"][0] < task.campaign["state_thresholds"][1]
@@ -60,7 +62,9 @@ def test_a_pure_convergence_task_yields_no_campaign_overrides() -> None:
     stand and `switch_to_metad` stays out of the action space."""
     task = load_task_file(_TASKS / "trpcage_convergence.yaml")
 
-    assert task.campaign == {}
+    # `description` is prose for the pre-flight check, not a campaign
+    # parameter; nothing here changes what the loop does.
+    assert set(task.campaign) <= {"description"}
     assert task.done_criterion == {}
 
 
@@ -327,7 +331,7 @@ def test_a_timescale_contradicting_its_own_source_is_refused(tmp_path: Path) -> 
     doc["expectation"]["characteristic_timescale_ns"] = 1.0
     doc["expectation"]["timescale_source"] = "folds on the ~1 microsecond timescale"
 
-    with pytest.raises(ValueError, match="describes the transition in microseconds"):
+    with pytest.raises(ValueError, match="more than an order of magnitude"):
         load_task_file(_write(tmp_path, doc))
 
 
@@ -366,3 +370,59 @@ def test_padding_is_declarable_and_reaches_the_spec(tmp_path: Path) -> None:
 def test_the_shipped_task_files_use_the_post_f11_box() -> None:
     for name in ("cln025_folding", "trpcage_convergence"):
         assert load_task_file(_TASKS / f"{name}.yaml").spec.padding_nm == 1.5
+
+
+def test_build_adapter_carries_the_whole_system_spec(tmp_path: Path) -> None:
+    """`run_kwargs` deliberately excludes the spec — it belongs to the adapter.
+    That split is a footgun, because `run_campaign(adapter=None)` falls back to
+    Trp-cage rather than complaining, so a caller who forgets gets a different
+    molecule with no signal at all."""
+    from mdpilot.adapters.system_spec import Ensemble
+
+    doc = _minimal(starting_pdb="5AWL", padding_nm=2.0, forcefield="charmm36/tip3p")
+    doc["integrator"] = {"temperature_K": 240.0, "timestep_fs": 1.0}
+    task = load_task_file(_write(tmp_path, doc))
+
+    adapter = task.build_adapter(tmp_path, seed=7)
+
+    assert adapter.spec.pdb_id == "5AWL"
+    assert adapter.spec.padding_nm == 2.0
+    assert adapter.spec.forcefield == "charmm36/tip3p"
+    assert adapter.spec.ensemble == Ensemble(temperature_k=240.0, timestep_fs=1.0)
+    assert adapter.temperature_k == 240.0 and adapter.timestep_fs == 1.0
+    # None of this is in run_kwargs, which is exactly why the helper exists.
+    assert "spec" not in task.run_kwargs()
+
+
+def test_a_source_may_mention_other_timescales_for_context(tmp_path: Path) -> None:
+    """Regression. The check keyed on bare units, so a source that mentioned a
+    slower process for comparison — which scientific prose does constantly —
+    was refused although its own number was right. Hit live: a draft citing
+    "~1 µs" alongside a millisecond comparison was rejected at 1000 ns."""
+    doc = _campaign_doc()
+    doc["expectation"]["characteristic_timescale_ns"] = 1000.0
+    doc["expectation"]["timescale_source"] = (
+        "Chignolin folds on the ~1 microsecond timescale, far below the "
+        "millisecond timescale of larger proteins."
+    )
+
+    assert load_task_file(_write(tmp_path, doc))
+
+
+def test_a_source_with_no_stated_magnitude_is_not_judged(tmp_path: Path) -> None:
+    """Nothing to compare against is not evidence of a mistake."""
+    doc = _campaign_doc()
+    doc["expectation"]["timescale_source"] = "Honda et al. (2004) JACS 126:15318"
+
+    assert load_task_file(_write(tmp_path, doc))
+
+
+def test_the_refusal_names_what_the_source_actually_quoted(tmp_path: Path) -> None:
+    doc = _campaign_doc()
+    doc["expectation"]["characteristic_timescale_ns"] = 1.0
+    doc["expectation"]["timescale_source"] = "folds on the ~1 microsecond timescale"
+
+    with pytest.raises(ValueError) as excinfo:
+        load_task_file(_write(tmp_path, doc))
+
+    assert "quotes [1000.0] ns" in str(excinfo.value)

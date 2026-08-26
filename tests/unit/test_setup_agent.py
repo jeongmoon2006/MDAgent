@@ -30,6 +30,7 @@ def _valid(**overrides: Any) -> dict[str, Any]:
         "observable_selections": ["protein and name CA"],
         "observable_name": "q_native_contacts",
         "observable_scale": 1.0,
+        "observable_normalize": True,
         "objective": "Sample folding and unfolding in both directions.",
         "characteristic_timescale_ns": 800.0,
         "timescale_source": "Lindorff-Larsen et al. 2011, Science 334:517",

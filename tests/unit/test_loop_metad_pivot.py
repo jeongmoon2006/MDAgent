@@ -22,6 +22,19 @@ from mdpilot.orchestrator.loop import run_campaign
 from mdpilot.orchestrator.scientist import Decision, MetadProposal
 
 
+# A real (if tiny) topology, not a marker file. `run_campaign`'s pre-flight
+# loads this and computes the campaign observable on it before any dynamics,
+# so a fake that writes "PDB" would exercise a path no real adapter takes.
+# Four alanines in a line: enough CA atoms for an rmsd observable to resolve.
+_MINIMAL_PDB = "".join(
+    f"ATOM  {i * 2 + 1:>5d}  N   ALA A{i + 1:>4d}    "
+    f"{i * 3.8:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           N\n"
+    f"ATOM  {i * 2 + 2:>5d}  CA  ALA A{i + 1:>4d}    "
+    f"{i * 3.8 + 1.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C\n"
+    for i in range(4)
+) + "END\n"
+
+
 class _FakeAdapter:
     """Minimal MDAdapter that writes marker files and records calls."""
 
@@ -70,7 +83,7 @@ class _FakeAdapter:
     def start(self) -> None:
         self.started = True
         self._topology_path.parent.mkdir(parents=True, exist_ok=True)
-        self._topology_path.write_text("PDB")
+        self._topology_path.write_text(_MINIMAL_PDB)
 
     def run_steps(self, n_steps, *, trajectory_path=None, report_interval_steps=500):
         self.run_calls.append(n_steps)

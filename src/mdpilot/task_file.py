@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,7 @@ _TOP_LEVEL = {
 _EXPECTATION_KEYS = {"objective", "characteristic_timescale_ns", "timescale_source"}
 _DONE_CRITERION_KEYS = {"states", "min_recrossings", "max_biased_ns", "pivot_required"}
 _STATE_KEYS = {"name", "threshold"}
-_OBSERVABLE_KEYS = {"cv_type", "selections", "name", "scale", "reference"}
+_OBSERVABLE_KEYS = {"cv_type", "selections", "name", "scale", "normalize", "reference"}
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,25 @@ class TaskFile:
     sha256: str
     path: Path
     observable_name: str
+
+    def build_adapter(self, work_dir: Path, *, seed: int = 42) -> Any:
+        """The engine adapter this task describes.
+
+        `run_kwargs` deliberately does not carry the system spec — the spec
+        belongs to the adapter, which the caller constructs. That split is a
+        footgun: `run_campaign(adapter=None)` silently falls back to
+        `SystemSpec.trpcage()`, so a caller who forgets gets a Trp-cage
+        campaign no matter what the task file said, with nothing to indicate
+        the file was ignored. The Streamlit app did exactly that, and ran
+        1L2Y for forty minutes under a task file describing chignolin.
+
+        Using this instead of constructing an adapter by hand keeps the two
+        halves of a task file — what to simulate, and how to judge it —
+        from being separable by accident.
+        """
+        from mdpilot.adapters.openmm_adapter import OpenMMAdapter
+
+        return OpenMMAdapter(work_dir=Path(work_dir), seed=seed, spec=self.spec)
 
     def run_kwargs(self, **overrides: Any) -> dict[str, Any]:
         """Keyword arguments for `run_campaign`, with caller overrides applied.
@@ -302,6 +322,7 @@ def _build_observable(doc: dict[str, Any]) -> ObservableSpec:
         selections=tuple(block["selections"]),
         name=block["name"],
         scale=float(block.get("scale", 1.0)),
+        normalize=bool(block.get("normalize", False)),
     )
 
 
@@ -313,6 +334,12 @@ def _build_campaign(doc: dict[str, Any]) -> dict[str, Any]:
     observable = _build_observable(doc)
     if observable != ObservableSpec.ca_rmsd_angstrom():
         campaign["observable"] = observable
+
+    # Prose, threaded through only so `preflight` can check it against the
+    # structure that actually gets fetched. Not part of the campaign's
+    # identity — editing the description must not stop a resume.
+    if doc.get("description"):
+        campaign["description"] = str(doc["description"])
 
     if doc.get("expectation"):
         campaign["task_expectation"] = render_task_expectation(doc)
@@ -383,15 +410,36 @@ def _check_expectation(doc: dict[str, Any], path: Path) -> None:
         )
 
 
-# Order matters: the longer spellings are checked first so "microsecond" is not
-# matched as "us" inside another word. The tolerance is one order of magnitude
-# either way — 0.6 us stated as 600 ns is correct and must pass, while 1 us
-# stated as 1 ns is off by a factor of 1000 and must not.
+# Timescales the source *states*, as (number, unit) pairs converted to
+# nanoseconds. Matching a quantity rather than a bare unit is the point: an
+# earlier version looked for any unit anywhere in the text, so a source that
+# mentioned a slower process for context — "folds on the ~1 us timescale, far
+# below the ms timescale of larger proteins" — was refused although its number
+# was right. Scientific prose does that constantly.
+#
+# Tolerance is one order of magnitude either way: 0.6 us written as 600 ns is
+# correct and must pass, while 1 us written as 1 ns is off by 1000x and must not.
 _ORDER_OF_MAGNITUDE = 10.0
-_TIMESCALE_UNIT_HINTS: tuple[tuple[tuple[str, ...], float, str], ...] = (
-    (("millisecond", " ms", "~ms"), 1_000_000.0, "milliseconds"),
-    (("microsecond", " us", "~us", "\u00b5s", "\u03bcs"), 1_000.0, "microseconds"),
+_UNIT_NS: dict[str, float] = {
+    "ns": 1.0, "nanosecond": 1.0, "nanoseconds": 1.0,
+    "us": 1e3, "\u00b5s": 1e3, "\u03bcs": 1e3,
+    "microsecond": 1e3, "microseconds": 1e3,
+    "ms": 1e6, "millisecond": 1e6, "milliseconds": 1e6,
+}
+_QUANTITY = re.compile(
+    r"(\d+(?:\.\d+)?)\s*"
+    r"(nanoseconds?|microseconds?|milliseconds?|ns|us|\u00b5s|\u03bcs|ms)\b",
+    re.IGNORECASE,
 )
+
+
+def _quoted_timescales_ns(source: str) -> list[float]:
+    """Every magnitude the source actually states, in nanoseconds."""
+    return [
+        float(number) * _UNIT_NS[unit.lower()]
+        for number, unit in _QUANTITY.findall(source)
+        if unit.lower() in _UNIT_NS
+    ]
 
 
 def _check_timescale_units(expectation: dict[str, Any], path: Path) -> None:
@@ -405,27 +453,31 @@ def _check_timescale_units(expectation: dict[str, Any], path: Path) -> None:
     so the campaign never pivots and spends its whole budget on sampling that
     cannot work.
 
-    Narrow on purpose. This only fires when the source *says* microseconds or
-    milliseconds and the value is too small to be that, which is a slip a
-    reader skims past and arithmetic catches.
+    Compared against the magnitudes the source *states*, passing if any one of
+    them is within an order of magnitude. A source is free to mention other
+    timescales for context; an earlier version keyed on bare units and refused
+    good sources for doing exactly that.
     """
     value = expectation.get("characteristic_timescale_ns")
-    source = str(expectation.get("timescale_source") or "").lower()
+    source = str(expectation.get("timescale_source") or "")
     if value is None or not source:
         return
-    for spellings, unit_ns, unit in _TIMESCALE_UNIT_HINTS:
-        if not any(s in source for s in spellings):
-            continue
-        if float(value) < unit_ns / _ORDER_OF_MAGNITUDE:
-            raise ValueError(
-                f"task_file: {path} states characteristic_timescale_ns="
-                f"{value!r}, but timescale_source describes the transition in "
-                f"{unit} (~{unit_ns:g} ns), which is more than an order of "
-                f"magnitude away. One of the two is wrong, and this is the "
-                f"number the pivot decision is taken against — state the "
-                f"timescale in nanoseconds."
-            )
+    quoted = _quoted_timescales_ns(source)
+    if not quoted:
         return
+    value = float(value)
+    if any(
+        q / _ORDER_OF_MAGNITUDE <= value <= q * _ORDER_OF_MAGNITUDE for q in quoted
+    ):
+        return
+    closest = min(quoted, key=lambda q: abs(q - value))
+    raise ValueError(
+        f"task_file: {path} states characteristic_timescale_ns={value:g}, but "
+        f"its own timescale_source quotes {sorted(set(quoted))} ns, the "
+        f"nearest of which ({closest:g} ns) is more than an order of magnitude "
+        f"away. One of the two is wrong, and this is the number the pivot "
+        f"decision is taken against — state the timescale in nanoseconds."
+    )
 
 
 def _verify_declared_constants(doc: dict[str, Any], path: Path) -> None:

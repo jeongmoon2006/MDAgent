@@ -39,7 +39,7 @@ import anthropic
 import yaml
 from dotenv import load_dotenv
 
-from mdpilot import forcefields
+from mdpilot import forcefields, preflight
 from mdpilot.orchestrator.scientist import _chunk
 from mdpilot.task_file import TaskFile, load_task_file
 
@@ -125,9 +125,14 @@ _TASK_FILE_TOOL: dict[str, Any] = {
             "observable_selections": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "MDTraj selection strings. Arity depends on the "
-                               "type: distance 2 single-atom, torsion 4 "
-                               "single-atom, gyration/rmsd/contacts 1 group.",
+                "description": "MDTraj selection strings. The count is fixed "
+                               "by the type and is rejected if wrong: distance "
+                               "exactly 2 single-atom selections, torsion "
+                               "exactly 4, and gyration / rmsd / contacts "
+                               "exactly 1 group. `contacts` forms native pairs "
+                               "*within* that one group, so contacts between "
+                               "two strands are one selection covering both "
+                               "strands, not one selection per strand.",
             },
             "observable_name": {
                 "type": "string",
@@ -139,6 +144,17 @@ _TASK_FILE_TOOL: dict[str, Any] = {
                 "description": "Multiplies the raw value. mdtraj returns "
                                "nanometres and radians; use 10 to state "
                                "lengths in Angstrom, otherwise 1.",
+            },
+            "observable_normalize": {
+                "type": "boolean",
+                "description": "contacts only. True divides by the number of "
+                               "native pairs, turning the count into a "
+                               "fraction on [0, 1] — which is what state "
+                               "thresholds like 0.3 and 0.7 assume. A "
+                               "`contacts` observable whose thresholds are "
+                               "fractions MUST set this: the raw count runs to "
+                               "hundreds and no threshold in [0,1] can ever be "
+                               "crossed. False for every other type.",
             },
             "objective": {
                 "type": "string",
@@ -176,6 +192,7 @@ _TASK_FILE_TOOL: dict[str, Any] = {
             "name", "description", "starting_pdb", "structure_path",
             "forcefield", "padding_nm", "temperature_K", "timestep_fs", "observable_cv_type",
             "observable_selections", "observable_name", "observable_scale",
+            "observable_normalize",
             "objective", "characteristic_timescale_ns", "timescale_source",
             "low_state", "high_state", "min_recrossings", "max_biased_ns",
             "cv_upper_wall_nm",
@@ -214,6 +231,7 @@ def to_document(proposal: dict[str, Any]) -> dict[str, Any]:
             "selections": list(proposal["observable_selections"]),
             "name": proposal["observable_name"],
             "scale": proposal["observable_scale"],
+            "normalize": proposal["observable_normalize"],
         },
         "expectation": {
             "objective": proposal["objective"],
@@ -290,7 +308,14 @@ def propose_task_file(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(rendered)
         try:
-            load_task_file(candidate)
+            task = load_task_file(candidate)
+            # The one check the loader cannot make: it has no structure. Done
+            # here rather than at campaign start so a wrong identifier never
+            # reaches the human who is supposed to be reviewing the science,
+            # and so the retry loop can correct it.
+            preflight.check_pdb_matches_description(
+                task.spec.pdb_id, task.campaign.get("description")
+            )
         except ValueError as e:
             last_error = str(e)
             # A refused tool call is answered with a `tool_result`, not with a

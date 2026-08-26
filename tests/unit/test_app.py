@@ -128,6 +128,11 @@ def test_the_worker_runs_the_campaign_with_the_task_files_arguments(
 
     assert run.finished and run.error is None
     assert run.stop_reason == "max_rounds_reached"
+    # The system the task file describes must reach the engine. Calling
+    # `run_campaign` without an adapter silently falls back to
+    # `SystemSpec.trpcage()`, so a chignolin task file ran 1L2Y for forty
+    # minutes with nothing anywhere indicating the file had been ignored.
+    assert captured["adapter"].spec.pdb_id == "5AWL"
     # Loop-control overrides win; the file still owns what the campaign is.
     assert captured["max_rounds"] == 3
     assert captured["state_thresholds"] == (1.5, 4.0)
@@ -182,3 +187,44 @@ def test_the_log_is_safe_to_write_from_the_campaign_thread(tmp_path: Path) -> No
         w.join(timeout=30)
 
     assert len(run.drain()) == 200
+
+
+# ---------- the viewer must not render anything unasked ----------
+
+def test_the_viewer_starts_idle(tmp_path: Path) -> None:
+    """A fresh page opened onto an animating trajectory from whatever campaign
+    happened to sort last on disk — a run the user had not asked to see and had
+    no context for. Agent-driven mode follows *this session's* campaign; with
+    none, the viewer shows nothing.
+    """
+    from streamlit.testing.v1 import AppTest
+
+    repo = Path(__file__).resolve().parents[2]
+    at = AppTest.from_file(str(repo / "app.py"), default_timeout=180)
+    at.run()
+
+    assert not at.exception, at.exception
+    # The campaign picker is offered; the round picker and the tabs that render
+    # structure and free energy are not reached at all.
+    assert [s.label for s in at.selectbox] == ["Campaign"]
+    assert len(at.tabs) == 0
+    assert any("Idle" in c.value for c in at.caption)
+
+
+def test_choosing_a_campaign_still_renders_it() -> None:
+    """The other half: manual override must actually work."""
+    from streamlit.testing.v1 import AppTest
+
+    repo = Path(__file__).resolve().parents[2]
+    known = sorted(p.name for p in (repo / "campaigns").glob("*")
+                   if (p / "state.db").exists())
+    if not known:
+        pytest.skip("no campaigns on disk to inspect")
+
+    at = AppTest.from_file(str(repo / "app.py"), default_timeout=180)
+    at.run()
+    at.selectbox[0].select(known[-1]).run()
+
+    assert not at.exception, at.exception
+    assert [s.label for s in at.selectbox] == ["Campaign", "Round"]
+    assert len(at.tabs) == 3

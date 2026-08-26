@@ -25,7 +25,7 @@ file and an opportunity for the two references to differ.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import mdtraj as md
 import numpy as np
@@ -55,10 +55,37 @@ class ObservableSpec:
     selections: tuple[str, ...]
     name: str
     scale: float = 1.0
+    # `contacts` only. Divides by the number of native pairs, which is known
+    # when the CV is resolved and not before — so without this a task file
+    # wanting a *fraction* of native contacts has to hard-code a constant tied
+    # to a topology it has not seen. That is exactly how a campaign came to
+    # measure 938-2140 under the name `native_contacts_fraction` against
+    # thresholds of 0.3 and 0.7.
+    normalize: bool = False
+
+    # How many selections each type takes. Pure schema — knowable without a
+    # topology, so it belongs here rather than in `cv_designer`, which only
+    # finds out once a structure has been fetched and solvated.
+    _ARITY: ClassVar[dict[str, int]] = {
+        "distance": 2, "torsion": 4, "gyration": 1, "rmsd": 1, "contacts": 1,
+    }
 
     def __post_init__(self) -> None:
         if not self.selections:
             raise ValueError("ObservableSpec: at least one selection required")
+        expected = self._ARITY.get(self.cv_type)
+        if expected is not None and len(self.selections) != expected:
+            hint = (
+                " `contacts` forms native pairs *within* one atom group, so "
+                "contacts between two strands are expressed as a single "
+                "selection covering both — not as one selection per strand."
+                if self.cv_type == "contacts"
+                else ""
+            )
+            raise ValueError(
+                f"ObservableSpec: cv_type={self.cv_type!r} takes {expected} "
+                f"selection(s), got {len(self.selections)}.{hint}"
+            )
         if not self.name:
             raise ValueError("ObservableSpec: name is required — it labels the "
                              "series in every report and done criterion")
@@ -66,6 +93,26 @@ class ObservableSpec:
             raise ValueError(
                 f"ObservableSpec: scale must be positive (got {self.scale})"
             )
+        if self.normalize and self.cv_type != "contacts":
+            raise ValueError(
+                f"ObservableSpec: normalize applies to cv_type='contacts' "
+                f"(a count with a natural denominator), not "
+                f"{self.cv_type!r}, which has no pair count to divide by."
+            )
+
+    @classmethod
+    def native_contact_fraction(cls, selection: str = "name CA") -> "ObservableSpec":
+        """Fraction of native contacts formed, on [0, 1].
+
+        Bounded on both sides, which is what makes it usable as a folding
+        coordinate — see the `contacts` note in the CV vocabulary.
+        """
+        return cls(
+            cv_type="contacts",
+            selections=(selection,),
+            name="native_contacts_fraction",
+            normalize=True,
+        )
 
     @classmethod
     def ca_rmsd_angstrom(cls) -> "ObservableSpec":
@@ -83,6 +130,7 @@ class ObservableSpec:
             "selections": list(self.selections),
             "name": self.name,
             "scale": self.scale,
+            "normalize": self.normalize,
         }
 
     @classmethod
@@ -92,6 +140,7 @@ class ObservableSpec:
             selections=tuple(data["selections"]),
             name=data["name"],
             scale=float(data.get("scale", 1.0)),
+            normalize=bool(data.get("normalize", False)),
         )
 
 
@@ -131,7 +180,12 @@ def _series(
         traj.topology,
         reference=reference,
     )
-    return cv_series(cv, traj) * spec.scale
+    values = cv_series(cv, traj)
+    if spec.normalize:
+        # `design_cv` already refuses a contacts CV with no native pairs, so
+        # the denominator cannot be zero here.
+        values = values / len(cv.pairs)
+    return values * spec.scale
 
 
 def _resolve_one(
