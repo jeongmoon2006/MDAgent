@@ -237,7 +237,7 @@ def _native_pairs(
     Distances come from ``md.compute_distances``, which applies the minimum
     image convention when the reference carries a unit cell. That matters
     because this is one of *three* places the same pair distance gets measured:
-    here (which pairs are native), in ``bias_designer._cv_series`` (sizing
+    here (which pairs are native), in ``bias_designer.cv_series`` (sizing
     SIGMA), and in PLUMED's own ``CONTACTMAP`` at run time. The other two apply
     PBC, so measuring raw displacements here would define the native set under
     a different convention than the one that evaluates it. The reference is

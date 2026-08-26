@@ -314,7 +314,7 @@ def test_contacts_needs_at_least_two_atoms() -> None:
 
 def test_contacts_pairs_are_measured_under_the_minimum_image_convention() -> None:
     """The native set has to be defined under the same convention that
-    evaluates it. `bias_designer._cv_series` and PLUMED's CONTACTMAP both apply
+    evaluates it. `bias_designer.cv_series` and PLUMED's CONTACTMAP both apply
     PBC, so a pair separated by nearly a box length is a *contact*, not a
     2.4 nm miss. Measuring raw displacements here would silently drop it.
     """

@@ -31,6 +31,111 @@ from typing import Any, Iterator
 
 _DB_FILENAME = "state.db"
 
+# --- campaign config compatibility -----------------------------------------
+#
+# The campaign config is the resume guard: `init_campaign` refuses to reopen a
+# campaign whose parameters have changed, because prior rounds were produced
+# under the old ones. Comparing the serialized JSON byte-for-byte made that
+# guard brittle in one specific way — *adding* a config key stranded every
+# campaign already on disk, since their stored config could not contain a key
+# that did not exist when they started. Four real campaigns were stranded that
+# way before this existed, by the commits that added `state_thresholds` and
+# `min_recrossings`.
+#
+# The fix is to compare *meaning* rather than bytes: fill in, for each key that
+# postdates the campaign table, the value that was in force before that key
+# existed. A campaign that predates a key then resumes when the requested value
+# matches what it actually ran under, and is still refused when it does not.
+#
+# This is read-time normalization only. The stored config is never rewritten —
+# a campaign's record should say what was actually recorded, not what a later
+# version of the code would have written.
+
+# Written since the campaign table existed. Their absence from a stored config
+# is not something that can be interpreted, so it is left to fail loudly.
+_ORIGINAL_CONFIG_KEYS = frozenset({
+    "seed",
+    "initial_steps",
+    "report_interval_steps",
+    "equilibration_steps",
+    "system_spec",
+    "engine",
+})
+
+# Added later. Each maps to the behaviour in force *before* the key existed —
+# not to the parameter's current default, which is a different thing and would
+# be wrong the moment a default changes.
+#
+# `system_spec` is a nested dict and gets its own table below.
+_LEGACY_CONFIG_DEFAULTS: dict[str, Any] = {
+    # Before this, a campaign could not pivot; no expectation was recorded.
+    "task_expectation": None,
+    # Before this, the biased CV was unbounded above (F6).
+    "cv_upper_wall_nm": None,
+    # Before this, recrossings were counted between the two deepest basins of
+    # the current surface rather than against task states (F9).
+    "state_thresholds": None,
+    # Before this, one crossing was enough to satisfy `fes_converged`.
+    "min_recrossings": 1,
+    # Before these, the bias took `bias_designer`'s own defaults; None still
+    # means exactly that, so absent and unset agree.
+    "bias_pace": None,
+    "bias_factor": None,
+    # Before this, the campaign observable was hardcoded to CA-RMSD in
+    # Angstrom. `run_campaign` omits the key when the observable *is* that
+    # default, so absent and unset agree here too.
+    "observable": None,
+}
+
+# Nested under `system_spec`, same rule one level down. These are *historical*
+# values, so they are literals rather than references to the current defaults:
+# what a campaign was actually built with cannot change later, and pointing at
+# a default that has since moved is precisely the bug this prevents.
+#
+# `padding_nm` is why this table exists. `SystemSpec.to_dict` omits a default
+# `ensemble` because its default equals what pre-ensemble campaigns ran under,
+# so absent and default agree. Padding's default was *raised* from 1.0 to 1.5
+# (F11), so absent and default disagree — a pre-F11 campaign was built at 1.0,
+# and resuming it at the new default must be refused, not waved through.
+_LEGACY_SYSTEM_SPEC_DEFAULTS: dict[str, Any] = {
+    "padding_nm": 1.0,
+}
+
+_MISSING = object()
+
+_LEGACY_NOTE = " (not recorded; the behaviour before this key existed)"
+
+
+def _with_legacy_defaults(config: dict[str, Any]) -> dict[str, Any]:
+    """Config as it would read if every later-added key had been recorded."""
+    filled = {**_LEGACY_CONFIG_DEFAULTS, **config}
+    spec = filled.get("system_spec")
+    if isinstance(spec, dict):
+        filled["system_spec"] = {**_LEGACY_SYSTEM_SPEC_DEFAULTS, **spec}
+    return filled
+
+
+def config_differences(
+    stored: dict[str, Any], requested: dict[str, Any]
+) -> dict[str, tuple[Any, Any]]:
+    """Field-level disagreements between two configs, legacy defaults applied.
+
+    Empty means the two describe the same campaign. Returned per field rather
+    than as a boolean so the refusal can name what actually changed instead of
+    printing two JSON blobs and leaving the reader to diff them.
+    """
+    a, b = _with_legacy_defaults(stored), _with_legacy_defaults(requested)
+    return {
+        key: (a.get(key, _MISSING), b.get(key, _MISSING))
+        for key in sorted(set(a) | set(b))
+        if a.get(key, _MISSING) != b.get(key, _MISSING)
+    }
+
+
+def _describe(value: Any) -> str:
+    return "<not recorded>" if value is _MISSING else repr(value)
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS campaign (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -102,7 +207,10 @@ def init_campaign(work_dir: Path, config: dict[str, Any]) -> None:
 
     Idempotent. Raises ``ValueError`` if a campaign already exists with a
     different config — resuming under different parameters would silently
-    invalidate prior rounds.
+    invalidate prior rounds. The comparison is by meaning, not by bytes: keys
+    that postdate the stored campaign are filled with the behaviour that was in
+    force before they existed, so adding a config key does not strand campaigns
+    already on disk. See `_LEGACY_CONFIG_DEFAULTS`.
     """
     work_dir = Path(work_dir)
     config_json = json.dumps(config, sort_keys=True)
@@ -118,11 +226,21 @@ def init_campaign(work_dir: Path, config: dict[str, Any]) -> None:
                 (config_json, _now_iso()),
             )
             return
-        existing = row[0]
-        if existing != config_json:
+        recorded = json.loads(row[0])
+        differences = config_differences(recorded, config)
+        if differences:
+            # A key filled from `_LEGACY_CONFIG_DEFAULTS` is reported with what
+            # the campaign effectively ran under, marked as inferred — printing
+            # it bare would claim a value the campaign never actually stored.
+            detail = "\n".join(
+                f"  {key}: stored={_describe(was)}"
+                + ("" if key in recorded else _LEGACY_NOTE)
+                + f" requested={_describe(now)}"
+                for key, (was, now) in differences.items()
+            )
             raise ValueError(
                 f"campaign at {work_dir} was created with a different config; "
-                f"refusing to resume.\n  existing: {existing}\n  requested: {config_json}"
+                f"refusing to resume. Differing field(s):\n{detail}"
             )
 
 

@@ -314,7 +314,7 @@ def test_a_ceiled_sigma_is_announced_in_the_rendered_input() -> None:
 
 
 def test_contact_count_matches_the_rational_switch_plumed_evaluates() -> None:
-    """`_cv_series` uses the closed form 1/(1+x**NN) where PLUMED evaluates
+    """`cv_series` uses the closed form 1/(1+x**NN) where PLUMED evaluates
     (1-x**NN)/(1-x**MM). They are equal only for MM == 2*NN, and a drift
     between them would size SIGMA against a coordinate the run does not bias.
 
@@ -323,7 +323,7 @@ def test_contact_count_matches_the_rational_switch_plumed_evaluates() -> None:
     This keeps the identity covered in the default environment.
     """
     from mdpilot.adapters.plumed_writer import ContactsCV
-    from mdpilot.sampling.bias_designer import _cv_series
+    from mdpilot.sampling.bias_designer import cv_series
 
     assert ContactsCV.MM == 2 * ContactsCV.NN
 
@@ -339,7 +339,7 @@ def test_contact_count_matches_the_rational_switch_plumed_evaluates() -> None:
     xyz[1, 1, 0] = 2.0 * r0
     traj = md.Trajectory(xyz, top)
 
-    series = _cv_series(ContactsCV(label="q", pairs=((0, 1),), r0_nm=r0), traj)
+    series = cv_series(ContactsCV(label="q", pairs=((0, 1),), r0_nm=r0), traj)
 
     # At r == R_0 the rational switch is 0.5 by construction, whichever form
     # you evaluate; at r == 2*R_0 it is 1/(1+2**6) = 1/65.

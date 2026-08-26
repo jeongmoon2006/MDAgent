@@ -1,8 +1,8 @@
 """GROMACS implementation of `MDAdapter`.
 
 Trp-cage in TIP3P + 0.15 M NaCl, amber99sb-ildn force field, stochastic-
-dynamics integrator (Langevin equivalent) at 300 K, C-rescale barostat at
-1 bar. The system-level parameters intentionally mirror those in
+dynamics integrator (Langevin equivalent), C-rescale barostat at 1 bar.
+Thermostat temperature and timestep come from ``spec.ensemble``. The system-level parameters intentionally mirror those in
 `openmm_adapter` so that the same convergence rubric can be applied to
 trajectories produced by either engine; small force-field-level differences
 (amber99sb-ildn vs amber14-all) are accepted.
@@ -32,18 +32,20 @@ from pathlib import Path
 from openmm import app
 from pdbfixer import PDBFixer
 
+from mdpilot import forcefields
 from mdpilot.adapters.system_spec import SystemSpec
 
-_FORCEFIELD = "amber99sb-ildn"
-_WATER_MODEL = "tip3p"
+# Force field and water come from `spec.forcefield` via
+# `forcefields.for_gromacs`, which refuses a combination this engine
+# cannot build rather than substituting the nearest parameter set.
 _BOX_TYPE = "cubic"
-_PADDING_NM = 1.0
 _SALT_CONC_M = 0.15
-_TEMPERATURE_K = 300.0
 _TAU_T_PS = 1.0          # inverse friction; 1/friction_per_ps with friction = 1 ps^-1
-_TIMESTEP_PS = 0.002     # 2 fs
+# Thermostat temperature (`ref-t`, `annealing-temp`, `gen-temp`) and timestep
+# (`dt`) come from `spec.ensemble` and are rendered into the mdp at run time,
+# so they are locked by the campaign config on resume. They were previously
+# baked into these templates at import, which made them unreachable.
 _CUTOFF_NM = 1.0
-_PRESSURE_BAR = 1.0
 _TAU_P_PS = 2.0
 _COMPRESSIBILITY = 4.5e-5   # bar^-1, water
 # Equilibration mirrors the OpenMM adapter: 50 K -> 300 K ramp under the same
@@ -56,7 +58,17 @@ _NVT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
 _NPT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
 _EM_MAX_STEPS = 50_000
 _EM_TOLERANCE = 100.0
-_GMX_TIMEOUT_SECONDS = 1800.0
+# Wall-clock ceiling for *setup* subcommands only (pdb2gmx, editconf, solvate,
+# grompp, genion). Those are seconds of work, so half an hour past means
+# something is genuinely stuck — historically, a subcommand waiting on stdin.
+#
+# `mdrun` deliberately runs untimed. A production round can legitimately take
+# hours on CPU, and a ceiling that fires kills MD already paid for, mid-round,
+# leaving a partial .gro/.cpt — the opposite of what a safety timeout is for.
+# The campaign loop is the supervisor here, and walltime planning is M5's job
+# (`execution/walltime_planner.py`), not a constant in this file.
+_GMX_SETUP_TIMEOUT_SECONDS = 1800.0
+_NO_TIMEOUT: float | None = None
 
 
 _EM_MDP = f"""\
@@ -90,7 +102,7 @@ pbc           = xyz
 _NVT_MDP_TEMPLATE = f"""\
 ; equilibration stage 1 — staged heating, NVT, Langevin (sd) integrator
 integrator           = sd
-dt                   = {_TIMESTEP_PS}
+dt                   = {{dt_ps}}
 nsteps               = {{nsteps}}
 
 nstxout              = 0
@@ -101,13 +113,13 @@ nstenergy            = 500
 
 tc-grps              = System
 tau-t                = {_TAU_T_PS}
-ref-t                = {_TEMPERATURE_K}
+ref-t                = {{ref_t}}
 
-; ramp {_HEAT_START_K:g} K -> {_TEMPERATURE_K:g} K across the whole stage
+; ramp {_HEAT_START_K:g} K -> {{ref_t}} K across the whole stage
 annealing            = single
 annealing-npoints    = 2
 annealing-time       = 0 {{anneal_ps}}
-annealing-temp       = {_HEAT_START_K} {_TEMPERATURE_K}
+annealing-temp       = {_HEAT_START_K} {{ref_t}}
 
 constraints          = h-bonds
 constraint-algorithm = LINCS
@@ -132,7 +144,7 @@ continuation         = no
 _NPT_MDP_TEMPLATE = f"""\
 ; equilibration stage 2 — density relaxation, NPT, C-rescale barostat
 integrator           = sd
-dt                   = {_TIMESTEP_PS}
+dt                   = {{dt_ps}}
 nsteps               = {{nsteps}}
 
 nstxout              = 0
@@ -143,12 +155,12 @@ nstenergy            = 500
 
 tc-grps              = System
 tau-t                = {_TAU_T_PS}
-ref-t                = {_TEMPERATURE_K}
+ref-t                = {{ref_t}}
 
 pcoupl               = C-rescale
 pcoupltype           = isotropic
 tau-p                = {_TAU_P_PS}
-ref-p                = {_PRESSURE_BAR}
+ref-p                = {{ref_p}}
 compressibility      = {_COMPRESSIBILITY}
 
 constraints          = h-bonds
@@ -172,7 +184,7 @@ continuation         = yes
 _MD_MDP_TEMPLATE = f"""\
 ; production MD, NPT, Langevin (sd) integrator + C-rescale barostat
 integrator           = sd
-dt                   = {_TIMESTEP_PS}
+dt                   = {{dt_ps}}
 nsteps               = {{nsteps}}
 
 nstxout-compressed   = {{report_interval}}
@@ -185,12 +197,12 @@ nstfout              = 0
 
 tc-grps              = System
 tau-t                = {_TAU_T_PS}
-ref-t                = {_TEMPERATURE_K}
+ref-t                = {{ref_t}}
 
 pcoupl               = C-rescale
 pcoupltype           = isotropic
 tau-p                = {_TAU_P_PS}
-ref-p                = {_PRESSURE_BAR}
+ref-p                = {{ref_p}}
 compressibility      = {_COMPRESSIBILITY}
 
 constraints          = h-bonds
@@ -216,9 +228,14 @@ def _run_gmx(
     *args: str,
     cwd: Path,
     input_text: str | None = None,
-    timeout: float = _GMX_TIMEOUT_SECONDS,
+    timeout: float | None = _GMX_SETUP_TIMEOUT_SECONDS,
 ) -> str:
-    """Invoke `gmx <args>` in cwd; raise with stderr tail on non-zero exit."""
+    """Invoke `gmx <args>` in cwd; raise with stderr tail on non-zero exit.
+
+    `timeout=None` disables the ceiling, which is what every `mdrun` call
+    passes: see `_GMX_SETUP_TIMEOUT_SECONDS` for why dynamics must not be
+    killed on a clock.
+    """
     cmd = ["gmx", *args]
     result = subprocess.run(
         cmd,
@@ -241,7 +258,8 @@ def _run_gmx(
 class GROMACSAdapter:
     """MDAdapter: subprocess-driven GROMACS execution. System chosen by
     SystemSpec; the forcefield/water/integrator choices stay hardcoded
-    (amber99sb-ildn, TIP3P, sd at 300 K, 2 fs, C-rescale barostat at 1 bar).
+    (amber99sb-ildn, TIP3P, sd, C-rescale barostat at 1 bar); temperature and
+    timestep come from ``spec.ensemble``, box padding from ``spec.padding_nm``.
 
     ``nvt_steps`` / ``npt_steps`` size the two equilibration stages. Setting
     *both* to 0 skips equilibration entirely and falls back to the legacy
@@ -272,17 +290,23 @@ class GROMACSAdapter:
         self._started = False
 
     @property
+    def _timestep_ps(self) -> float:
+        """The mdp `dt`. GROMACS states the timestep in picoseconds; the
+        `MDAdapter` contract states it in femtoseconds. One conversion, here."""
+        return self._spec.ensemble.timestep_fs / 1000.0
+
+    @property
     def spec(self) -> SystemSpec:
         return self._spec
 
     @property
     def timestep_fs(self) -> float:
         # GROMACS states `dt` in picoseconds; the Protocol is in femtoseconds.
-        return _TIMESTEP_PS * 1000.0
+        return self._spec.ensemble.timestep_fs
 
     @property
     def temperature_k(self) -> float:
-        return _TEMPERATURE_K
+        return self._spec.ensemble.temperature_k
 
     @property
     def trajectory_extension(self) -> str:
@@ -341,15 +365,18 @@ class GROMACSAdapter:
             self._started = True
             return
 
-        # pdb2gmx: parameterize + add hydrogens consistent with chosen FF
+        # pdb2gmx: parameterize + add hydrogens consistent with chosen FF.
+        # Resolved before any subprocess runs, so a combination this engine
+        # cannot build is refused before setup is paid for rather than after.
+        gmx_forcefield, gmx_water = forcefields.for_gromacs(self._spec.forcefield)
         _run_gmx(
             "pdb2gmx",
             "-f", str(self._pdb_path),
             "-o", "processed.gro",
             "-p", "topol.top",
             "-i", "posre.itp",
-            "-ff", _FORCEFIELD,
-            "-water", _WATER_MODEL,
+            "-ff", gmx_forcefield,
+            "-water", gmx_water,
             "-ignh",  # ignore hydrogens from input; let pdb2gmx add the right ones
             cwd=self._setup_dir,
         )
@@ -359,7 +386,7 @@ class GROMACSAdapter:
             "-f", "processed.gro",
             "-o", "boxed.gro",
             "-c",
-            "-d", str(_PADDING_NM),
+            "-d", str(self._spec.padding_nm),
             "-bt", _BOX_TYPE,
             cwd=self._setup_dir,
         )
@@ -410,6 +437,7 @@ class GROMACSAdapter:
             "mdrun",
             "-deffnm", "em",
             "-ntmpi", "1",
+            timeout=_NO_TIMEOUT,
             cwd=self._setup_dir,
         )
 
@@ -455,6 +483,9 @@ class GROMACSAdapter:
                 nsteps=n_steps,
                 report_interval=(report_interval_steps if trajectory_path is not None else 0),
                 seed=self._seed,
+                ref_t=self.temperature_k,
+                ref_p=self._spec.ensemble.pressure_bar,
+                dt_ps=self._timestep_ps,
             )
         )
 
@@ -479,7 +510,10 @@ class GROMACSAdapter:
                 nsteps=n_steps,
                 report_interval=(report_interval_steps if trajectory_path is not None else 0),
                 seed=self._seed,
-            ).replace("gen-vel              = no", f"gen-vel              = yes\ngen-temp             = {_TEMPERATURE_K}\ngen-seed             = {self._seed}") \
+                ref_t=self.temperature_k,
+                ref_p=self._spec.ensemble.pressure_bar,
+                dt_ps=self._timestep_ps,
+            ).replace("gen-vel              = no", f"gen-vel              = yes\ngen-temp             = {self.temperature_k}\ngen-seed             = {self._seed}") \
              .replace("continuation         = yes", "continuation         = no")
             mdp_path.write_text(cold_mdp)
         _run_gmx(*grompp_args, cwd=run_dir)
@@ -490,7 +524,7 @@ class GROMACSAdapter:
             "-deffnm", tag,
             "-ntmpi", "1",
         ]
-        _run_gmx(*mdrun_args, cwd=run_dir)
+        _run_gmx(*mdrun_args, cwd=run_dir, timeout=_NO_TIMEOUT)
 
         produced_xtc = run_dir / f"{tag}.xtc"
         if trajectory_path is not None:
@@ -542,8 +576,10 @@ class GROMACSAdapter:
 
         (self._setup_dir / "nvt.mdp").write_text(
             _NVT_MDP_TEMPLATE.format(
+                ref_t=self.temperature_k,
+                dt_ps=self._timestep_ps,
                 nsteps=nvt_steps,
-                anneal_ps=f"{nvt_steps * _TIMESTEP_PS:g}",
+                anneal_ps=f"{nvt_steps * self._timestep_ps:g}",
                 seed=self._seed,
             )
         )
@@ -556,10 +592,19 @@ class GROMACSAdapter:
             "-maxwarn", "1",
             cwd=self._setup_dir,
         )
-        _run_gmx("mdrun", "-deffnm", "nvt", "-ntmpi", "1", cwd=self._setup_dir)
+        _run_gmx(
+            "mdrun", "-deffnm", "nvt", "-ntmpi", "1",
+            cwd=self._setup_dir, timeout=_NO_TIMEOUT,
+        )
 
         (self._setup_dir / "npt.mdp").write_text(
-            _NPT_MDP_TEMPLATE.format(nsteps=npt_steps, seed=self._seed)
+            _NPT_MDP_TEMPLATE.format(
+                nsteps=npt_steps,
+                seed=self._seed,
+                ref_t=self.temperature_k,
+                ref_p=self._spec.ensemble.pressure_bar,
+                dt_ps=self._timestep_ps,
+            )
         )
         # -t carries velocities and RNG state out of the heating stage.
         _run_gmx(
@@ -572,7 +617,10 @@ class GROMACSAdapter:
             "-maxwarn", "1",
             cwd=self._setup_dir,
         )
-        _run_gmx("mdrun", "-deffnm", "npt", "-ntmpi", "1", cwd=self._setup_dir)
+        _run_gmx(
+            "mdrun", "-deffnm", "npt", "-ntmpi", "1",
+            cwd=self._setup_dir, timeout=_NO_TIMEOUT,
+        )
 
     def _final_setup_tag(self) -> str:
         """Basename of the last setup stage — the NPT equilibration, or the

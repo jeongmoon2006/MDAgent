@@ -13,27 +13,37 @@ description: |
 
 system:
   starting_pdb: "1L2Y"        # downloaded via PDBFixer
-  forcefield: ["amber14-all.xml", "amber14/tip3p.xml"]
-  water_model: tip3p
-  padding_nm: 1.0
+  forcefield: amber14/tip3p       # a validated protein+water pair; see mdpilot.forcefields
+  padding_nm: 1.5              # raised from 1.0 after F11 (periodic self-interaction)
   ionic_strength_M: 0.15
+  nonbonded_cutoff_nm: 1.0     # checked against the adapter
+  electrostatics: PME
 
 integrator:
-  type: LangevinMiddle
+  # Thermodynamic state — real parameters.
   temperature_K: 300.0
-  friction_per_ps: 1.0
+  pressure_bar: 1.0
   timestep_fs: 2.0
+  # Coupling algorithms and nonbonded treatment: declared here and checked
+  # against what the engine actually does, so the file cannot drift from the
+  # run. Not yet choosable — OpenMM's LangevinMiddle / MonteCarloBarostat are
+  # idiomatic equivalents of GROMACS's sd / C-rescale, not interchangeable.
+  type: LangevinMiddle
+  friction_per_ps: 1.0
+  barostat: MonteCarloBarostat
+  barostat_interval_steps: 25
   constraints: HBonds
 
 observable:
+  cv_type: rmsd
+  selections: ["protein and name CA"]
   name: rmsd_ca_to_reference_angstrom
-  selection: "protein and name CA"
+  scale: 10.0                    # mdtraj returns nm; thresholds here are Angstrom
   reference: campaign_topology   # post-equilibration structure, constant across rounds
 
 diagnostics:
-  - block_averaging
-  - autocorrelation
-  target_ess: 50
+  methods: [block_averaging, autocorrelation]
+  target_ess: 50            # must match autocorrelation()'s own default
 
 # Done criterion (per ROADMAP.md, Milestone 1):
 # Scientist correctly says "extend" on a planted under-converged trajectory

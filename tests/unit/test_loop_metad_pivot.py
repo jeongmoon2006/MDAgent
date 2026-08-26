@@ -22,6 +22,19 @@ from mdpilot.orchestrator.loop import run_campaign
 from mdpilot.orchestrator.scientist import Decision, MetadProposal
 
 
+# A real (if tiny) topology, not a marker file. `run_campaign`'s pre-flight
+# loads this and computes the campaign observable on it before any dynamics,
+# so a fake that writes "PDB" would exercise a path no real adapter takes.
+# Four alanines in a line: enough CA atoms for an rmsd observable to resolve.
+_MINIMAL_PDB = "".join(
+    f"ATOM  {i * 2 + 1:>5d}  N   ALA A{i + 1:>4d}    "
+    f"{i * 3.8:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           N\n"
+    f"ATOM  {i * 2 + 2:>5d}  CA  ALA A{i + 1:>4d}    "
+    f"{i * 3.8 + 1.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C\n"
+    for i in range(4)
+) + "END\n"
+
+
 class _FakeAdapter:
     """Minimal MDAdapter that writes marker files and records calls."""
 
@@ -70,7 +83,7 @@ class _FakeAdapter:
     def start(self) -> None:
         self.started = True
         self._topology_path.parent.mkdir(parents=True, exist_ok=True)
-        self._topology_path.write_text("PDB")
+        self._topology_path.write_text(_MINIMAL_PDB)
 
     def run_steps(self, n_steps, *, trajectory_path=None, report_interval_steps=500):
         self.run_calls.append(n_steps)
@@ -923,7 +936,7 @@ def test_inverted_state_thresholds_are_refused(
     so a swapped pair would read as a campaign that never crossed."""
     _stub_collaborators(monkeypatch, [_stop()])
 
-    with pytest.raises(ValueError, match="extended > folded"):
+    with pytest.raises(ValueError, match="high > low"):
         run_campaign(
             work_dir=tmp_path / "campaign",
             adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
@@ -1039,3 +1052,163 @@ def test_biased_phase_uses_the_adapter_thermostat_temperature(
     )
 
     assert seen == {"build": 277.0, "report": 277.0}
+
+
+# ---------- bias shape overrides ----------
+#
+# PACE and BIASFACTOR were already keyword arguments on `design_bias`; the loop
+# simply never passed them, so no campaign could change the shape of its own
+# bias. These pin the threading and the resume lock that has to come with it.
+
+def _two_atom_traj(tmp_path: Path) -> tuple[Path, Path]:
+    import mdtraj as md
+    import numpy as np
+
+    top = md.Topology()
+    res = top.add_residue("ALA", top.add_chain(), resSeq=1)
+    top.add_atom("A", md.element.carbon, res)
+    top.add_atom("B", md.element.carbon, res)
+    xyz = np.zeros((20, 2, 3))
+    xyz[:, 1, 0] = np.linspace(0.9, 1.4, 20)   # a real, non-degenerate spread
+    traj = md.Trajectory(xyz=xyz.astype(np.float32), topology=top)
+    pdb, dcd = tmp_path / "top.pdb", tmp_path / "traj.dcd"
+    traj[0].save_pdb(str(pdb))
+    traj.save_dcd(str(dcd))
+    return dcd, pdb
+
+
+def _render(tmp_path: Path, **overrides) -> str:
+    from mdpilot.orchestrator.loop import _build_plumed_input
+
+    dcd, pdb = _two_atom_traj(tmp_path)
+    return _build_plumed_input(
+        MetadProposal(cv_type="distance", selections=("name A", "name B"), label="d"),
+        dcd,
+        pdb,
+        tmp_path.resolve(),
+        temperature_k=300.0,
+        **overrides,
+    )
+
+
+def test_bias_overrides_reach_the_rendered_plumed_dat(tmp_path: Path) -> None:
+    rendered = _render(tmp_path, bias_pace=200, bias_factor=15.0)
+
+    assert "PACE=200" in rendered
+    assert "BIASFACTOR=15" in rendered
+
+
+def test_unset_bias_overrides_leave_the_designer_defaults(tmp_path: Path) -> None:
+    """None means "let bias_designer decide" — the loop must not restate its
+    defaults, or the two drift apart silently."""
+    from mdpilot.sampling.bias_designer import _DEFAULT_BIAS_FACTOR, _DEFAULT_PACE
+
+    rendered = _render(tmp_path)
+
+    assert f"PACE={_DEFAULT_PACE}" in rendered
+    assert f"BIASFACTOR={_DEFAULT_BIAS_FACTOR:g}" in rendered
+
+
+def test_bias_shape_locks_into_the_campaign_config_only_when_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Biased-phase physics, so it has to lock — but adding the keys
+    unconditionally would break resume for every campaign predating them."""
+    from mdpilot.memory import store
+
+    for kwargs, expected in (
+        ({}, False),
+        ({"bias_factor": 15.0}, True),
+    ):
+        work = tmp_path / f"c{int(expected)}"
+        _stub_collaborators(monkeypatch, [_stop()])
+        adapter = _FakeAdapter(work, spec=SystemSpec.trpcage())
+        run_campaign(
+            work_dir=work, adapter=adapter, max_rounds=1, **_run_kwargs(), **kwargs
+        )
+        config = store.get_campaign_config(work)
+        assert ("bias_factor" in config) is expected, kwargs
+
+
+def test_every_config_key_is_covered_by_the_compatibility_table(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Forget-proofing for the resume guard.
+
+    Adding a key to the campaign config without a compatibility entry silently
+    strands every campaign already on disk — the bug `_LEGACY_CONFIG_DEFAULTS`
+    exists to prevent, and one that had already cost four real campaigns before
+    it existed. If this fails, add the new key to
+    `store._LEGACY_CONFIG_DEFAULTS` with the behaviour that was in force
+    *before* the key existed, which is not necessarily its current default.
+    """
+    from mdpilot.memory import store
+    from mdpilot.memory.store import _LEGACY_CONFIG_DEFAULTS, _ORIGINAL_CONFIG_KEYS
+    from mdpilot.observables import ObservableSpec
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        max_rounds=1,
+        # Every optional parameter set, so the recorded config is the widest
+        # one run_campaign can produce.
+        task_expectation="fold it",
+        state_thresholds=(1.0, 2.0),
+        min_recrossings=2,
+        cv_upper_wall_nm=0.8,
+        bias_pace=200,
+        bias_factor=15.0,
+        observable=ObservableSpec(
+            cv_type="gyration", selections=("name CA",), name="rg_nm"
+        ),
+        **_run_kwargs(),
+    )
+
+    recorded = set(store.get_campaign_config(tmp_path))
+    uncovered = recorded - _ORIGINAL_CONFIG_KEYS - set(_LEGACY_CONFIG_DEFAULTS)
+    assert not uncovered, (
+        f"config key(s) {sorted(uncovered)} have no compatibility entry in "
+        f"store._LEGACY_CONFIG_DEFAULTS; campaigns already on disk would be "
+        f"stranded by them"
+    )
+
+
+def test_the_real_task_file_drives_the_loop_and_reopens_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The seam between `task_file` and `run_campaign`, which nothing else
+    covers: the two were built separately and only met in a benchmark script.
+
+    Also the round trip that matters operationally — the same task file must
+    reopen its own campaign, which is only true if the rendered
+    `task_expectation` is deterministic.
+    """
+    from mdpilot.memory import store
+    from mdpilot.task_file import load_task_file
+
+    task = load_task_file(Path("benchmarks/tasks/cln025_folding.yaml"))
+    kwargs = task.run_kwargs(
+        max_extra_ns=2.0, seed=42, initial_steps=100,
+        report_interval_steps=50, equilibration_steps=0, max_rounds=1,
+    )
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=task.spec),
+        **kwargs,
+    )
+    assert result.stop_reason == "scientist_said_stop"
+
+    config = store.get_campaign_config(tmp_path)
+    assert config["state_thresholds"] == [1.5, 4.0]
+    assert config["min_recrossings"] == 2
+    assert config["task_expectation"] == kwargs["task_expectation"]
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=task.spec),
+        **kwargs,
+    )

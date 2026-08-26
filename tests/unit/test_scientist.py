@@ -523,3 +523,60 @@ def test_retrieval_shortens_the_prompt_against_sending_everything() -> None:
             phase, can_propose_cv=propose, allow_cv_switch=switch
         )
         assert len(got) < len(widest)
+
+
+# ---------- the prompt names only actions the round's enum offers ----------
+#
+# Chunks are shared across variants, so a rule written for one round's action
+# space travels into rounds that do not have it. Both tests below read the
+# enum off the tool actually sent and check the prose against it, rather than
+# restating which actions each variant has.
+
+def _paragraph_containing(text: str, needle: str) -> str:
+    """The blank-line block stating one rule. Matched case-insensitively so the
+    test survives a rewording of the sentence and still checks the rule."""
+    for block in text.split("\n\n"):
+        if needle.lower() in block.lower():
+            return block
+    raise AssertionError(f"no paragraph containing {needle!r} in:\n{text}")
+
+
+def _decision_enum(fake: _FakeClient) -> list[str]:
+    assert fake.last_request is not None
+    schema = fake.last_request["tools"][0]["input_schema"]
+    return schema["properties"]["decision"]["enum"]
+
+
+def test_the_proposal_instruction_names_the_action_the_round_can_take() -> None:
+    """`cv_vocabulary` is shared by both proposal-carrying rounds. Naming only
+    `switch_to_metad` told a biased round to populate `metad_proposal` on an
+    action `phase_metad` had just called permanently unavailable."""
+    for kwargs, action in (
+        ({"task_expectation": "fold it"}, "switch_to_metad"),
+        ({"phase": "metad", "allow_cv_switch": True}, "switch_cv"),
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        assert action in _decision_enum(fake), kwargs
+        rule = _paragraph_containing(_system_text(fake), "populate `metad_proposal`")
+        assert f"`{action}`" in rule, (kwargs, rule)
+
+
+def test_every_non_extending_action_is_told_to_null_extra_ns() -> None:
+    """`extra_ns` is meaningful only on an extend, and the loop ignores it
+    otherwise — but the rule listed `stop` and `switch_to_metad` only, so a
+    `switch_cv` round was given no instruction and could persist a number that
+    means nothing."""
+    for kwargs in (
+        {"task_expectation": "fold it"},
+        {},
+        {"phase": "metad"},
+        {"phase": "metad", "allow_cv_switch": True},
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        rule = _paragraph_containing(_system_text(fake), "`extra_ns` must be null")
+        for action in _decision_enum(fake):
+            if action == "extend":
+                continue
+            assert f"`{action}`" in rule, (kwargs, action, rule)

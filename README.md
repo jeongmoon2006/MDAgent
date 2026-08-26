@@ -66,10 +66,30 @@ First call fetches PDB 1L2Y, solvates, minimizes and equilibrates; the state is
 cached, so later calls on the same `work_dir` skip straight to dynamics.
 Per-round artifacts land in `campaigns/demo/rounds/`.
 
+## Web app
+
+A three-column control surface: draft a campaign from a sentence, watch the
+scientist decide, inspect what it produced.
+
+```sh
+micromamba run -n mdpilot pip install -e ".[ui]"
+micromamba run -n mdpilot streamlit run app.py
+```
+
+Run it in the conda environment — the app starts real campaigns, so it needs
+the same PLUMED-capable environment metadynamics does. The left column calls
+the setup agent (needs `ANTHROPIC_API_KEY`); the middle streams
+`run_campaign`'s event log; the right renders trajectories and free-energy
+surfaces straight out of `campaigns/`. It starts idle and follows whichever
+campaign you lock; pick one from its dropdown to inspect an earlier run.
+
+Run bounds in the left column default to shakedown sizes on purpose — a click
+should not start a 20 ns campaign.
+
 ## Tests
 
 ```sh
-pytest tests/unit          # 239 tests, ~14 s — no API key, no MD
+pytest tests/unit          # 349 tests, ~5 s — no API key, no MD
 pytest tests/integration   # live MD; PLUMED and API-key tests skip if unavailable
 ```
 

@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 
 from mdpilot.diagnostics.free_energy import plumed_available
-from mdpilot.sampling.bias_designer import _cv_series
+from mdpilot.sampling.bias_designer import cv_series
 from mdpilot.sampling.cv_designer import CVProposal, design_cv
 
 _FIXED_PDB = Path("benchmarks/data/trpcage/1L2Y_fixed.pdb")
@@ -113,7 +113,7 @@ def test_python_and_plumed_agree_on_the_contact_count(tmp_path: Path) -> None:
     both = md.join([native[0], extended])
 
     from_plumed = _drive(cv, both, tmp_path / "both")
-    from_python = _cv_series(cv, both)
+    from_python = cv_series(cv, both)
 
     assert from_plumed.size == both.n_frames
     # atol as well as rtol: the extended frame sits at Q ~ 1e-13, where a

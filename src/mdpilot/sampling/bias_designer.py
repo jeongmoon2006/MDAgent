@@ -123,7 +123,7 @@ def design_bias(
     per-CV-type floor.
     """
     traj = md.load(str(trajectory_path), top=str(topology_path))
-    series = _cv_series(cv, traj)
+    series = cv_series(cv, traj)
     spread = _spread(cv, series)
     sigma, floored, ceiled = size_sigma(cv, spread)
     height = _HEIGHT_KT_FRACTION * _KB_KJ_PER_MOL_K * temperature_k
@@ -177,8 +177,14 @@ def size_sigma(cv: CV, spread: float) -> tuple[float, bool, bool]:
     return measured, False, False
 
 
-def _cv_series(cv: CV, traj: md.Trajectory) -> np.ndarray:
-    """Per-frame CV value using the mdtraj primitive matching the CV type."""
+def cv_series(cv: CV, traj: md.Trajectory) -> np.ndarray:
+    """Per-frame CV value using the mdtraj primitive matching the CV type.
+
+    Public because `mdpilot.observables` computes the campaign observable with
+    it. The bias is sized from a coordinate and the campaign is judged on a
+    coordinate; those must be the same computation or the two disagree with
+    nothing to catch it.
+    """
     if isinstance(cv, DistanceCV):
         return md.compute_distances(traj, np.array([cv.atoms]))[:, 0]
     if isinstance(cv, TorsionCV):

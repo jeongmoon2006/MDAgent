@@ -1,7 +1,9 @@
 """Run the Milestone-4 done-criterion campaign: CLN025 folding via metadynamics.
 
-Reads `benchmarks/tasks/cln025_folding.yaml` for the task expectation and the
-done criterion, then drives `run_campaign` through the OpenMM adapter.
+Reads `benchmarks/tasks/cln025_folding.yaml` through `mdpilot.task_file`,
+which maps the tunable fields onto `run_campaign` arguments and *checks* the
+ones that are declared but not yet tunable against the constants that really
+govern them. Then drives the campaign through the OpenMM adapter.
 
 Must be launched inside the conda environment, and via `micromamba run` rather
 than by calling the environment's python directly — `metad_report` shells out to
@@ -31,90 +33,83 @@ from typing import Any
 
 import mdtraj as md
 import numpy as np
-import yaml
 
-from mdpilot.adapters.openmm_adapter import OpenMMAdapter
-from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.diagnostics.free_energy import count_recrossings
 from mdpilot.orchestrator.loop import CampaignResult, run_campaign, steps_per_ns_for
+from mdpilot.task_file import TaskFile, load_task_file
 
 _TASK_FILE = Path("benchmarks/tasks/cln025_folding.yaml")
 
 
-def load_task(path: Path = _TASK_FILE) -> dict[str, Any]:
-    return yaml.safe_load(path.read_text())
+def load_task(path: Path = _TASK_FILE) -> TaskFile:
+    return load_task_file(path)
 
 
-def run(
-    task: dict[str, Any], work_dir: Path, *, dry_run: bool
-) -> tuple[CampaignResult, int]:
+def run(task: TaskFile, work_dir: Path, *, dry_run: bool) -> tuple[CampaignResult, int]:
     """Drive the campaign; return the result and the engine's steps-per-ns.
 
-    The conversion comes back with the result because the caller reports round
-    lengths in nanoseconds, and it is the adapter — not this file — that knows
-    the timestep.
-    """
-    criterion = task["done_criterion"]
+    The split is deliberate: the *task file* owns everything that defines what
+    the campaign is — system, ensemble, expectation, state thresholds, wall,
+    biased budget — and this runner owns only loop-control bounds, which may
+    differ between a dry run and the real thing. `task.run_kwargs` merges the
+    two and checks every key against `run_campaign`'s signature.
 
-    adapter = OpenMMAdapter(
-        work_dir=work_dir, seed=42, spec=SystemSpec(pdb_id=task["system"]["starting_pdb"])
-    )
+    The steps-per-ns conversion comes back with the result because the caller
+    reports round lengths in nanoseconds, and it is the adapter — not this
+    file — that knows the timestep.
+    """
+    adapter = task.build_adapter(work_dir, seed=42)
     steps_per_ns = steps_per_ns_for(adapter)
 
     if dry_run:
         # Short enough to fail fast, long enough that the diagnostics have
-        # something to chew on. 0.05 ns vanilla, 0.1 ns of biased budget.
-        initial_steps, max_biased_ns, max_rounds = 25_000, 0.1, 4
-        report_interval_steps = 100          # 0.2 ps/frame -> 250 frames
+        # something to chew on. 0.05 ns vanilla, 0.1 ns of biased budget —
+        # the budget override deliberately undercuts the file's 20 ns.
+        overrides = dict(
+            initial_steps=25_000,
+            report_interval_steps=100,       # 0.2 ps/frame -> 250 frames
+            max_rounds=4,
+            max_biased_ns=0.1,
+        )
     else:
-        initial_steps = 1 * steps_per_ns     # 1 ns vanilla, and the first biased round
-        max_biased_ns = float(criterion["max_biased_ns"])
-        # The budget, not this, is meant to be the real bound. Raised from 15
-        # once `switch_cv` landed: a CV switch spends an extra round at
-        # `initial_steps` and restarts the extend cadence, so a campaign that
-        # revises its coordinate can reach the round cap with budget unspent.
-        max_rounds = 20
-        report_interval_steps = 500          # 1 ps/frame
+        overrides = dict(
+            initial_steps=1 * steps_per_ns,  # 1 ns vanilla, and the first biased round
+            report_interval_steps=500,       # 1 ps/frame
+            # The budget, not this, is meant to be the real bound. Raised from
+            # 15 once `switch_cv` landed: a CV switch spends an extra round at
+            # `initial_steps` and restarts the extend cadence, so a campaign
+            # that revises its coordinate can reach the round cap with budget
+            # unspent.
+            max_rounds=20,
+        )
 
     result = run_campaign(
         work_dir=work_dir,
         adapter=adapter,
-        initial_steps=initial_steps,
-        report_interval_steps=report_interval_steps,
-        max_rounds=max_rounds,
-        max_extra_ns=2.0,
-        max_biased_ns=max_biased_ns,
-        min_recrossings=int(criterion["min_recrossings"]),
-        # Count recrossings between the states the task defines, on the
-        # coordinate it defines them on, rather than between whichever two
-        # basins are currently deepest on the biased surface. Same thresholds
-        # `verify_done_criterion` uses below, so the number the scientist sees
-        # each round is the number that decides the criterion.
-        state_thresholds=(
-            float(criterion["folded_state_rmsd_angstrom"]),
-            float(criterion["extended_state_rmsd_angstrom"]),
-        ),
-        cv_upper_wall_nm=task.get("sampling", {}).get("cv_upper_wall_nm"),
-        task_expectation=task["task_expectation"],
-        seed=42,
+        **task.run_kwargs(max_extra_ns=2.0, seed=42, **overrides),
     )
     return result, steps_per_ns
 
 
 def verify_done_criterion(
-    result: CampaignResult, task: dict[str, Any], steps_per_ns: int
+    result: CampaignResult, task: TaskFile, steps_per_ns: int
 ) -> dict[str, Any]:
-    """Check the campaign against the task's CA-RMSD criterion, post-hoc.
+    """Check the campaign against the task's own state definitions, post-hoc.
 
     The loop judges the biased phase along the CV the scientist proposed. This
     asks the separate question the task actually poses: did the system visit
-    both the extended (CA-RMSD > 4.0 A) and native (< 1.5 A) states, and did it
-    come back? Concatenating the biased rounds in order gives the whole biased
-    trajectory, so a crossing that straddles a round boundary still counts.
+    both states the task names, and did it come back? Concatenating the biased
+    rounds in order gives the whole biased trajectory, so a crossing that
+    straddles a round boundary still counts.
+
+    The thresholds come from `task.campaign["state_thresholds"]` — the same
+    tuple the loop was given — rather than being re-read from the criterion, so
+    the post-hoc check and the in-loop count cannot be taken against different
+    bands.
     """
-    criterion = task["done_criterion"]
-    lo = float(criterion["folded_state_rmsd_angstrom"])
-    hi = float(criterion["extended_state_rmsd_angstrom"])
+    criterion = task.done_criterion
+    lo, hi = task.campaign["state_thresholds"]
+    states = criterion["states"]
 
     biased = [r for r in result.rounds if r.plumed_dat_path is not None]
     pivoted = any(r.decision.decision == "switch_to_metad" for r in result.rounds)
@@ -126,13 +121,16 @@ def verify_done_criterion(
 
     return {
         "pivoted": pivoted,
+        "states": {
+            "low": {**states["low"], "reached": bool(rmsd.size and rmsd.min() < lo)},
+            "high": {**states["high"], "reached": bool(rmsd.size and rmsd.max() > hi)},
+        },
+        "observable": task.observable_name,
         "n_biased_rounds": len(biased),
         "biased_ns": sum(r.n_steps for r in biased) / steps_per_ns,
-        "rmsd_min_angstrom": float(rmsd.min()) if rmsd.size else None,
-        "rmsd_max_angstrom": float(rmsd.max()) if rmsd.size else None,
-        "reached_folded": bool(rmsd.size and rmsd.min() < lo),
-        "reached_extended": bool(rmsd.size and rmsd.max() > hi),
-        "rmsd_recrossings": recrossings,
+        "observable_min": float(rmsd.min()) if rmsd.size else None,
+        "observable_max": float(rmsd.max()) if rmsd.size else None,
+        "recrossings": recrossings,
         "min_recrossings_required": int(criterion["min_recrossings"]),
         "passed": bool(
             pivoted and recrossings >= int(criterion["min_recrossings"])
@@ -181,7 +179,7 @@ def main() -> None:
             print(f"      CV: {r.decision.metad_proposal.to_dict()}")
 
     verdict = verify_done_criterion(result, task, steps_per_ns)
-    print("\n=== done criterion (CA-RMSD, post-hoc) ===")
+    print(f"\n=== done criterion ({task.observable_name}, post-hoc) ===")
     print(json.dumps(verdict, indent=2))
     (work_dir / "done_criterion.json").write_text(json.dumps(verdict, indent=2))
 
