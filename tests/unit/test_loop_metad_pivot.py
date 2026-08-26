@@ -1115,3 +1115,87 @@ def test_bias_shape_locks_into_the_campaign_config_only_when_set(
         )
         config = store.get_campaign_config(work)
         assert ("bias_factor" in config) is expected, kwargs
+
+
+def test_every_config_key_is_covered_by_the_compatibility_table(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Forget-proofing for the resume guard.
+
+    Adding a key to the campaign config without a compatibility entry silently
+    strands every campaign already on disk — the bug `_LEGACY_CONFIG_DEFAULTS`
+    exists to prevent, and one that had already cost four real campaigns before
+    it existed. If this fails, add the new key to
+    `store._LEGACY_CONFIG_DEFAULTS` with the behaviour that was in force
+    *before* the key existed, which is not necessarily its current default.
+    """
+    from mdpilot.memory import store
+    from mdpilot.memory.store import _LEGACY_CONFIG_DEFAULTS, _ORIGINAL_CONFIG_KEYS
+    from mdpilot.observables import ObservableSpec
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        max_rounds=1,
+        # Every optional parameter set, so the recorded config is the widest
+        # one run_campaign can produce.
+        task_expectation="fold it",
+        state_thresholds=(1.0, 2.0),
+        min_recrossings=2,
+        cv_upper_wall_nm=0.8,
+        bias_pace=200,
+        bias_factor=15.0,
+        observable=ObservableSpec(
+            cv_type="gyration", selections=("name CA",), name="rg_nm"
+        ),
+        **_run_kwargs(),
+    )
+
+    recorded = set(store.get_campaign_config(tmp_path))
+    uncovered = recorded - _ORIGINAL_CONFIG_KEYS - set(_LEGACY_CONFIG_DEFAULTS)
+    assert not uncovered, (
+        f"config key(s) {sorted(uncovered)} have no compatibility entry in "
+        f"store._LEGACY_CONFIG_DEFAULTS; campaigns already on disk would be "
+        f"stranded by them"
+    )
+
+
+def test_the_real_task_file_drives_the_loop_and_reopens_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The seam between `task_file` and `run_campaign`, which nothing else
+    covers: the two were built separately and only met in a benchmark script.
+
+    Also the round trip that matters operationally — the same task file must
+    reopen its own campaign, which is only true if the rendered
+    `task_expectation` is deterministic.
+    """
+    from mdpilot.memory import store
+    from mdpilot.task_file import load_task_file
+
+    task = load_task_file(Path("benchmarks/tasks/cln025_folding.yaml"))
+    kwargs = task.run_kwargs(
+        max_extra_ns=2.0, seed=42, initial_steps=100,
+        report_interval_steps=50, equilibration_steps=0, max_rounds=1,
+    )
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=task.spec),
+        **kwargs,
+    )
+    assert result.stop_reason == "scientist_said_stop"
+
+    config = store.get_campaign_config(tmp_path)
+    assert config["state_thresholds"] == [1.5, 4.0]
+    assert config["min_recrossings"] == 2
+    assert config["task_expectation"] == kwargs["task_expectation"]
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=task.spec),
+        **kwargs,
+    )

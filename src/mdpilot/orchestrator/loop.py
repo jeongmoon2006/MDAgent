@@ -43,7 +43,8 @@ from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
 from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.diagnostics.free_energy import metad_report
-from mdpilot.diagnostics.report import campaign_observable, make_report
+from mdpilot.diagnostics.report import make_report
+from mdpilot.observables import ObservableSpec, campaign_observable
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
 from mdpilot.sampling.bias_designer import design_bias, design_upper_wall
@@ -117,6 +118,7 @@ def run_campaign(
     cv_upper_wall_nm: float | None = None,
     bias_pace: int | None = None,
     bias_factor: float | None = None,
+    observable: ObservableSpec | None = None,
     seed: int = 42,
     report_interval_steps: int = 500,    # 1 ps/frame at 2 fs
     equilibration_steps: int = 0,
@@ -172,6 +174,12 @@ def run_campaign(
     characteristic timescale, the compute budget. Required for campaigns
     where the scientist may need to choose `switch_to_metad`; otherwise the
     LLM has no basis to judge "the budget cannot reach the transition."
+
+    `observable` is the coordinate every round is judged on — the vanilla
+    convergence bundle summarizes it and `state_thresholds` are positions on
+    it. Left at None it is CA-RMSD to the campaign topology in Angstrom, the
+    M1 observable. It defines what the campaign measures, so it locks with the
+    rest of the config.
 
     `bias_pace` and `bias_factor` override the METAD deposition stride and the
     well-tempered gamma that `sampling.bias_designer` would otherwise pick.
@@ -274,6 +282,11 @@ def run_campaign(
     # `sum_hills` integration. Added to the lock only when set, for the same
     # reason `SystemSpec.to_dict` omits a default ensemble — an unconditional
     # key would make every campaign recorded before this existed unresumable.
+    # Omitted when default for the same reason `SystemSpec.to_dict` omits a
+    # default ensemble: an unconditional key would strand campaigns recorded
+    # before observables were declarable.
+    if observable is not None and observable != ObservableSpec.ca_rmsd_angstrom():
+        config["observable"] = observable.to_dict()
     if bias_pace is not None:
         config["bias_pace"] = bias_pace
     if bias_factor is not None:
@@ -443,6 +456,7 @@ def run_campaign(
             rounds_dir=rounds_dir,
             round_index=round_idx,
             state_thresholds=state_thresholds,
+            observable=observable,
         )
         prior_summaries = [_compact_prior(r) for r in rounds]
         decision = decide(
@@ -665,6 +679,7 @@ def _round_report(
     rounds_dir: Path | None = None,
     round_index: int | None = None,
     state_thresholds: tuple[float, float] | None = None,
+    observable: ObservableSpec | None = None,
 ) -> dict[str, Any]:
     """Diagnostic bundle for one round, chosen by phase.
 
@@ -682,20 +697,20 @@ def _round_report(
     well-tempered convergence test wants — not per-round.
     """
     if plumed_dat_path is None:
-        report = make_report(trajectory_path, topology_path)
+        report = make_report(trajectory_path, topology_path, observable)
         report["phase"] = "vanilla"
         return report
 
     # Only computed when there are task states to count against: it costs a
     # trajectory load, and without thresholds nothing consumes the result.
-    observable = observable_name = None
+    series = observable_name = None
     if (
         state_thresholds is not None
         and rounds_dir is not None
         and round_index is not None
     ):
-        observable, observable_name = _accumulated_observable(
-            rounds_dir, round_index, trajectory_path, topology_path
+        series, observable_name = _accumulated_observable(
+            rounds_dir, round_index, trajectory_path, topology_path, observable
         )
 
     bias_dir = plumed_dat_path.parent
@@ -705,7 +720,7 @@ def _round_report(
         fes_dir,
         temperature_k=temperature_k,
         min_recrossings=min_recrossings,
-        observable=observable,
+        observable=series,
         observable_name=observable_name,
         state_thresholds=state_thresholds,
     )
@@ -720,6 +735,7 @@ def _accumulated_observable(
     round_index: int,
     trajectory_path: Path,
     topology_path: Path,
+    observable: ObservableSpec | None = None,
 ) -> tuple[np.ndarray, str]:
     """The campaign observable over every biased round so far, in order.
 
@@ -734,7 +750,7 @@ def _accumulated_observable(
     biased phase — over a gigabyte by the end of a 20 ns campaign.
     """
     traj = md.load(str(trajectory_path), top=str(topology_path))
-    series, name = campaign_observable(traj, topology_path)
+    series, name = campaign_observable(traj, topology_path, observable)
     rounds_dir.mkdir(parents=True, exist_ok=True)
     np.save(rounds_dir / f"round_{round_index:03d}.obs.npy", series)
 

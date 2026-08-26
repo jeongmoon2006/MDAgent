@@ -23,9 +23,8 @@ description: |
 
 system:
   starting_pdb: "5AWL"        # downloaded via PDBFixer; 10 residues, ~5380 atoms solvated
-  forcefield: ["amber14-all.xml", "amber14/tip3p.xml"]
-  water_model: tip3p
-  padding_nm: 1.0
+  forcefield: amber14/tip3p       # a validated protein+water pair; see mdpilot.forcefields
+  padding_nm: 1.5              # raised from 1.0 after F11 (periodic self-interaction)
   ionic_strength_M: 0.15
   starting_state: folded      # 5AWL is the native beta-hairpin
 
@@ -36,9 +35,15 @@ integrator:
   timestep_fs: 2.0
   constraints: HBonds
 
+# The coordinate every round is judged on, and the one `done_criterion.states`
+# places its thresholds on. Declared as a collective variable, from the same
+# vocabulary the scientist proposes biased CVs from — a binding campaign writes
+# `cv_type: distance` here and nothing downstream changes.
 observable:
+  cv_type: rmsd
+  selections: ["protein and name CA"]
   name: rmsd_ca_to_reference_angstrom
-  selection: "protein and name CA"
+  scale: 10.0                    # mdtraj returns nm; this task states states in Angstrom
   reference: campaign_topology   # post-equilibration structure, constant across rounds
 
 # Campaign expectation. `task_expectation` — the string threaded into every

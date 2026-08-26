@@ -44,20 +44,16 @@ import yaml
 from mdpilot.adapters import openmm_adapter as _omm
 from mdpilot.adapters.system_spec import Ensemble, SystemSpec
 from mdpilot.diagnostics.autocorrelation import autocorrelation
-from mdpilot.diagnostics.report import OBSERVABLE_NAME
+from mdpilot.observables import ObservableSpec
 
 # Declared in task files, governed by a constant elsewhere. Sourced from the
 # module that owns each value rather than retyped, so the check cannot drift
 # into asserting a number nothing uses any more.
 _VERIFIED: dict[tuple[str, str], Any] = {
-    ("system", "forcefield"): list(_omm._FORCEFIELD_FILES),
-    ("system", "water_model"): "tip3p",
-    ("system", "padding_nm"): _omm._PADDING_NM,
     ("system", "ionic_strength_M"): _omm._SALT_M,
     ("integrator", "type"): "LangevinMiddle",
     ("integrator", "friction_per_ps"): _omm._FRICTION_PER_PS,
     ("integrator", "constraints"): "HBonds",
-    ("observable", "name"): OBSERVABLE_NAME,
     ("diagnostics", "target_ess"): inspect.signature(
         autocorrelation
     ).parameters["target_ess"].default,
@@ -66,7 +62,8 @@ _VERIFIED: dict[tuple[str, str], Any] = {
 # Carried for humans, not interpreted.
 _INFORMATIONAL = {
     ("system", "starting_state"),
-    ("observable", "selection"),
+    # Only one reference is possible today — the campaign topology — so this is
+    # documentation until a second one exists.
     ("observable", "reference"),
     ("diagnostics", "methods"),
     ("done_criterion", "pivot_required"),
@@ -79,6 +76,7 @@ _TOP_LEVEL = {
 _EXPECTATION_KEYS = {"objective", "characteristic_timescale_ns", "timescale_source"}
 _DONE_CRITERION_KEYS = {"states", "min_recrossings", "max_biased_ns", "pivot_required"}
 _STATE_KEYS = {"name", "threshold"}
+_OBSERVABLE_KEYS = {"cv_type", "selections", "name", "scale", "reference"}
 
 
 @dataclass(frozen=True)
@@ -123,6 +121,9 @@ def load_task_file(path: Path) -> TaskFile:
         raise ValueError(f"task_file: {path} is not a YAML mapping")
 
     _reject_unknown("<top level>", set(doc), _TOP_LEVEL, path)
+    _reject_unknown(
+        "observable", set(doc.get("observable") or {}), _OBSERVABLE_KEYS, path
+    )
     _check_expectation(doc, path)
     _verify_declared_constants(doc, path)
 
@@ -133,7 +134,7 @@ def load_task_file(path: Path) -> TaskFile:
         done_criterion=dict(doc.get("done_criterion") or {}),
         sha256=hashlib.sha256(raw).hexdigest(),
         path=path,
-        observable_name=(doc.get("observable") or {}).get("name", OBSERVABLE_NAME),
+        observable_name=_build_observable(doc).name,
     )
 
 
@@ -143,7 +144,7 @@ def _build_spec(doc: dict[str, Any], path: Path) -> SystemSpec:
     _reject_unknown(
         "system",
         set(system),
-        {"starting_pdb", "structure_path"}
+        {"starting_pdb", "structure_path", "padding_nm", "forcefield"}
         | {k for s, k in _VERIFIED if s == "system"}
         | {k for s, k in _INFORMATIONAL if s == "system"},
         path,
@@ -163,13 +164,24 @@ def _build_spec(doc: dict[str, Any], path: Path) -> SystemSpec:
         ensemble_kwargs["timestep_fs"] = float(integrator["timestep_fs"])
     ensemble = Ensemble(**ensemble_kwargs)
 
-    # SystemSpec enforces exactly-one-of; let its message stand.
+    # SystemSpec enforces exactly-one-of and a positive padding; let its
+    # messages stand rather than restating them here.
+    spec_kwargs: dict[str, Any] = {}
+    if "padding_nm" in system:
+        spec_kwargs["padding_nm"] = float(system["padding_nm"])
+    if "forcefield" in system:
+        # A key into `mdpilot.forcefields`, which pairs the protein force field
+        # with a water model that engine can actually solvate. There is no
+        # separate `water_model` field: two fields could disagree, and the
+        # combination is what was validated, not either half.
+        spec_kwargs["forcefield"] = system["forcefield"]
     return SystemSpec(
         pdb_id=system.get("starting_pdb"),
         structure_path=(
             Path(system["structure_path"]) if system.get("structure_path") else None
         ),
         ensemble=ensemble,
+        **spec_kwargs,
     )
 
 
@@ -246,20 +258,61 @@ def render_task_expectation(doc: dict[str, Any]) -> str:
         line = f"Compute budget: {float(budget):g} ns for the biased phase."
         if timescale:
             ratio = float(timescale) / float(budget)
-            line += (
-                f" That is {ratio:.0f}x shorter than the characteristic "
-                f"timescale, so unbiased MD within this budget is expected to "
-                f"stay trapped in whichever state it starts from."
-            )
+            if ratio >= 1.5:
+                line += (
+                    f" That is {ratio:.0f}x shorter than the characteristic "
+                    f"timescale, so unbiased MD within this budget is expected "
+                    f"to stay trapped in whichever state it starts from."
+                )
+            else:
+                # The budget reaches the timescale. Saying "0x shorter ...
+                # expected to stay trapped" here was not merely awkward, it
+                # asserted the opposite of what the numbers say, and the pivot
+                # rule reads this sentence.
+                line += (
+                    " That is comparable to or longer than the characteristic "
+                    "timescale, so unbiased MD within this budget may reach "
+                    "the transition without enhanced sampling."
+                )
         parts.append(line)
 
     return "\n\n".join(parts) + "\n"
+
+
+def _build_observable(doc: dict[str, Any]) -> ObservableSpec:
+    """The declared campaign observable, or the CA-RMSD default.
+
+    An observable is a collective variable, so the block is the same shape as a
+    CV proposal. A file that says nothing gets the M1 observable, which is what
+    every campaign recorded so far actually ran on.
+    """
+    block = dict(doc.get("observable") or {})
+    block.pop("reference", None)   # informational; only one reference exists
+    if not block:
+        return ObservableSpec.ca_rmsd_angstrom()
+    missing = {"cv_type", "selections", "name"} - set(block)
+    if missing:
+        raise ValueError(
+            f"task_file: observable block is missing {sorted(missing)}. An "
+            f"observable is declared as a collective variable: cv_type, "
+            f"selections and name are all required."
+        )
+    return ObservableSpec(
+        cv_type=block["cv_type"],
+        selections=tuple(block["selections"]),
+        name=block["name"],
+        scale=float(block.get("scale", 1.0)),
+    )
 
 
 def _build_campaign(doc: dict[str, Any]) -> dict[str, Any]:
     """The `run_campaign` keywords the file owns. Absent keys are omitted
     rather than passed as None, so the loop's own defaults stay in charge."""
     campaign: dict[str, Any] = {}
+
+    observable = _build_observable(doc)
+    if observable != ObservableSpec.ca_rmsd_angstrom():
+        campaign["observable"] = observable
 
     if doc.get("expectation"):
         campaign["task_expectation"] = render_task_expectation(doc)
@@ -315,6 +368,8 @@ def _check_expectation(doc: dict[str, Any], path: Path) -> None:
                 f"reads as a run that never crossed."
             )
 
+    _check_timescale_units(expectation, path)
+
     # `run_campaign` refuses a pivot-capable campaign with no task states,
     # because the biased phase would fall back to counting recrossings between
     # whichever two basins are currently deepest (F9). Catch it here, where the
@@ -326,6 +381,51 @@ def _check_expectation(doc: dict[str, Any], path: Path) -> None:
             f"A biased phase needs the task's own state definitions to count "
             f"recrossings against."
         )
+
+
+# Order matters: the longer spellings are checked first so "microsecond" is not
+# matched as "us" inside another word. The tolerance is one order of magnitude
+# either way — 0.6 us stated as 600 ns is correct and must pass, while 1 us
+# stated as 1 ns is off by a factor of 1000 and must not.
+_ORDER_OF_MAGNITUDE = 10.0
+_TIMESCALE_UNIT_HINTS: tuple[tuple[tuple[str, ...], float, str], ...] = (
+    (("millisecond", " ms", "~ms"), 1_000_000.0, "milliseconds"),
+    (("microsecond", " us", "~us", "\u00b5s", "\u03bcs"), 1_000.0, "microseconds"),
+)
+
+
+def _check_timescale_units(expectation: dict[str, Any], path: Path) -> None:
+    """Refuse a timescale that contradicts the unit its own source states.
+
+    `characteristic_timescale_ns` is the one decision-driving number with no
+    second copy anywhere, and it is what the pivot rule compares elapsed
+    simulation time against. A unit slip there does not look wrong — it looks
+    like a small number — and it inverts the decision: a transition stated as
+    1 ns instead of 1000 ns tells the scientist unbiased MD reaches it easily,
+    so the campaign never pivots and spends its whole budget on sampling that
+    cannot work.
+
+    Narrow on purpose. This only fires when the source *says* microseconds or
+    milliseconds and the value is too small to be that, which is a slip a
+    reader skims past and arithmetic catches.
+    """
+    value = expectation.get("characteristic_timescale_ns")
+    source = str(expectation.get("timescale_source") or "").lower()
+    if value is None or not source:
+        return
+    for spellings, unit_ns, unit in _TIMESCALE_UNIT_HINTS:
+        if not any(s in source for s in spellings):
+            continue
+        if float(value) < unit_ns / _ORDER_OF_MAGNITUDE:
+            raise ValueError(
+                f"task_file: {path} states characteristic_timescale_ns="
+                f"{value!r}, but timescale_source describes the transition in "
+                f"{unit} (~{unit_ns:g} ns), which is more than an order of "
+                f"magnitude away. One of the two is wrong, and this is the "
+                f"number the pivot decision is taken against — state the "
+                f"timescale in nanoseconds."
+            )
+        return
 
 
 def _verify_declared_constants(doc: dict[str, Any], path: Path) -> None:

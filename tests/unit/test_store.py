@@ -438,3 +438,115 @@ def test_cv_switch_migration_is_idempotent(tmp_path: Path) -> None:
         ).fetchone()[0]
     assert before == after
     assert "switch_cv" in after
+
+
+# ---------- campaign config compatibility across schema changes ----------
+#
+# The resume guard used to compare config JSON byte-for-byte, so *adding* a
+# config key stranded every campaign already on disk — their stored config
+# could not contain a key that did not exist when they started. Four real
+# campaigns were lost that way. These pin the fix and, just as importantly,
+# pin that the guard still refuses a genuine change.
+
+def _legacy_config() -> dict:
+    """A config as written before state_thresholds / min_recrossings existed."""
+    return {
+        "seed": 42,
+        "initial_steps": 5_000,
+        "report_interval_steps": 500,
+        "equilibration_steps": 0,
+        "system_spec": {"pdb_id": "1L2Y", "structure_path": None},
+        "engine": "OpenMMAdapter",
+        "task_expectation": None,
+    }
+
+
+def test_a_campaign_predating_a_key_resumes_when_the_value_matches_history(
+    tmp_path: Path,
+) -> None:
+    """`min_recrossings` did not exist; the behaviour then was 1. Reopening
+    with 1 describes the same campaign, so it must not be refused."""
+    store.init_campaign(tmp_path, _legacy_config())
+
+    store.init_campaign(
+        tmp_path, {**_legacy_config(), "min_recrossings": 1, "state_thresholds": None}
+    )
+
+
+def test_a_campaign_predating_a_key_is_refused_when_the_value_changed(
+    tmp_path: Path,
+) -> None:
+    """The other half. That campaign counted one crossing as done; reopening at
+    2 changes when it is allowed to end, retroactively, for rounds already
+    judged under the old rule."""
+    store.init_campaign(tmp_path, _legacy_config())
+
+    with pytest.raises(ValueError, match="different config"):
+        store.init_campaign(tmp_path, {**_legacy_config(), "min_recrossings": 2})
+
+
+def test_a_genuine_change_to_a_recorded_key_is_still_refused(tmp_path: Path) -> None:
+    """The guard's actual job, unaffected by the compatibility layer."""
+    store.init_campaign(tmp_path, _legacy_config())
+
+    with pytest.raises(ValueError, match="different config"):
+        store.init_campaign(tmp_path, {**_legacy_config(), "seed": 7})
+
+
+def test_the_refusal_names_the_differing_field(tmp_path: Path) -> None:
+    """It used to print two whole JSON blobs and leave the reader to diff."""
+    store.init_campaign(tmp_path, _legacy_config())
+
+    with pytest.raises(ValueError) as excinfo:
+        store.init_campaign(
+            tmp_path, {**_legacy_config(), "seed": 7, "min_recrossings": 2}
+        )
+    message = str(excinfo.value)
+    assert "seed: stored=42 requested=7" in message
+    assert "min_recrossings: stored=1" in message and "requested=2" in message
+    assert "initial_steps" not in message   # unchanged fields stay out of it
+
+
+def test_a_key_the_code_no_longer_writes_is_not_silently_ignored(
+    tmp_path: Path,
+) -> None:
+    """Removing a config key is as much a semantic change as adding one; the
+    stored value has no counterpart to agree with."""
+    store.init_campaign(tmp_path, {**_legacy_config(), "retired_key": 3})
+
+    with pytest.raises(ValueError, match="retired_key"):
+        store.init_campaign(tmp_path, _legacy_config())
+
+
+def test_not_recorded_is_distinguishable_from_none() -> None:
+    """`None` is a real, meaningful value for several of these keys, so the
+    message must not render an absent key as if it had been stored as null."""
+    diff = store.config_differences({}, {"engine": "OpenMMAdapter"})
+
+    assert set(diff) == {"engine"}
+    stored, _ = diff["engine"]
+    assert stored is not None
+    assert "<not recorded>" in store._describe(stored)
+
+
+def test_the_stored_config_is_never_rewritten(tmp_path: Path) -> None:
+    """Read-time normalization only — a campaign's record should say what was
+    actually recorded, not what a later version of the code would have written."""
+    store.init_campaign(tmp_path, _legacy_config())
+    store.init_campaign(tmp_path, {**_legacy_config(), "min_recrossings": 1})
+
+    assert store.get_campaign_config(tmp_path) == _legacy_config()
+
+
+def test_an_inferred_value_is_marked_as_inferred(tmp_path: Path) -> None:
+    """Reporting a filled legacy default bare would claim a value the campaign
+    never stored. The reader needs to know which side of that line it is on."""
+    store.init_campaign(tmp_path, _legacy_config())
+
+    with pytest.raises(ValueError) as excinfo:
+        store.init_campaign(
+            tmp_path, {**_legacy_config(), "seed": 7, "min_recrossings": 2}
+        )
+    message = str(excinfo.value)
+    assert "min_recrossings: stored=1 (not recorded;" in message
+    assert "seed: stored=42 requested=7" in message   # genuinely recorded, unmarked

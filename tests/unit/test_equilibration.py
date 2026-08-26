@@ -267,3 +267,54 @@ def test_gromacs_mdp_renders_the_ensemble_not_a_baked_constant() -> None:
 
     assert "ref-t                = 240.0" in mdp
     assert "dt                   = 0.001" in mdp
+
+
+# ---------- mdrun must never be killed on a clock ----------
+
+def test_no_mdrun_invocation_carries_a_wall_clock_timeout() -> None:
+    """A production round legitimately takes hours on CPU. A ceiling that fires
+    kills MD already paid for, mid-round, leaving a partial .gro/.cpt — the
+    opposite of what a safety timeout is for. Setup subcommands keep theirs,
+    where a hang really does mean something is stuck.
+
+    Checked at the call sites because that is where the invariant lives: adding
+    a fifth `mdrun` without the override is the regression this catches.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path("src/mdpilot/adapters/gromacs_adapter.py").read_text()
+    calls = re.findall(r"_run_gmx\((?:[^()]|\([^()]*\))*\)", source, re.S)
+    mdruns = [c for c in calls if "mdrun" in c]
+
+    assert mdruns, "no mdrun call sites found — did the parse break?"
+    for call in mdruns:
+        assert "timeout=_NO_TIMEOUT" in call, call[:120]
+
+
+def test_setup_subcommands_keep_their_ceiling() -> None:
+    import inspect
+
+    from mdpilot.adapters.gromacs_adapter import (
+        _GMX_SETUP_TIMEOUT_SECONDS,
+        _run_gmx,
+    )
+
+    default = inspect.signature(_run_gmx).parameters["timeout"].default
+    assert default == _GMX_SETUP_TIMEOUT_SECONDS
+
+
+def test_both_adapters_take_the_box_from_the_spec() -> None:
+    """Padding used to be a module constant in each adapter, so a campaign
+    could not change its own box. Checked at the call site, which is where the
+    regression would be — reintroducing a constant and passing that instead.
+    """
+    from pathlib import Path
+
+    openmm_src = Path("src/mdpilot/adapters/openmm_adapter.py").read_text()
+    gromacs_src = Path("src/mdpilot/adapters/gromacs_adapter.py").read_text()
+
+    assert "padding=self._spec.padding_nm * unit.nanometer" in openmm_src
+    assert '"-d", str(self._spec.padding_nm),' in gromacs_src
+    for src in (openmm_src, gromacs_src):
+        assert "_PADDING_NM" not in src

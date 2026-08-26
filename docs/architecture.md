@@ -79,6 +79,11 @@ mdpilot/
 │   │
 │   ├── task_file.py                   # task YAML -> SystemSpec + run_campaign kwargs
 │   │                                  #   (checks declared-but-fixed fields)
+│   ├── forcefields.py                 # validated protein+water pairs, per engine
+│   ├── observables.py                 # the coordinate every round is judged on,
+│   │                                  #   declared as a CV (default: CA-RMSD)
+│   ├── setup_agent.py                 # request -> reviewable task file (the one
+│   │                                  #   LLM call outside the round loop)
 │   │
 │   ├── orchestrator/                  # outer loop: plan → run → analyze → decide
 │   │   ├── scientist.py               # the single LLM call per round
@@ -90,7 +95,9 @@ mdpilot/
 │   │   ├── phase_metad.md             # free-energy rubric
 │   │   ├── action_switch_cv.md        # when to revise the biased coordinate
 │   │   ├── cv_vocabulary.md           # CV types, arities, bounded-vs-unbounded
-│   │   └── output_contract.md         # extra_ns / ledger_note / reason
+│   │   ├── output_contract.md         # extra_ns / ledger_note / reason
+│   │   ├── setup_role.md              # [setup agent] what it emits, and for whom
+│   │   └── forcefield_guide.md        # [setup agent] how to choose a force field
 │   │
 │   ├── diagnostics/                   # mechanical convergence + adequacy (no LLM)
 │   │   ├── block_averaging.py         # Flyvbjerg-Petersen SEM plateau

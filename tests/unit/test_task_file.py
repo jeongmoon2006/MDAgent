@@ -90,25 +90,28 @@ def test_a_declared_value_that_disagrees_with_the_code_raises(tmp_path: Path) ->
     """The whole point. `padding_nm: 1.5` used to be documentation the adapter
     was free to contradict, and it ran at 1.0 with nothing said."""
     with pytest.raises(ValueError, match="not tunable yet"):
-        load_task_file(_write(tmp_path, _minimal(padding_nm=1.5)))
+        load_task_file(_write(tmp_path, _minimal(ionic_strength_M=0.3)))
 
 
 def test_a_declared_value_that_agrees_is_accepted(tmp_path: Path) -> None:
-    from mdpilot.adapters.openmm_adapter import _PADDING_NM
+    from mdpilot.adapters.openmm_adapter import _SALT_M
 
-    assert load_task_file(_write(tmp_path, _minimal(padding_nm=_PADDING_NM)))
+    assert load_task_file(_write(tmp_path, _minimal(ionic_strength_M=_SALT_M)))
 
 
 def test_the_verified_table_is_sourced_from_the_modules_that_own_the_values() -> None:
     """Retyped constants drift. These must be the live ones."""
-    from mdpilot.adapters.openmm_adapter import _FORCEFIELD_FILES, _SALT_M
-    from mdpilot.diagnostics.report import OBSERVABLE_NAME
+    from mdpilot.adapters.openmm_adapter import _SALT_M
     from mdpilot.task_file import _VERIFIED
 
-    assert _VERIFIED[("system", "forcefield")] == list(_FORCEFIELD_FILES)
     assert _VERIFIED[("system", "ionic_strength_M")] == _SALT_M
-    assert _VERIFIED[("observable", "name")] == OBSERVABLE_NAME
     assert _VERIFIED[("diagnostics", "target_ess")] == 50.0
+    # Fields leave this table as they become declarable; a stale entry would
+    # refuse every campaign that sets its own value. The observable went first,
+    # then padding, then the force field.
+    assert not any(section == "observable" for section, _ in _VERIFIED)
+    for gone in ("padding_nm", "forcefield", "water_model"):
+        assert ("system", gone) not in _VERIFIED
 
 
 # ---------- unknown keys: how a generated file's typos surface ----------
@@ -147,7 +150,12 @@ def test_the_file_hashes_itself_for_provenance() -> None:
 
 def _campaign_doc(**criterion_overrides) -> dict:
     doc = _minimal()
-    doc["observable"] = {"name": "rmsd_ca_to_reference_angstrom"}
+    doc["observable"] = {
+        "cv_type": "rmsd",
+        "selections": ["protein and name CA"],
+        "name": "rmsd_ca_to_reference_angstrom",
+        "scale": 10.0,
+    }
     doc["integrator"] = {"temperature_K": 300.0}
     doc["expectation"] = {
         "objective": "Sample the transition in both directions.",
@@ -220,7 +228,11 @@ def test_an_authored_task_expectation_is_not_accepted(tmp_path: Path) -> None:
 def _ligand_doc() -> dict:
     """A protein-ligand binding campaign. Same mechanics, different states."""
     doc = _minimal(starting_pdb="1STP")
-    doc["observable"] = {"name": "ligand_com_distance_nm"}
+    doc["observable"] = {
+        "cv_type": "distance",
+        "selections": ["resname LIG and name C1", "protein and resid 42 and name CA"],
+        "name": "ligand_com_distance_nm",
+    }
     doc["expectation"] = {
         "objective": "Sample binding and unbinding of the ligand.",
         "characteristic_timescale_ns": 50_000.0,
@@ -251,19 +263,25 @@ def test_the_renderer_is_not_folding_shaped() -> None:
     assert "fold" not in prose.lower()      # no folding vocabulary anywhere
 
 
-def test_a_non_protein_observable_is_refused_until_it_is_tunable(
-    tmp_path: Path,
-) -> None:
-    """The blocker for binding campaigns, made explicit rather than latent.
+def test_a_non_protein_observable_now_loads(tmp_path: Path) -> None:
+    """This test used to assert the opposite.
 
-    `diagnostics.report.campaign_observable` selects `protein and name CA` and
-    raises on an empty selection, so CA-RMSD is the only observable the loop
-    can compute. A task file may declare a ligand distance only once that is
-    real — this refusal is what stops a binding campaign from silently being
-    judged on protein RMSD.
+    `campaign_observable` was hardcoded to `protein and name CA`, so a binding
+    campaign could not be scored at all and the loader refused any other
+    `observable.name` rather than let one be silently judged on protein RMSD.
+    The observable is now a declared collective variable, so the refusal is
+    gone and the declaration carries through to `run_campaign`.
     """
-    with pytest.raises(ValueError, match="not tunable yet"):
-        load_task_file(_write(tmp_path, _ligand_doc()))
+    from mdpilot.observables import ObservableSpec
+
+    task = load_task_file(_write(tmp_path, _ligand_doc()))
+
+    assert task.observable_name == "ligand_com_distance_nm"
+    assert task.campaign["observable"] == ObservableSpec(
+        cv_type="distance",
+        selections=("resname LIG and name C1", "protein and resid 42 and name CA"),
+        name="ligand_com_distance_nm",
+    )
 
 
 # ---------- structural refusals a generated file will hit ----------
@@ -295,3 +313,56 @@ def test_an_unknown_expectation_key_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unknown expectation key"):
         load_task_file(_write(tmp_path, doc))
+
+
+# ---------- the timescale is the field with no second copy ----------
+
+def test_a_timescale_contradicting_its_own_source_is_refused(tmp_path: Path) -> None:
+    """Caught on the setup agent's first live run: it cited a ~1 microsecond
+    folding time and wrote `characteristic_timescale_ns: 1.0`. A unit slip here
+    does not look wrong, it looks like a small number, and it inverts the pivot
+    decision — the scientist would conclude unbiased MD reaches the transition
+    easily and never switch to enhanced sampling."""
+    doc = _campaign_doc()
+    doc["expectation"]["characteristic_timescale_ns"] = 1.0
+    doc["expectation"]["timescale_source"] = "folds on the ~1 microsecond timescale"
+
+    with pytest.raises(ValueError, match="describes the transition in microseconds"):
+        load_task_file(_write(tmp_path, doc))
+
+
+def test_a_timescale_agreeing_with_its_source_passes(tmp_path: Path) -> None:
+    doc = _campaign_doc()
+    doc["expectation"]["characteristic_timescale_ns"] = 1000.0
+    doc["expectation"]["timescale_source"] = "folds on the ~1 microsecond timescale"
+
+    assert load_task_file(_write(tmp_path, doc))
+
+
+def test_a_budget_that_reaches_the_timescale_is_not_described_as_short() -> None:
+    """`{ratio:.0f}x shorter` rendered "0x shorter ... expected to stay trapped"
+    when the budget exceeded the timescale — asserting the opposite of the
+    numbers, in the sentence the pivot rule reads."""
+    from mdpilot.task_file import render_task_expectation
+
+    doc = _campaign_doc(max_biased_ns=5000.0)      # budget >> 800 ns timescale
+    prose = render_task_expectation(doc)
+
+    assert "0x shorter" not in prose
+    assert "may reach the transition without enhanced sampling" in prose
+    assert "expected to stay trapped" not in prose
+
+
+def test_padding_is_declarable_and_reaches_the_spec(tmp_path: Path) -> None:
+    """It moved out of the verified-but-fixed table when it became tunable; a
+    stale entry there would refuse every campaign that sets its own box."""
+    from mdpilot.task_file import _VERIFIED
+
+    assert ("system", "padding_nm") not in _VERIFIED
+    assert load_task_file(_write(tmp_path, _minimal(padding_nm=2.0))).spec.padding_nm == 2.0
+    assert load_task_file(_write(tmp_path, _minimal())).spec.padding_nm == 1.5
+
+
+def test_the_shipped_task_files_use_the_post_f11_box() -> None:
+    for name in ("cln025_folding", "trpcage_convergence"):
+        assert load_task_file(_TASKS / f"{name}.yaml").spec.padding_nm == 1.5

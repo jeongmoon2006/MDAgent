@@ -24,11 +24,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mdpilot import forcefields
+
 # Neither adapter implements hydrogen mass repartitioning, and both constrain
 # only h-bonds, so a timestep past roughly 2.5 fs integrates the fast X-H
 # bending modes too coarsely and the run goes unstable — or, worse, stays
 # stable and quietly reports the wrong ensemble.
 _MAX_TIMESTEP_FS_WITHOUT_HMR = 2.5
+
+# Solvent between the solute and the edge of the box, applied to the *starting*
+# structure. Raised from 1.0 after F11: padding sized on a folded structure is
+# not padding sized for the ensemble a campaign intends to sample, and on
+# CLN025 that put the peptide in contact with its own periodic image in half
+# the biased rounds. Measured against that campaign's own sampled spans, 1.5 nm
+# leaves 0.18% of frames inside the 1.0 nm cutoff where 1.0 nm left 20.2%, at
+# roughly 2x the atom count. A campaign that drives its system further apart
+# than CLN025 did should raise it again — this is a better default, not a
+# guarantee.
+_DEFAULT_PADDING_NM = 1.5
 
 
 @dataclass(frozen=True)
@@ -89,11 +102,20 @@ class SystemSpec:
     pdb_id: str | None = None
     structure_path: Path | None = None
     ensemble: Ensemble = field(default_factory=Ensemble)
+    padding_nm: float = _DEFAULT_PADDING_NM
+    # A key into `mdpilot.forcefields`, not a file list: the combination is
+    # engine-agnostic here and each adapter resolves it to its own names.
+    forcefield: str = forcefields.DEFAULT_KEY
 
     def __post_init__(self) -> None:
         if (self.pdb_id is None) == (self.structure_path is None):
             raise ValueError(
                 "SystemSpec requires exactly one of pdb_id or structure_path"
+            )
+        forcefields.resolve(self.forcefield)   # raises, listing what exists
+        if self.padding_nm <= 0:
+            raise ValueError(
+                f"SystemSpec: padding_nm must be positive (got {self.padding_nm})"
             )
 
     @classmethod
@@ -110,13 +132,22 @@ class SystemSpec:
             if self.structure_path is not None
             else None,
         }
-        # Emitted only when it differs from the default. `store.init_campaign`
-        # compares the serialized config JSON byte-for-byte, so adding a key
-        # unconditionally would make every campaign recorded before this field
-        # existed refuse to resume. A default ensemble serializes as absent,
-        # which is exactly the state those campaigns ran under; anything else
-        # locks explicitly. The guard stays correct either way — starting at
-        # 240 K and resuming at the default still mismatches.
+        # `ensemble` is emitted only when it differs from the default, because
+        # its default *is* what every campaign recorded before it existed ran
+        # under — so absent and default mean the same thing and old campaigns
+        # stay resumable.
+        #
+        # `padding_nm` cannot use that trick: its default was raised from 1.0 to
+        # 1.5, so absent (a pre-F11 campaign, built at 1.0) and default (1.5)
+        # mean *different* boxes. It is always emitted, and
+        # `store._LEGACY_SYSTEM_SPEC_DEFAULTS` supplies 1.0 for configs
+        # recorded before the field existed — so resuming one of those at the
+        # new default is correctly refused rather than silently accepted.
         if self.ensemble != Ensemble():
             spec["ensemble"] = self.ensemble.to_dict()
+        spec["padding_nm"] = self.padding_nm
+        # Omit-when-default is safe here, unlike padding: this default *is*
+        # what every campaign recorded before the field existed was built with.
+        if self.forcefield != forcefields.DEFAULT_KEY:
+            spec["forcefield"] = self.forcefield
         return spec

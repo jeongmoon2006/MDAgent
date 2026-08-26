@@ -54,10 +54,11 @@ from openmm import (
 )
 from pdbfixer import PDBFixer
 
+from mdpilot import forcefields
 from mdpilot.adapters.system_spec import SystemSpec
 
-_FORCEFIELD_FILES = ("amber14-all.xml", "amber14/tip3p.xml")
-_PADDING_NM = 1.0
+# Force field and water model come from `spec.forcefield`, a key into
+# `mdpilot.forcefields`.
 _SALT_M = 0.15
 _FRICTION_PER_PS = 1.0
 _NONBONDED_CUTOFF_NM = 1.0
@@ -200,9 +201,10 @@ def _prepare_plumed_force(plumed_input: str, work_dir: Path):
 
 class OpenMMAdapter:
     """MDAdapter: direct OpenMM execution. System chosen by SystemSpec; the
-    forcefield/box/ions choices are still hardcoded (AMBER14, TIP3P, 1 nm
-    padding, 0.15 M NaCl, LangevinMiddle, MonteCarloBarostat at 1 bar).
-    Thermostat temperature and timestep come from ``spec.ensemble``.
+    ion concentration and integrator choices are still hardcoded (0.15 M NaCl,
+    LangevinMiddle, MonteCarloBarostat at 1 bar). Thermostat temperature and
+    timestep come from ``spec.ensemble``, box padding from ``spec.padding_nm``,
+    and the force field + water model from ``spec.forcefield``.
 
     ``platform`` pins the OpenMM platform by name; left at None the adapter
     picks the fastest one that actually works (GPU when present, CPU
@@ -315,12 +317,13 @@ class OpenMMAdapter:
         box vectors at 300 K / 1 bar)."""
         assert self._pdb_path is not None
         pdb = app.PDBFile(str(self._pdb_path))
-        forcefield = app.ForceField(*_FORCEFIELD_FILES)
+        chosen = forcefields.resolve(self._spec.forcefield)
+        forcefield = app.ForceField(*chosen.openmm_files)
         modeller = app.Modeller(pdb.topology, pdb.positions)
         modeller.addSolvent(
             forcefield,
-            model="tip3p",
-            padding=_PADDING_NM * unit.nanometer,
+            model=chosen.openmm_water_model,
+            padding=self._spec.padding_nm * unit.nanometer,
             ionicStrength=_SALT_M * unit.molar,
         )
         system = forcefield.createSystem(

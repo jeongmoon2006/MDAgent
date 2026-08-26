@@ -18,35 +18,27 @@ import numpy as np
 from mdpilot.diagnostics.autocorrelation import autocorrelation
 from mdpilot.diagnostics.block_averaging import block_average
 from mdpilot.diagnostics.exploration import exploration
+from mdpilot.observables import ObservableSpec, campaign_observable
 
 _MIN_FRAMES_FOR_STATISTICS = 8
 
+# Kept as a re-export: the campaign observable and its default now live in
+# `mdpilot.observables`, because an observable is a collective variable and
+# `sampling/` already knows how to compute five of them.
+OBSERVABLE_NAME = ObservableSpec.ca_rmsd_angstrom().name
 
-OBSERVABLE_NAME = "rmsd_ca_to_reference_angstrom"
-
-
-def campaign_observable(
-    traj: md.Trajectory, top_path: Path
-) -> tuple[np.ndarray, str]:
-    """CA-RMSD to the campaign reference, in Angstrom, plus its name.
-
-    Split out of `make_report` because the biased phase needs the same series:
-    the task defines its states on this coordinate, so a recrossing count
-    anchored to those states has to be measured here rather than on whichever
-    CV the scientist chose to bias. One definition, so the vanilla report, the
-    biased report and the post-hoc done-criterion check cannot drift apart.
-    """
-    ca = traj.topology.select("protein and name CA")
-    if ca.size == 0:
-        raise ValueError("no protein CA atoms found in topology")
-    protein = traj.atom_slice(ca)
-    # Same `ca` indices are valid for both: traj was loaded with this topology.
-    reference = md.load(str(top_path)).atom_slice(ca)
-    return md.rmsd(protein, reference, frame=0) * 10.0, OBSERVABLE_NAME  # nm -> A
+__all__ = ["OBSERVABLE_NAME", "campaign_observable", "make_report", "to_json"]
 
 
-def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
-    """Load a trajectory, compute CA-RMSD to the campaign reference, summarize.
+def make_report(
+    dcd_path: Path,
+    top_path: Path,
+    observable: ObservableSpec | None = None,
+) -> dict[str, Any]:
+    """Load a trajectory, compute the campaign observable, summarize.
+
+    `observable` defaults to CA-RMSD in Angstrom — the M1 observable — so a
+    campaign that declares nothing behaves exactly as it did.
 
     The reference is the campaign's topology structure, *not* this round's
     first frame. A per-round reference makes every round a different
@@ -61,7 +53,7 @@ def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
     dcd_path = Path(dcd_path)
     top_path = Path(top_path)
     traj = md.load(str(dcd_path), top=str(top_path))
-    rmsd_angstrom, observable_name = campaign_observable(traj, top_path)
+    series, observable_name = campaign_observable(traj, top_path, observable)
 
     if traj.n_frames > 1:
         frame_dt_ps = float(np.diff(traj.time).mean())
@@ -71,7 +63,7 @@ def make_report(dcd_path: Path, top_path: Path) -> dict[str, Any]:
         length_ns = 0.0
 
     return _summarize(
-        observable=rmsd_angstrom,
+        observable=series,
         observable_name=observable_name,
         dcd_path=dcd_path,
         top_path=top_path,
