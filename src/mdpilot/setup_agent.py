@@ -113,6 +113,12 @@ _TASK_FILE_TOOL: dict[str, Any] = {
                                "further apart than it starts.",
             },
             "temperature_K": {"type": "number"},
+            "pressure_bar": {
+                "type": "number",
+                "description": "Production is NPT. 1.0 unless the science is "
+                               "about pressure itself (pressure denaturation, "
+                               "high-pressure phases).",
+            },
             "timestep_fs": {
                 "type": "number",
                 "description": "At most 2.5; no hydrogen mass repartitioning exists.",
@@ -190,7 +196,8 @@ _TASK_FILE_TOOL: dict[str, Any] = {
         },
         "required": [
             "name", "description", "starting_pdb", "structure_path",
-            "forcefield", "padding_nm", "temperature_K", "timestep_fs", "observable_cv_type",
+            "forcefield", "padding_nm", "temperature_K", "pressure_bar",
+            "timestep_fs", "observable_cv_type",
             "observable_selections", "observable_name", "observable_scale",
             "observable_normalize",
             "objective", "characteristic_timescale_ns", "timescale_source",
@@ -224,6 +231,7 @@ def to_document(proposal: dict[str, Any]) -> dict[str, Any]:
         "system": system,
         "integrator": {
             "temperature_K": proposal["temperature_K"],
+            "pressure_bar": proposal["pressure_bar"],
             "timestep_fs": proposal["timestep_fs"],
         },
         "observable": {

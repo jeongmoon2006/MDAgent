@@ -32,6 +32,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import mdtraj as md  # noqa: E402
 import streamlit as st  # noqa: E402
+import yaml  # noqa: E402
 import streamlit.components.v1 as components  # noqa: E402
 
 from mdpilot.diagnostics import free_energy  # noqa: E402
@@ -354,6 +355,46 @@ def draft_task_file(objective: str, sink) -> str:
 # Columns
 # --------------------------------------------------------------------------
 
+def _envelope_note(
+    opening_ns: float, max_ext_ns: float, max_rounds: int, cap_ns: float
+) -> str:
+    """The compute this configuration can actually consume.
+
+    `max_rounds` on its own says nothing about time — a round is an opening
+    round or an extension, and the scientist picks extension lengths within a
+    ceiling. Worth stating outright that only the *biased* phase has an ns
+    budget: `run_campaign` gates its budget check on `in_metad`, so a campaign
+    that keeps extending without pivoting is bounded by the round count alone.
+    """
+    per_later_round = max(opening_ns, max_ext_ns)
+    worst = opening_ns + (max_rounds - 1) * per_later_round
+    return (
+        f"**Envelope:** up to {max_rounds} rounds — {opening_ns:g} ns opening, "
+        f"then up to {max_ext_ns:g} ns each, so **at most ~{worst:g} ns total**. "
+        f"At most {cap_ns:g} ns of that may be biased. The unbiased phase has "
+        f"no ns budget — only the round count bounds it."
+    )
+
+
+def _budget_note(task_yaml: str, cap_ns: float) -> str:
+    """Say plainly what the cap does to the task file's own budget.
+
+    Overrides always win, in both directions, so a file asking for 20 ns runs
+    at whatever is set here — higher or lower. Leaving that implicit is how
+    someone launches a shakedown believing they launched the real campaign.
+    """
+    try:
+        declared = (yaml.safe_load(task_yaml) or {})["done_criterion"]["max_biased_ns"]
+    except Exception:
+        return f"Biased phase will run to **{cap_ns:g} ns**."
+    if float(declared) == float(cap_ns):
+        return f"Biased phase will run to **{cap_ns:g} ns**, matching the task file."
+    return (
+        f"Task file asks for **{float(declared):g} ns** of biased sampling; this "
+        f"cap replaces it, so the campaign will run to **{cap_ns:g} ns**."
+    )
+
+
 def render_configurator() -> None:
     st.subheader("① Copilot")
     st.caption("Describe the science. The setup agent drafts a task file you review.")
@@ -384,16 +425,43 @@ def render_configurator() -> None:
         help="Validated by mdpilot.task_file before anything runs.",
     )
 
-    with st.expander("Run bounds (not owned by the task file)"):
+    with st.expander("Run bounds — set here, not by the task file"):
         c1, c2 = st.columns(2)
-        initial_ns = c1.number_input("first round (ns)", 0.01, 20.0, 0.05, 0.01, format="%.2f")
-        max_rounds = c2.number_input("max rounds", 1, 40, 4)
-        cap_ns = c1.number_input("biased budget cap (ns)", 0.05, 200.0, 0.10, 0.05, format="%.2f")
-        frame_ps = c2.number_input("frame every (ps)", 0.1, 20.0, 0.2, 0.1, format="%.1f")
+        opening_ns = c1.number_input(
+            "opening round (ns)", 0.01, 20.0, 0.05, 0.01, format="%.2f",
+            help="Length of the first round of any phase: round 1, the first "
+                 "biased round after a pivot, and the first round on a new CV. "
+                 "LOCKED into the campaign at first run — a resume must repeat "
+                 "it.",
+        )
+        max_ext_ns = c2.number_input(
+            "max extension round (ns)", 0.01, 20.0, 2.0, 0.05, format="%.2f",
+            help="Ceiling on a single `extend` round. The scientist asks for a "
+                 "length each round (0.5 ns if it does not say); this clamps "
+                 "the request. A loop bound: free to differ on every run.",
+        )
+        max_rounds = c1.number_input(
+            "max rounds", 1, 40, 4,
+            help="Total rounds, vanilla and biased together.",
+        )
+        cap_ns = c2.number_input(
+            "biased budget cap (ns)", 0.05, 200.0, 0.10, 0.05, format="%.2f",
+            help="Cumulative metadynamics time, across rounds and resumes. "
+                 "REPLACES the task file's own max_biased_ns in both "
+                 "directions — the file's value is never used from here.",
+        )
+        frame_ps = c1.number_input(
+            "frame every (ps)", 0.1, 20.0, 0.2, 0.1, format="%.1f",
+            help="Trajectory sampling interval. LOCKED into the campaign at "
+                 "first run, because every diagnostic is computed on these "
+                 "frames.",
+        )
+        st.caption(_envelope_note(opening_ns, max_ext_ns, int(max_rounds), cap_ns))
+        st.caption(_budget_note(st.session_state.get("yaml", ""), cap_ns))
         st.caption(
-            "Defaults are shakedown-sized on purpose — a click should not "
-            "start a 20 ns campaign. The task file's own budget applies once "
-            "you raise the cap."
+            "**opening round** and **frame every** are locked into the campaign "
+            "the first time it runs, so resuming must repeat them. The rest may "
+            "differ every time."
         )
 
     name = st.text_input("Campaign directory", value="ui_campaign")
@@ -418,9 +486,10 @@ def render_configurator() -> None:
                 fresh,
                 task_path,
                 {
-                    "initial_steps": int(initial_ns * steps_per_ns),
+                    "initial_steps": int(opening_ns * steps_per_ns),
                     "report_interval_steps": max(int(frame_ps * steps_per_ns / 1000), 1),
                     "max_rounds": int(max_rounds),
+                    "max_extra_ns": float(max_ext_ns),
                     "max_biased_ns": float(cap_ns),
                 },
             )

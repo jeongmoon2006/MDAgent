@@ -52,8 +52,20 @@ from mdpilot.observables import ObservableSpec
 # into asserting a number nothing uses any more.
 _VERIFIED: dict[tuple[str, str], Any] = {
     ("system", "ionic_strength_M"): _omm._SALT_M,
+    # Nonbonded treatment. Invisible until now and reproducibility-critical:
+    # a free-energy surface is not interpretable without knowing the cutoff and
+    # how long-range electrostatics were handled.
+    ("system", "nonbonded_cutoff_nm"): _omm._NONBONDED_CUTOFF_NM,
+    ("system", "electrostatics"): "PME",
+    # Coupling. The *algorithms* stay engine-owned — OpenMM's LangevinMiddle
+    # and MonteCarloBarostat are idiomatic equivalents of GROMACS's `sd` and
+    # C-rescale, not interchangeable names — so they are declared here and
+    # checked rather than chosen. The thermodynamic state they target
+    # (temperature, pressure) is a real parameter and lives on `Ensemble`.
     ("integrator", "type"): "LangevinMiddle",
     ("integrator", "friction_per_ps"): _omm._FRICTION_PER_PS,
+    ("integrator", "barostat"): "MonteCarloBarostat",
+    ("integrator", "barostat_interval_steps"): _omm._BAROSTAT_INTERVAL,
     ("integrator", "constraints"): "HBonds",
     ("diagnostics", "target_ess"): inspect.signature(
         autocorrelation
@@ -172,7 +184,7 @@ def _build_spec(doc: dict[str, Any], path: Path) -> SystemSpec:
     _reject_unknown(
         "integrator",
         set(integrator),
-        {"temperature_K", "timestep_fs"}
+        {"temperature_K", "pressure_bar", "timestep_fs"}
         | {k for s, k in _VERIFIED if s == "integrator"},
         path,
     )
@@ -180,6 +192,8 @@ def _build_spec(doc: dict[str, Any], path: Path) -> SystemSpec:
     ensemble_kwargs: dict[str, Any] = {}
     if "temperature_K" in integrator:
         ensemble_kwargs["temperature_k"] = float(integrator["temperature_K"])
+    if "pressure_bar" in integrator:
+        ensemble_kwargs["pressure_bar"] = float(integrator["pressure_bar"])
     if "timestep_fs" in integrator:
         ensemble_kwargs["timestep_fs"] = float(integrator["timestep_fs"])
     ensemble = Ensemble(**ensemble_kwargs)

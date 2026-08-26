@@ -26,13 +26,23 @@ system:
   forcefield: amber14/tip3p       # a validated protein+water pair; see mdpilot.forcefields
   padding_nm: 1.5              # raised from 1.0 after F11 (periodic self-interaction)
   ionic_strength_M: 0.15
+  nonbonded_cutoff_nm: 1.0     # checked against the adapter
+  electrostatics: PME
   starting_state: folded      # 5AWL is the native beta-hairpin
 
 integrator:
-  type: LangevinMiddle
+  # Thermodynamic state — real parameters.
   temperature_K: 300.0
-  friction_per_ps: 1.0
+  pressure_bar: 1.0
   timestep_fs: 2.0
+  # Coupling algorithms and nonbonded treatment: declared here and checked
+  # against what the engine actually does, so the file cannot drift from the
+  # run. Not yet choosable — OpenMM's LangevinMiddle / MonteCarloBarostat are
+  # idiomatic equivalents of GROMACS's sd / C-rescale, not interchangeable.
+  type: LangevinMiddle
+  friction_per_ps: 1.0
+  barostat: MonteCarloBarostat
+  barostat_interval_steps: 25
   constraints: HBonds
 
 # The coordinate every round is judged on, and the one `done_criterion.states`

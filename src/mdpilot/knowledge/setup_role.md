@@ -46,6 +46,11 @@ request only asks whether a transition happens at all.
 something else. The timestep may not exceed 2.5 fs — no hydrogen mass
 repartitioning is implemented.
 
+**Pressure** is 1.0 bar unless the science is about pressure itself. Production
+is NPT — the box is free to breathe — so the density relaxes to the force
+field's own equilibrium rather than being frozen at whatever the solvation step
+produced.
+
 **Do not raise the temperature to accelerate sampling.** That reflex belongs to
 unbiased MD. This campaign may pivot to metadynamics, and it is the bias that
 crosses the barrier — an elevated temperature does not sample the same surface

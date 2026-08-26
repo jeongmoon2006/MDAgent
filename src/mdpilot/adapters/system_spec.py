@@ -61,6 +61,13 @@ class Ensemble:
     that silently joins two halves of a campaign sampled under different
     conditions.
 
+    Pressure is here for the same reason temperature is: it is thermodynamic
+    state, not an engine detail. The *coupling algorithms* are not — OpenMM
+    uses LangevinMiddle and MonteCarloBarostat where GROMACS uses `sd` and
+    C-rescale, which are idiomatic equivalents rather than interchangeable
+    names. Those stay engine-owned and are declared-and-checked in the task
+    file instead.
+
     Temperature is not a setup-only knob. It also sets PLUMED's `TEMP=` (and
     so the well-tempered scaling factor), the initial hill height in
     `bias_designer`, and the kT the free-energy convergence threshold is taken
@@ -68,12 +75,19 @@ class Ensemble:
     """
 
     temperature_k: float = 300.0
+    pressure_bar: float = 1.0
     timestep_fs: float = 2.0
 
     def __post_init__(self) -> None:
         if self.temperature_k <= 0:
             raise ValueError(
                 f"Ensemble: temperature_k must be positive (got {self.temperature_k})"
+            )
+        if self.pressure_bar <= 0:
+            raise ValueError(
+                f"Ensemble: pressure_bar must be positive (got "
+                f"{self.pressure_bar}). Production is NPT; there is no NVT "
+                f"path, so 0 is not a way to switch the barostat off."
             )
         if self.timestep_fs <= 0:
             raise ValueError(
@@ -91,8 +105,68 @@ class Ensemble:
     def to_dict(self) -> dict[str, Any]:
         return {
             "temperature_k": self.temperature_k,
+            "pressure_bar": self.pressure_bar,
             "timestep_fs": self.timestep_fs,
         }
+
+
+@dataclass(frozen=True)
+class Equilibration:
+    """How the system reaches the target state before production starts.
+
+    Stated in **picoseconds**, not steps. The adapters convert against their
+    own timestep, so halving the timestep no longer silently halves how long
+    the system was equilibrated for — which is what a step count does, and
+    which nothing would have caught.
+
+    Both stages at 0 skips equilibration entirely. Only useful for tests that
+    need the setup pipeline without the MD cost; a run started that way is not
+    physically comparable to a production one.
+    """
+
+    nvt_ps: float = 100.0        # staged heating, at constant volume
+    npt_ps: float = 100.0        # density relaxation at the target pressure
+    heat_start_k: float = 50.0   # bottom of the temperature ramp
+    heat_stages: int = 6         # equal steps from heat_start_k to the target
+
+    def __post_init__(self) -> None:
+        if self.nvt_ps < 0 or self.npt_ps < 0:
+            raise ValueError(
+                f"Equilibration: stage lengths cannot be negative (got "
+                f"nvt_ps={self.nvt_ps}, npt_ps={self.npt_ps})"
+            )
+        if self.heat_stages < 1:
+            raise ValueError(
+                f"Equilibration: heat_stages must be >= 1 (got {self.heat_stages})"
+            )
+        if self.heat_start_k <= 0:
+            raise ValueError(
+                f"Equilibration: heat_start_k must be positive (got "
+                f"{self.heat_start_k})"
+            )
+
+    def nvt_steps(self, timestep_fs: float) -> int:
+        return int(round(self.nvt_ps * 1000.0 / timestep_fs))
+
+    def npt_steps(self, timestep_fs: float) -> int:
+        return int(round(self.npt_ps * 1000.0 / timestep_fs))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "nvt_ps": self.nvt_ps,
+            "npt_ps": self.npt_ps,
+            "heat_start_k": self.heat_start_k,
+            "heat_stages": self.heat_stages,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Equilibration":
+        return cls(
+            nvt_ps=float(data.get("nvt_ps", 100.0)),
+            npt_ps=float(data.get("npt_ps", 100.0)),
+            heat_start_k=float(data.get("heat_start_k", 50.0)),
+            heat_stages=int(data.get("heat_stages", 6)),
+        )
 
 
 @dataclass(frozen=True)
@@ -106,6 +180,7 @@ class SystemSpec:
     # A key into `mdpilot.forcefields`, not a file list: the combination is
     # engine-agnostic here and each adapter resolves it to its own names.
     forcefield: str = forcefields.DEFAULT_KEY
+    equilibration: Equilibration = field(default_factory=Equilibration)
 
     def __post_init__(self) -> None:
         if (self.pdb_id is None) == (self.structure_path is None):
@@ -150,4 +225,8 @@ class SystemSpec:
         # what every campaign recorded before the field existed was built with.
         if self.forcefield != forcefields.DEFAULT_KEY:
             spec["forcefield"] = self.forcefield
+        # Same omit-when-default rule: this default is what every campaign
+        # recorded before the field existed was equilibrated with.
+        if self.equilibration != Equilibration():
+            spec["equilibration"] = self.equilibration.to_dict()
         return spec

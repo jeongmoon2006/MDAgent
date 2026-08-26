@@ -29,7 +29,6 @@ from mdpilot.adapters.openmm_adapter import (
     _BAROSTAT_INTERVAL,
     _HEAT_STAGES,
     _HEAT_START_K,
-    _PRESSURE_BAR,
     OpenMMAdapter,
 )
 from mdpilot.adapters.system_spec import Ensemble, SystemSpec
@@ -105,7 +104,7 @@ def test_barostat_carries_pressure_temperature_and_seed(tmp_path: Path) -> None:
     barostat = adapter._make_barostat()
 
     assert barostat.getDefaultPressure().value_in_unit(unit.bar) == pytest.approx(
-        _PRESSURE_BAR
+        adapter.spec.ensemble.pressure_bar
     )
     assert barostat.getDefaultTemperature().value_in_unit(
         unit.kelvin
@@ -120,7 +119,7 @@ def test_barostat_carries_pressure_temperature_and_seed(tmp_path: Path) -> None:
 
 def test_nvt_mdp_anneals_from_start_to_target_and_generates_velocities() -> None:
     mdp = _NVT_MDP_TEMPLATE.format(
-        nsteps=50_000, anneal_ps="100", seed=42, ref_t=300.0, dt_ps=0.002
+        nsteps=50_000, anneal_ps="100", seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
     )
 
     assert "annealing            = single" in mdp
@@ -134,7 +133,7 @@ def test_nvt_mdp_anneals_from_start_to_target_and_generates_velocities() -> None
 
 def test_npt_mdp_couples_pressure_and_continues_from_nvt() -> None:
     mdp = _NPT_MDP_TEMPLATE.format(
-        nsteps=50_000, seed=42, ref_t=300.0, dt_ps=0.002
+        nsteps=50_000, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
     )
 
     assert "pcoupl               = C-rescale" in mdp
@@ -146,7 +145,7 @@ def test_npt_mdp_couples_pressure_and_continues_from_nvt() -> None:
 
 def test_production_mdp_keeps_the_barostat_on() -> None:
     mdp = _MD_MDP_TEMPLATE.format(
-        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, dt_ps=0.002
+        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
     )
 
     assert "pcoupl               = C-rescale" in mdp
@@ -157,7 +156,7 @@ def test_production_mdp_cold_start_override_still_matches() -> None:
     """`run_steps` rewrites two exact lines for the equilibration-disabled
     path. If the template's spacing drifts, that surgery silently no-ops."""
     mdp = _MD_MDP_TEMPLATE.format(
-        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, dt_ps=0.002
+        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
     )
 
     assert "gen-vel              = no" in mdp
@@ -262,7 +261,7 @@ def test_gromacs_mdp_renders_the_ensemble_not_a_baked_constant() -> None:
     """`ref-t` and `dt` were f-string-interpolated at import, so no campaign
     could change them. They are format placeholders now."""
     mdp = _MD_MDP_TEMPLATE.format(
-        nsteps=1000, report_interval=500, seed=42, ref_t=240.0, dt_ps=0.001
+        nsteps=1000, report_interval=500, seed=42, ref_t=240.0, ref_p=1.0, dt_ps=0.001
     )
 
     assert "ref-t                = 240.0" in mdp
@@ -318,3 +317,25 @@ def test_both_adapters_take_the_box_from_the_spec() -> None:
     assert '"-d", str(self._spec.padding_nm),' in gromacs_src
     for src in (openmm_src, gromacs_src):
         assert "_PADDING_NM" not in src
+
+
+def test_pressure_comes_from_the_ensemble(tmp_path: Path) -> None:
+    """Thermodynamic state, like temperature — not an engine constant."""
+    adapter = OpenMMAdapter(
+        work_dir=tmp_path,
+        spec=SystemSpec(pdb_id="1L2Y", ensemble=Ensemble(pressure_bar=400.0)),
+    )
+
+    assert adapter._make_barostat().getDefaultPressure().value_in_unit(
+        unit.bar
+    ) == pytest.approx(400.0)
+
+
+def test_gromacs_renders_the_ensemble_pressure() -> None:
+    mdp = _MD_MDP_TEMPLATE.format(
+        nsteps=1, report_interval=500, seed=42,
+        ref_t=300.0, ref_p=400.0, dt_ps=0.002,
+    )
+
+    assert "ref-p                = 400.0" in mdp
+    assert "pcoupl               = C-rescale" in mdp     # still NPT

@@ -228,3 +228,36 @@ def test_choosing_a_campaign_still_renders_it() -> None:
     assert not at.exception, at.exception
     assert [s.label for s in at.selectbox] == ["Campaign", "Round"]
     assert len(at.tabs) == 3
+
+
+# ---------- the run-bounds panel must state what it will actually cost ----------
+
+def test_the_envelope_states_the_real_ceiling() -> None:
+    """`max rounds` alone says nothing about time. A round is either an opening
+    round or an extension, and the scientist picks extension lengths within a
+    ceiling that the panel did not expose at all."""
+    note = app._envelope_note(1.0, 2.0, 20, 20.0)
+
+    assert "up to 20 rounds" in note
+    assert "~39 ns total" in note          # 1 + 19*2
+    assert "20 ns of that may be biased" in note
+
+
+def test_the_envelope_says_the_unbiased_phase_is_uncapped() -> None:
+    """`run_campaign` gates its budget check on `in_metad`, so a campaign that
+    keeps extending without pivoting is bounded by the round count alone. That
+    is invisible from the controls."""
+    assert "unbiased phase has no ns budget" in app._envelope_note(0.05, 2.0, 4, 0.1)
+
+
+def test_the_budget_note_says_the_cap_replaces_the_files_value() -> None:
+    """Overrides always win, in both directions. Someone could raise the cap to
+    5, believe the file's 20 ns was in force, and get a quarter of a campaign."""
+    task_yaml = Path("benchmarks/tasks/cln025_contacts.yaml").read_text()
+
+    assert "20 ns" in app._budget_note(task_yaml, 0.1)
+    assert "0.1 ns" in app._budget_note(task_yaml, 0.1)
+    assert "matching the task file" in app._budget_note(task_yaml, 20.0)
+    # An unparseable editor buffer must not take the panel down.
+    assert app._budget_note("not: [valid", 0.1)
+    assert app._budget_note("", 0.1)

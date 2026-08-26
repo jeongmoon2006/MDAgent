@@ -46,7 +46,6 @@ _TAU_T_PS = 1.0          # inverse friction; 1/friction_per_ps with friction = 1
 # so they are locked by the campaign config on resume. They were previously
 # baked into these templates at import, which made them unreachable.
 _CUTOFF_NM = 1.0
-_PRESSURE_BAR = 1.0
 _TAU_P_PS = 2.0
 _COMPRESSIBILITY = 4.5e-5   # bar^-1, water
 # Equilibration mirrors the OpenMM adapter: 50 K -> 300 K ramp under the same
@@ -161,7 +160,7 @@ ref-t                = {{ref_t}}
 pcoupl               = C-rescale
 pcoupltype           = isotropic
 tau-p                = {_TAU_P_PS}
-ref-p                = {_PRESSURE_BAR}
+ref-p                = {{ref_p}}
 compressibility      = {_COMPRESSIBILITY}
 
 constraints          = h-bonds
@@ -203,7 +202,7 @@ ref-t                = {{ref_t}}
 pcoupl               = C-rescale
 pcoupltype           = isotropic
 tau-p                = {_TAU_P_PS}
-ref-p                = {_PRESSURE_BAR}
+ref-p                = {{ref_p}}
 compressibility      = {_COMPRESSIBILITY}
 
 constraints          = h-bonds
@@ -485,6 +484,7 @@ class GROMACSAdapter:
                 report_interval=(report_interval_steps if trajectory_path is not None else 0),
                 seed=self._seed,
                 ref_t=self.temperature_k,
+                ref_p=self._spec.ensemble.pressure_bar,
                 dt_ps=self._timestep_ps,
             )
         )
@@ -511,6 +511,7 @@ class GROMACSAdapter:
                 report_interval=(report_interval_steps if trajectory_path is not None else 0),
                 seed=self._seed,
                 ref_t=self.temperature_k,
+                ref_p=self._spec.ensemble.pressure_bar,
                 dt_ps=self._timestep_ps,
             ).replace("gen-vel              = no", f"gen-vel              = yes\ngen-temp             = {self.temperature_k}\ngen-seed             = {self._seed}") \
              .replace("continuation         = yes", "continuation         = no")
@@ -601,6 +602,7 @@ class GROMACSAdapter:
                 nsteps=npt_steps,
                 seed=self._seed,
                 ref_t=self.temperature_k,
+                ref_p=self._spec.ensemble.pressure_bar,
                 dt_ps=self._timestep_ps,
             )
         )
