@@ -6,9 +6,11 @@
 # detect that inadequacy itself, pivot to metadynamics, and the biased run must
 # actually cross the barrier.
 #
-# `task_expectation` below is the string threaded into every scientist.decide()
-# call. It is the only input gating `switch_to_metad`, and it is locked into the
-# campaign config, so it must be passed identically on every resume.
+# The `task_expectation` string threaded into every scientist.decide() call is
+# rendered from `expectation:` + `done_criterion:` by mdpilot.task_file, not
+# authored here. It is the only input gating `switch_to_metad` and is locked
+# into the campaign config, so it must render identically on every resume —
+# which it does, because it is a function of these fields.
 
 name: cln025_folding
 description: |

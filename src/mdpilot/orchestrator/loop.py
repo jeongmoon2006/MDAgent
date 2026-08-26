@@ -128,9 +128,11 @@ def run_campaign(
     `adapter` defaults to `OpenMMAdapter(work_dir=work_dir, seed=seed)`.
     Pass a different `MDAdapter` to run through another engine.
 
-    `state_thresholds` is `(folded, extended)` on the campaign observable
-    (CA-RMSD to the campaign reference, in Angstrom) — the states the *task*
-    defines. When given, biased-round recrossings are counted there rather than
+    `state_thresholds` is `(low, high)` on the campaign observable — the two
+    states the *task* defines, as positions on that coordinate rather than as
+    roles. For a folding campaign that is (native, extended) on CA-RMSD; for a
+    binding campaign it is (bound, unbound) on a distance, and nothing here
+    changes. When given, biased-round recrossings are counted there rather than
     between the two deepest basins of the current free-energy surface. The
     surface-derived band moves as the bias fills, vanishes when fewer than two
     basins resolve, and collapses once the barrier is filled, so a count taken
@@ -198,16 +200,15 @@ def run_campaign(
             "needs the task's own state definitions to count recrossings "
             "against; without them the count is taken between whichever two "
             "basins are currently deepest, which means something different "
-            "every round. Pass state_thresholds=(folded, extended) on the "
-            "campaign observable (CA-RMSD to the campaign reference, in "
-            "Angstrom)."
+            "every round. Pass state_thresholds=(low, high) on the campaign "
+            "observable."
         )
     if state_thresholds is not None:
         low, high = state_thresholds
         if not high > low:
             raise ValueError(
-                f"run_campaign: state_thresholds must be (folded, extended) "
-                f"with extended > folded; got {state_thresholds!r}. "
+                f"run_campaign: state_thresholds must be (low, high) on the "
+                f"campaign observable with high > low; got {state_thresholds!r}. "
                 f"`count_recrossings` silently returns 0 for an inverted band, "
                 f"so a swapped pair would read as a run that never crossed."
             )

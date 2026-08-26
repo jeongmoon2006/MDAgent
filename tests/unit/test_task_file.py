@@ -51,7 +51,7 @@ def test_cln025_produces_the_kwargs_the_runner_hand_assembled() -> None:
         "max_biased_ns": 20.0,
         "state_thresholds": (1.5, 4.0),
     }
-    # (folded, extended), the order run_campaign refuses to see inverted.
+    # (low, high) on the observable — the order run_campaign refuses inverted.
     assert task.campaign["state_thresholds"][0] < task.campaign["state_thresholds"][1]
 
 
@@ -136,3 +136,162 @@ def test_the_file_hashes_itself_for_provenance() -> None:
 
     path = _TASKS / "cln025_folding.yaml"
     assert load_task_file(path).sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# ---------- task_expectation is rendered, not authored ----------
+#
+# It is the only input gating `switch_to_metad`, and it was the one
+# load-bearing input that escaped structuring. These pin that the prose and the
+# typed fields agree *by construction* rather than by an author keeping two
+# copies in step.
+
+def _campaign_doc(**criterion_overrides) -> dict:
+    doc = _minimal()
+    doc["observable"] = {"name": "rmsd_ca_to_reference_angstrom"}
+    doc["integrator"] = {"temperature_K": 300.0}
+    doc["expectation"] = {
+        "objective": "Sample the transition in both directions.",
+        "characteristic_timescale_ns": 800.0,
+        "timescale_source": "Someone et al. 2011",
+    }
+    doc["done_criterion"] = {
+        "states": {
+            "low": {"name": "native beta-hairpin", "threshold": 1.5},
+            "high": {"name": "extended", "threshold": 4.0},
+        },
+        "min_recrossings": 2,
+        "max_biased_ns": 20.0,
+        **criterion_overrides,
+    }
+    return doc
+
+
+def test_every_decision_driving_number_appears_in_the_rendered_prose() -> None:
+    task = load_task_file(_TASKS / "cln025_folding.yaml")
+    prose = task.campaign["task_expectation"]
+
+    lo, hi = task.campaign["state_thresholds"]
+    for value in (lo, hi, task.campaign["min_recrossings"],
+                  task.campaign["max_biased_ns"]):
+        assert f"{value:g}" in prose, (value, prose)
+
+
+def test_changing_a_typed_field_changes_the_prose(tmp_path: Path) -> None:
+    """The drift test. Under the old free-text expectation the thresholds were
+    restated in words, so editing done_criterion left the prose stale and
+    nothing noticed."""
+    from mdpilot.task_file import render_task_expectation
+
+    base = render_task_expectation(_campaign_doc())
+    for override in (
+        {"min_recrossings": 1},
+        {"max_biased_ns": 5.0},
+        {"states": {
+            "low": {"name": "native beta-hairpin", "threshold": 2.0},
+            "high": {"name": "extended", "threshold": 4.0},
+        }},
+    ):
+        assert render_task_expectation(_campaign_doc(**override)) != base, override
+
+
+def test_the_budget_versus_timescale_comparison_is_computed(tmp_path: Path) -> None:
+    """`phase_vanilla` asks the scientist to compare cumulative simulation time
+    against the characteristic timescale. Doing the arithmetic here means it is
+    not doing it on prose."""
+    from mdpilot.task_file import render_task_expectation
+
+    prose = render_task_expectation(_campaign_doc())
+
+    assert "40x shorter" in prose          # 800 ns / 20 ns
+    assert "Someone et al. 2011" in prose  # the one free fact carries its source
+
+
+def test_an_authored_task_expectation_is_not_accepted(tmp_path: Path) -> None:
+    """Allowing both would reintroduce exactly the drift rendering removes."""
+    doc = _campaign_doc()
+    doc["task_expectation"] = "hand-written prose"
+
+    with pytest.raises(ValueError, match="unknown <top level> key"):
+        load_task_file(_write(tmp_path, doc))
+
+
+# ---------- the schema is not folding-shaped ----------
+
+def _ligand_doc() -> dict:
+    """A protein-ligand binding campaign. Same mechanics, different states."""
+    doc = _minimal(starting_pdb="1STP")
+    doc["observable"] = {"name": "ligand_com_distance_nm"}
+    doc["expectation"] = {
+        "objective": "Sample binding and unbinding of the ligand.",
+        "characteristic_timescale_ns": 50_000.0,
+        "timescale_source": "residence time ~50 us, SPR",
+    }
+    doc["done_criterion"] = {
+        "states": {
+            "low": {"name": "bound", "threshold": 0.4},
+            "high": {"name": "unbound", "threshold": 1.5},
+        },
+        "min_recrossings": 2,
+        "max_biased_ns": 100.0,
+    }
+    return doc
+
+
+def test_the_renderer_is_not_folding_shaped() -> None:
+    """The goal is a general MD agent. `low`/`high` name bands on whatever the
+    campaign observable is; a binding campaign uses the same mechanics on a
+    distance and `count_recrossings` is unchanged."""
+    from mdpilot.task_file import render_task_expectation
+
+    prose = render_task_expectation(_ligand_doc())
+
+    assert '"unbound" state (ligand_com_distance_nm > 1.5)' in prose
+    assert '"bound" state (ligand_com_distance_nm < 0.4)' in prose
+    assert "500x shorter" in prose          # 50 us residence vs 100 ns budget
+    assert "fold" not in prose.lower()      # no folding vocabulary anywhere
+
+
+def test_a_non_protein_observable_is_refused_until_it_is_tunable(
+    tmp_path: Path,
+) -> None:
+    """The blocker for binding campaigns, made explicit rather than latent.
+
+    `diagnostics.report.campaign_observable` selects `protein and name CA` and
+    raises on an empty selection, so CA-RMSD is the only observable the loop
+    can compute. A task file may declare a ligand distance only once that is
+    real — this refusal is what stops a binding campaign from silently being
+    judged on protein RMSD.
+    """
+    with pytest.raises(ValueError, match="not tunable yet"):
+        load_task_file(_write(tmp_path, _ligand_doc()))
+
+
+# ---------- structural refusals a generated file will hit ----------
+
+def test_an_inverted_state_band_raises(tmp_path: Path) -> None:
+    doc = _campaign_doc(states={
+        "low": {"name": "extended", "threshold": 4.0},
+        "high": {"name": "native", "threshold": 1.5},
+    })
+    with pytest.raises(ValueError, match="high.threshold > low.threshold"):
+        load_task_file(_write(tmp_path, doc))
+
+
+def test_an_expectation_without_states_raises_naming_the_block(
+    tmp_path: Path,
+) -> None:
+    """run_campaign refuses this too, but from the loop's vantage the message
+    names an argument the task-file author never sees."""
+    doc = _campaign_doc()
+    del doc["done_criterion"]["states"]
+
+    with pytest.raises(ValueError, match="done_criterion.states is missing"):
+        load_task_file(_write(tmp_path, doc))
+
+
+def test_an_unknown_expectation_key_raises(tmp_path: Path) -> None:
+    doc = _campaign_doc()
+    doc["expectation"]["timescale_us"] = 0.8   # plausible unit slip
+
+    with pytest.raises(ValueError, match="unknown expectation key"):
+        load_task_file(_write(tmp_path, doc))

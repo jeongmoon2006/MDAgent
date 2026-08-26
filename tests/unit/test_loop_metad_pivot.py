@@ -923,7 +923,7 @@ def test_inverted_state_thresholds_are_refused(
     so a swapped pair would read as a campaign that never crossed."""
     _stub_collaborators(monkeypatch, [_stop()])
 
-    with pytest.raises(ValueError, match="extended > folded"):
+    with pytest.raises(ValueError, match="high > low"):
         run_campaign(
             work_dir=tmp_path / "campaign",
             adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),

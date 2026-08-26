@@ -95,17 +95,22 @@ def run(task: TaskFile, work_dir: Path, *, dry_run: bool) -> tuple[CampaignResul
 def verify_done_criterion(
     result: CampaignResult, task: TaskFile, steps_per_ns: int
 ) -> dict[str, Any]:
-    """Check the campaign against the task's CA-RMSD criterion, post-hoc.
+    """Check the campaign against the task's own state definitions, post-hoc.
 
     The loop judges the biased phase along the CV the scientist proposed. This
     asks the separate question the task actually poses: did the system visit
-    both the extended (CA-RMSD > 4.0 A) and native (< 1.5 A) states, and did it
-    come back? Concatenating the biased rounds in order gives the whole biased
-    trajectory, so a crossing that straddles a round boundary still counts.
+    both states the task names, and did it come back? Concatenating the biased
+    rounds in order gives the whole biased trajectory, so a crossing that
+    straddles a round boundary still counts.
+
+    The thresholds come from `task.campaign["state_thresholds"]` — the same
+    tuple the loop was given — rather than being re-read from the criterion, so
+    the post-hoc check and the in-loop count cannot be taken against different
+    bands.
     """
     criterion = task.done_criterion
-    lo = float(criterion["folded_state_rmsd_angstrom"])
-    hi = float(criterion["extended_state_rmsd_angstrom"])
+    lo, hi = task.campaign["state_thresholds"]
+    states = criterion["states"]
 
     biased = [r for r in result.rounds if r.plumed_dat_path is not None]
     pivoted = any(r.decision.decision == "switch_to_metad" for r in result.rounds)
@@ -117,13 +122,16 @@ def verify_done_criterion(
 
     return {
         "pivoted": pivoted,
+        "states": {
+            "low": {**states["low"], "reached": bool(rmsd.size and rmsd.min() < lo)},
+            "high": {**states["high"], "reached": bool(rmsd.size and rmsd.max() > hi)},
+        },
+        "observable": task.observable_name,
         "n_biased_rounds": len(biased),
         "biased_ns": sum(r.n_steps for r in biased) / steps_per_ns,
-        "rmsd_min_angstrom": float(rmsd.min()) if rmsd.size else None,
-        "rmsd_max_angstrom": float(rmsd.max()) if rmsd.size else None,
-        "reached_folded": bool(rmsd.size and rmsd.min() < lo),
-        "reached_extended": bool(rmsd.size and rmsd.max() > hi),
-        "rmsd_recrossings": recrossings,
+        "observable_min": float(rmsd.min()) if rmsd.size else None,
+        "observable_max": float(rmsd.max()) if rmsd.size else None,
+        "recrossings": recrossings,
         "min_recrossings_required": int(criterion["min_recrossings"]),
         "passed": bool(
             pivoted and recrossings >= int(criterion["min_recrossings"])
@@ -172,7 +180,7 @@ def main() -> None:
             print(f"      CV: {r.decision.metad_proposal.to_dict()}")
 
     verdict = verify_done_criterion(result, task, steps_per_ns)
-    print("\n=== done criterion (CA-RMSD, post-hoc) ===")
+    print(f"\n=== done criterion ({task.observable_name}, post-hoc) ===")
     print(json.dumps(verdict, indent=2))
     (work_dir / "done_criterion.json").write_text(json.dumps(verdict, indent=2))
 

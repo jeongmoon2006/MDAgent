@@ -187,6 +187,17 @@ This is the same defect as the trailing-duplicate surface `sum_hills` already po
 
 *Second defect, same session:* `sum_hills` never cleared `out_dir`. A round re-run after a crash resumes from the previous round's restored (shorter) HILLS and writes fewer indexed surfaces, while leftovers from the aborted attempt survive — `indexed.sort()` then puts a stale surface last and `surfaces[-1]`, the profile every statistic is taken on, is from the previous attempt. Stale outputs are now removed before plumed is invoked. The unit test that fabricated sum_hills' output beforehand was rewritten so the fake subprocess writes it *during* the call, which is what the real binary does.
 
+### D7 — The task file is the campaign contract, and `task_expectation` is rendered from it (2026-08-26)
+**Goal context:** MDPilot is aimed at being a *general* MD agent — chignolin folding is the current forcing function, protein-ligand binding/unbinding is the next, and others follow. Interfaces should therefore be named for mechanics, not for the first problem that used them.
+
+**One file owns what a campaign is.** `benchmarks/tasks/*.yaml` was decorative: `run_cln025.py` read four fields and every other declaration — force field, water model, padding, ionic strength, timestep, constraints, observable, target ESS — was documentation the adapters were free to contradict. `mdpilot/task_file.py` makes it load-bearing, in three modes per field: **mapped** (becomes a `SystemSpec`/`Ensemble` or a `run_campaign` keyword), **verified** (not yet tunable, so checked against the constant that really governs it — a mismatch raises), **informational** (prose, carried not interpreted). Unknown keys raise, which is how a generated file's typos surface.
+
+**`task_expectation` is rendered, not authored.** It is the only input gating `switch_to_metad`, and it was the one load-bearing input that escaped structuring — free prose that restated the state thresholds, the round-trip requirement and the compute budget in words. Three of its four decision-driving numbers existed twice with nothing linking the copies. It is now a *view* of `expectation:` + `done_criterion:`, so drift is unrepresentable. Only the objective and the characteristic timescale are genuinely free, and the timescale carries a source because it is the one decision-driving number that exists nowhere else. The budget-vs-timescale comparison the pivot rule asks for is computed rather than left as arithmetic on prose.
+
+**States are positions, not roles.** `done_criterion.states.{low,high}` each carry a `name` and a `threshold` on the campaign observable, replacing `folded_state_rmsd_angstrom` / `extended_state_rmsd_angstrom`. `count_recrossings` only ever wanted a low band and a high band; a binding campaign names them `bound`/`unbound` on a distance and nothing in the mechanics changes. `run_campaign`'s `state_thresholds` documentation and error messages were reworded the same way.
+
+**Known blocker for the next system class**, now tested rather than latent: `diagnostics.report.campaign_observable` selects `protein and name CA` and raises on an empty selection, so CA-RMSD is the only observable the loop can compute. `task_file` refuses a file declaring any other `observable.name` — see `test_a_non_protein_observable_is_refused_until_it_is_tunable`. A binding campaign needs that generalized first, and per the M3 lesson the abstraction should be discovered from the second real observable, not invented ahead of it.
+
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
 - Do not build a persistent multi-agent system; subagents are ephemeral function calls returning structured artifacts, not prose.
@@ -197,6 +208,15 @@ This is the same defect as the trailing-duplicate surface `sum_hills` already po
 ---
 
 ## 2. Session journal
+
+### 2026-08-26 — Task file becomes the campaign contract; `task_expectation` rendered
+Branch `test`. Recorded as D7. `src/mdpilot/task_file.py` + `tests/unit/test_task_file.py` (20 tests); `run_cln025.py` rewired to load the file instead of hand-assembling kwargs, producing byte-identical `run_campaign` arguments in both dry-run and full mode.
+
+**Two things found by doing it.** `trpcage_convergence.yaml` never parsed — its `diagnostics:` block mixed a sequence and a mapping key, invalid YAML since it was written, and nothing had ever loaded it. Fixed. And the `observable.name` verification refused a ligand-distance test case, which is correct and surfaced the protein-CA blocker as a tested fact.
+
+**Pre-existing, not caused by this work:** all four on-disk campaigns are already unresumable. `min_recrossings` and `state_thresholds` were added to the config lock after they were created (`git show HEAD` confirms both keys predate this session), so their stored configs are missing keys the loop now computes. `store.py` has migration machinery for the `rounds` *schema* but none for the campaign *config*, so every added key strands every in-flight campaign. Impact today is nil — all four finished — but a 20 ns run interrupted after a future key lands would be lost. Rendering `task_expectation` also changes that locked string, so campaigns started under the authored prose cannot resume under the rendered one either.
+
+279 unit tests pass (9 new here, on top of the day's earlier `Ensemble` work).
 
 ### 2026-08-25 (later) — `Ensemble` on the spec: temperature and timestep become campaign parameters
 Branch `test`. First slice of making setup tunable. `_TEMPERATURE_K` and `_TIMESTEP_FS` / `_TIMESTEP_PS` were adapter class constants — in the GROMACS case interpolated into the mdp templates *at import*, so no campaign could reach them. They now live on `SystemSpec.ensemble`.
