@@ -259,6 +259,19 @@ Measured on the completed campaigns, not inferred. Box is cubic, L ≈ 3.66 nm (
 
 ## 2. Session journal
 
+### 2026-08-26 (night) — Streamlit control surface (`app.py`)
+Branch `test`. **This overrides a stated scope decision**: `ROADMAP.md` lists a web UI under *Deliberately out of scope* — "Terminal + notebooks only until at least Milestone 6". Recorded here rather than left implicit. The justification is that the thing MDPilot is *about* — the scientist deciding, mid-campaign, whether to extend, stop or pivot — reads poorly as a terminal transcript, and a three-column view makes the reasoning legible next to the trajectory and surface it was taken on. It is a view over the existing backend and adds no science: every number it shows is read from `campaigns/<name>/`.
+
+**One core change, deliberately small.** `run_campaign(on_event=...)` — an observer called with `(name, payload)` at `campaign_start`, `round_start`, `simulated`, `report`, `decision`, `override`, `pivot`, `campaign_end`. It cannot influence the run and `_emit` swallows anything it raises: a multi-hour biased run must not die because something watching it threw. Verified by running a campaign with an observer that raises on every event — it completes normally. Every `return` now goes through `_finish`, so the outcome is always reported. This is not a UI-specific seam; a CLI progress bar or M5's HPC monitor wants the same thing, which is why it is a callback rather than the app monkeypatching the loop.
+
+**Structure.** Left: objective → setup agent → editable `task.yaml` → validate → *Lock & Run* (a worker thread; Streamlit forbids `st.*` off the main thread, so the worker only fills a queue the script drains on rerun). Middle: the formatted event stream, plus per-call token accounting from a recording Anthropic client so the setup agent's cache behaviour is visible. Right: campaign and round selectors defaulting to "Latest (agent-driven)", with py3Dmol structure, the free-energy surface, and the raw report.
+
+**Two bugs the build surfaced**, both fixed:
+- `mdtraj.save_pdb` takes a path, not a file object. Handing it a `StringIO` wrote the model to *stdout* and killed the calling script.
+- The viewer reloaded the full trajectory on every rerun — and the app reruns every 1.5 s while a campaign is running. Round 12 of `cln025_metad_run3` is a 59 MB DCD, so the UI was unusable during exactly the runs it exists to watch. Now strided at load (`md.open` for the frame count first) and memoised on `(path, mtime, size)`: 0.15 s instead of seconds.
+
+Verified headlessly with `streamlit.testing.v1.AppTest` — no exception, all three columns render, both selectboxes populate from real campaigns on disk. `streamlit`, `py3Dmol` and `matplotlib` are a `[ui]` extra, not dependencies; nothing under `src/mdpilot/` imports them. 349 unit tests pass (17 new).
+
 ### 2026-08-26 (evening) — Force-field selection: vocabulary, guide, and it is now the agent's to choose
 Branch `test`. Recorded as D9. Before this the force field was not chosen by anything: `system.forcefield` sat in the loader's verified-but-fixed table and `setup_role.md` told the agent it was not adjustable. It is now a `SystemSpec` field, a task-file key, and an enum on the setup agent's tool schema generated from the vocabulary so the two cannot drift.
 

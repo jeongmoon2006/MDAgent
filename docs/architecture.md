@@ -75,6 +75,8 @@ mdpilot/
 ├── pyproject.toml
 ├── .env.example
 │
+├── app.py                             # Streamlit control surface (optional extra)
+│
 ├── src/mdpilot/
 │   │
 │   ├── task_file.py                   # task YAML -> SystemSpec + run_campaign kwargs

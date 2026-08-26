@@ -25,6 +25,14 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+# The Streamlit control surface (`app.py`). An extra rather than a dependency:
+# the loop, the scientist and the benchmarks all run headless, and nothing in
+# `src/mdpilot/` imports any of these.
+ui = [
+  "streamlit>=1.30",
+  "py3Dmol>=2.0",
+  "matplotlib>=3.8",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
