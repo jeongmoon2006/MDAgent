@@ -105,6 +105,16 @@ class TaskFile:
     path: Path
     observable_name: str
 
+    @property
+    def seed(self) -> int:
+        """The campaign seed: the file's, or `run_campaign`'s own default.
+
+        Public because the adapter is not always built here — a Slurm job
+        rebuilds it on a compute node (`execution.worker`) and has to seed it
+        identically or the two halves of one campaign are differently seeded.
+        """
+        return int(self.campaign.get("seed", 42))
+
     def build_adapter(self, work_dir: Path, *, seed: int | None = None) -> Any:
         """The engine adapter this task describes.
 
@@ -125,7 +135,7 @@ class TaskFile:
         # The file's own seed unless the caller overrides it, so the adapter
         # and `run_campaign` cannot end up seeded differently.
         if seed is None:
-            seed = int(self.campaign.get("seed", 42))
+            seed = self.seed
         return OpenMMAdapter(work_dir=Path(work_dir), seed=seed, spec=self.spec)
 
     def run_kwargs(self, **overrides: Any) -> dict[str, Any]:

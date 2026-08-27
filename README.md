@@ -78,6 +78,42 @@ last checkpoint. The task file owns what the campaign *is*; the flags own only
 the loop bounds. Suitable for `nohup`/`tmux` on a server — the log is
 line-flushed for `tail -f`.
 
+## Run on a cluster, watch from a laptop
+
+`--slurm <partition>` sends the MD to Slurm and keeps the decision loop in the
+invoking process:
+
+```sh
+nohup python -m mdpilot.run campaigns/run1/task.yaml campaigns/run1 \
+    --slurm g_pamish --slurm-cpus 16 --slurm-env mdpilot \
+    --opening-ns 1.0 --max-rounds 20 > campaigns/run1/campaign.log 2>&1 &
+```
+
+Run this **from the login node, from the repository root**. Both matter:
+
+- The loop calls the Anthropic API once per round, and compute nodes often
+  have no outbound network — on Chestnut, DNS does not resolve there at all.
+  The login node keeps the two steps that need the internet (the scientist's
+  decision, and the one-time structure fetch in `prepare()`) and burns no CPU
+  doing it; every step of dynamics is a batch job.
+- Trajectory paths are recorded relative to the working directory, which is
+  what lets a mirrored copy be read somewhere else.
+
+Then, locally:
+
+```sh
+scripts/pull_campaign.sh run1 60      # mirror campaigns/run1 every 60s
+streamlit run app.py                  # pick "run1" from the campaign selector
+```
+
+The mirror leaves behind what only a resume needs (`cache/`, `slurm/`, `*.chk`)
+and brings across everything the viewer and the diagnostics read. Set
+`MDPILOT_REMOTE` / `MDPILOT_REMOTE_DIR` for a different host or checkout.
+
+A per-job walltime (`--slurm-time`, default 24 h) bounds one round, not the
+campaign; a round that outgrows it is re-run from the last checkpoint when the
+campaign is restarted.
+
 ## Web app
 
 A three-column control surface: draft a campaign from a sentence, watch the

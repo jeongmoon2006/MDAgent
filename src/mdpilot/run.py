@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mdpilot.execution.slurm import SlurmAdapter, SlurmResources
 from mdpilot.orchestrator.loop import run_campaign, steps_per_ns_for
 from mdpilot.task_file import load_task_file
 
@@ -56,10 +57,36 @@ def main(argv: list[str] | None = None) -> int:
                              "file's own max_biased_ns. Defaults to the file's.")
     parser.add_argument("--frame-ps", type=float, default=1.0,
                         help="trajectory sampling interval. Locked at first run.")
+    parser.add_argument("--slurm", metavar="PARTITION", default=None,
+                        help="run the MD as Slurm jobs on this partition, "
+                             "keeping the decision loop in this process. For "
+                             "clusters whose compute nodes have no outbound "
+                             "network, which is where the API call would fail.")
+    parser.add_argument("--slurm-cpus", type=int, default=8)
+    parser.add_argument("--slurm-time", default="24:00:00",
+                        help="walltime per MD job, not per campaign")
+    parser.add_argument("--slurm-env", default="mdpilot_env",
+                        help="conda environment to activate in the job")
     args = parser.parse_args(argv)
 
     task = load_task_file(args.task_file)
-    adapter = task.build_adapter(args.work_dir)
+    extra: dict[str, Any] = {}
+    if args.slurm is None:
+        adapter = task.build_adapter(args.work_dir)
+    else:
+        adapter = SlurmAdapter(
+            work_dir=args.work_dir,
+            task=task,
+            resources=SlurmResources(
+                partition=args.slurm,
+                cpus=args.slurm_cpus,
+                time_limit=args.slurm_time,
+                conda_env=args.slurm_env,
+            ),
+        )
+        # The loop's default factory keys off the adapter's type and would
+        # refuse the pivot; see SlurmAdapter.biased_factory.
+        extra["biased_adapter_factory"] = adapter.biased_factory()
     steps_per_ns = steps_per_ns_for(adapter)
 
     overrides: dict[str, Any] = {
@@ -74,7 +101,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"task     : {task.name}  (sha {task.sha256[:12]})", flush=True)
     print(f"work dir : {args.work_dir}", flush=True)
     result = run_campaign(
-        work_dir=args.work_dir, adapter=adapter, on_event=_log, **task.run_kwargs(**overrides)
+        work_dir=args.work_dir, adapter=adapter, on_event=_log,
+        **extra, **task.run_kwargs(**overrides)
     )
     print(f"\nfinished : {result.stop_reason}  ({len(result.rounds)} rounds)", flush=True)
     return 0

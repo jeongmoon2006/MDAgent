@@ -84,6 +84,9 @@ If you only draw one thing, draw this. Nothing with a physical unit ever
 passes through the model.
 
 ```mermaid
+%% Layout hints, not cosmetics: the ~~~ chain keeps GATE stacked and the
+%% C3-before-C2 order keeps CODE in reading order. Both keep the diagram
+%% narrow enough to render at full size instead of being scaled down.
 flowchart LR
     subgraph LLM["THE LLM DECIDES — judgment, chemistry"]
         L1["extend / stop / pivot"]
@@ -91,22 +94,23 @@ flowchart LR
         L3["why — reason + ledger note"]
     end
 
-    subgraph CODE["CODE DECIDES — numbers, physics"]
-        C1["how many steps that actually is"]
-        C2["which atom indices it resolves to<br/>cv_designer, against the topology"]
-        C3["SIGMA / HEIGHT / PACE<br/>bias_designer, from the trajectory"]
-    end
-
     subgraph GATE["CODE OVERRULES"]
         G1["has it converged?<br/>diagnostics — no model involved"]
         G2["is it allowed to stop?<br/>refuses a stop against the data"]
         G3["budget caps + extension clamps<br/>recounted from disk on resume"]
+        G1 ~~~ G2 ~~~ G3
+    end
+
+    subgraph CODE["CODE DECIDES — numbers, physics"]
+        C1["how many steps that actually is"]
+        C3["SIGMA / HEIGHT / PACE<br/>bias_designer, from the trajectory"]
+        C2["which atom indices it resolves to<br/>cv_designer, against the topology"]
     end
 
     L1 --> C1
-    L2 --> C2
     L2 --> C3
-    GATE -.->|constrains| LLM
+    L2 --> C2
+    LLM -.->|constrained by| GATE
 ```
 
 Everything on the right is deterministic, testable and reproducible. That is

@@ -290,6 +290,24 @@ First campaign launched from the Streamlit UI. The task file said chignolin, `st
 
 **Also fixed:** the viewer plotted the raw `sum_hills` grid, which extends a few SIGMA past the outermost hill — so the axis ran to *negative contacts* and the frozen extrapolated shelf inflated the apparent depth (139 vs 116 kJ/mol). `metad_report` had always cropped; the plot now does too, using the round's own COLVAR snapshot.
 
+### D10 — Cluster execution splits on the network boundary, not on the engine (2026-08-26)
+Chestnut's compute nodes have no outbound network at all — DNS does not resolve there (`curl: (6) Could not resolve host: api.anthropic.com`), while the login node reaches both the API and RCSB. The loop calls the model once per round, so `sbatch python -m mdpilot.run` would have died at round one's `decide()`.
+
+The split follows that boundary rather than a design preference: the login node keeps the two steps that need the internet and no compute — the scientist's decision, and `prepare()`'s one-time structure fetch — and every step of dynamics is a batch job. `execution/slurm.py` implements `MDAdapter` by submitting `execution/worker.py`, which rebuilds the *same* `OpenMMAdapter` from the task file on the compute node. State between jobs is the OpenMM checkpoint the loop already writes for resume; the campaign directory it produces is identical in layout to a local one, so nothing downstream knows the difference.
+
+Two properties fall out rather than being designed in. A preempted-and-requeued job is correct by construction: the round restarts from the same `state.chk` and rewrites its own DCD, which is what makes the preemptible `g_standby` partition usable. And `sbatch --wait` means the login-node process holds no simulation and burns no CPU while it waits.
+
+The rejected alternative was proxying the API out of the compute node through the login node — zero code, but it circumvents a deliberate network control, and that is the cluster's call rather than ours.
+
+`engine` locks as `SlurmAdapter` in the campaign config, so a cluster campaign refuses to resume through a bare `OpenMMAdapter`. Conservative — the checkpoints are ordinary OpenMM checkpoints — but a cluster campaign should continue on the cluster.
+
+### F14 — The cluster's GPUs are unusable, and its pip OpenMM has no GPU platform anyway (2026-08-26)
+`scontrol show nodes` advertises `gpu:gk210gl:8` on five nodes; `gk210gl` is a Tesla K80, compute capability 3.7, which CUDA 12 dropped. Independently, OpenMM's PyPI wheels ship no GPU platform at all — the env installed from `pip install -e .` reports `['Reference', 'CPU']`. Campaigns there are CPU campaigns, and the GPU partition is worth requesting only for its 32 idle cores.
+
+`openmm-plumed` is not on PyPI either, so that env could not have run a biased round. A conda-forge env (`mdpilot`) was built alongside it; measured on 16 cores of node51, Trp-cage at 1.0 nm padding (4810 atoms) costs 74 s for solvate + minimize + 20 ps equilibration and 42 s per 10 ps of dynamics — about 20 ns/day.
+
+Also worth knowing before sizing a campaign: `qos_g_pamish` caps the **group** at 32 CPUs on `g_pamish`, not the user, so four idle nodes there can be unreachable while a labmate holds the quota. `g_standby` (nodes 51–52) is uncapped and preemptible.
+
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
 - Do not build a persistent multi-agent system; subagents are ephemeral function calls returning structured artifacts, not prose.
@@ -300,6 +318,19 @@ First campaign launched from the Streamlit UI. The task file said chignolin, `st
 ---
 
 ## 2. Session journal
+
+### 2026-08-26 (cluster) — Campaigns run on Chestnut, and are watched from a laptop
+Branch `test_remote`. Recorded as D10 and F14. The ask was small — run the compute remotely, look at it locally — and the cluster made one half of it structural: compute nodes there have no DNS, so the round loop cannot live where the MD lives.
+
+**`--slurm <partition>` on the headless runner** is the whole user-facing surface. `SlurmAdapter` wraps `OpenMMAdapter` rather than reimplementing an engine: it delegates the Protocol's metadata to it, runs `prepare()` in-process (that is the step that needs RCSB), and submits every step of dynamics as a batch job that rebuilds the same adapter from the task file. `sbatch --wait` rather than a polling loop — Slurm already knows when a job ends, and the loop has nothing to do until then.
+
+**The mirror needed no code.** Trajectory paths are recorded relative to the launch directory, so `campaigns/<name>/` copied into a local checkout is already addressable and the existing app renders it. `scripts/pull_campaign.sh` leaves behind what only a resume needs (`cache/`, `slurm/`, `*.chk`) and snapshots `state.db` through `sqlite3.Connection.backup` instead of rsyncing it — it is the one file being written while it is read, and a torn page there is the whole findings log.
+
+**Verified end to end on node51**: login node submits, compute node integrates, files land on the shared filesystem, the local mirror reads them. 10 frames of a 4810-atom system, 233 KB checkpoint, the numbers in F14.
+
+**Not yet verified:** a full `run_campaign` on the cluster, which needs an API key on a filesystem that has none yet. Everything up to the model call is exercised.
+
+419 unit tests pass (18 new).
 
 ### 2026-08-26 (very late) — Contacts CVs are fractions; viewer aligned; headless runner
 Branch `test`. Three fixes from reading a real campaign's free-energy plot.
