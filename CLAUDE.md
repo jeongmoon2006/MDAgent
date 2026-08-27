@@ -67,6 +67,35 @@ For multi-step tasks, state a brief plan:
 
 For MDPilot research code: a passing unit test is necessary but not sufficient. Also verify the science — does this convergence rubric actually identify the under-converged case in `benchmarks/tasks/`? Code that runs cleanly but answers the wrong question is a failure mode this project specifically exists to prevent.
 
+## Running the tests
+
+```sh
+pytest tests/unit          # ~400 tests, ~9 s — no API key, no MD
+pytest tests/integration   # live MD; PLUMED and API-key tests skip if unavailable
+ruff check                 # correctness rules only; config in pyproject.toml
+```
+
+CI runs the unit suite on Python 3.10 and 3.12, lints, and checks that a built
+wheel carries `mdpilot/knowledge/*.md` — the prompt is Markdown package data,
+and an editable install cannot catch it going missing.
+
+`tests/unit` must not depend on anything gitignored. `campaigns/` and
+`benchmarks/data/` do not exist on a fresh checkout, and a test that reads them
+passes locally and fails only in CI.
+
+Reference trajectories for the Milestone-1 criterion are generated on demand
+into `benchmarks/data/trpcage/` (gitignored, deterministic given the seed):
+
+```sh
+python -m benchmarks.generate_trpcage_planted --traj under       # 50 ps
+python -m benchmarks.generate_trpcage_planted --traj converged   # 5 ns
+```
+
+They predate the equilibration work and are NVT — see F3 in
+`docs/activity-log.md`.
+
+---
+
 ## 5. Subagent Test
 
 When unsure whether a subtask should be its own subagent:

@@ -41,6 +41,22 @@ The test for spawning a subagent: does the subtask have a clean input and a stru
 
 `setup_agent.py` is the worked example: bounded input (a sentence plus a fixed corpus), structured output (a task file), no need for campaign narrative, and it dies when the file is written. It runs *before* the loop, so the scientist still sees exactly one LLM call per round.
 
+### The task file is the campaign contract
+
+One YAML file defines a campaign, and every field in it is in one of three
+modes:
+
+| mode | meaning |
+|---|---|
+| **mapped** | a real parameter — system, force field, padding, ensemble, equilibration, seed, observable, thresholds, budgets |
+| **verified** | not yet tunable, but checked against the constant that governs it, so the file cannot disagree with the run |
+| **informational** | prose, carried not interpreted |
+
+Anything else is refused. The verified mode is the load-bearing one: a task
+file that *declares* a 1.0 nm cutoff and a run that uses 1.2 would otherwise be
+undetectable, and the file would slowly become documentation nobody trusts.
+`benchmarks/tasks/cln025_contacts.yaml` is a fully commented example.
+
 ### Externalized state
 
 The hypothesis ledger, findings log, and trajectory store live on disk (SQLite + filesystem) — not in the agent's context window. The scientist reads what it needs each round and writes back what it learned. Context is for active reasoning, not memory.
