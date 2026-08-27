@@ -24,6 +24,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "ruff>=0.6",
 ]
 # The Streamlit control surface (`app.py`). An extra rather than a dependency:
 # the loop, the scientist and the benchmarks all run headless, and nothing in
@@ -42,3 +43,16 @@ where = ["src"]
 # decide() call fails on the first chunk read.
 [tool.setuptools.package-data]
 mdpilot = ["knowledge/*.md"]
+
+# Correctness rules only, matching `.github/workflows/ci.yml` so a local run
+# and CI cannot disagree. Style and line length are deliberately not enforced:
+# this codebase carries long explanatory comments on purpose, and reformatting
+# to satisfy a linter is the churn CLAUDE.md's "surgical changes" rule exists
+# to prevent. Enabling E/W here would report ~80 line-length violations and
+# nothing that is actually wrong.
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E9", "B"]

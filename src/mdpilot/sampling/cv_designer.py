@@ -259,7 +259,8 @@ def _native_pairs(
     distances = md.compute_distances(reference[0], np.array(candidates))[0]
     return tuple(
         pair
-        for pair, d in zip(candidates, distances)
+        # strict: one distance per candidate pair, by construction.
+        for pair, d in zip(candidates, distances, strict=True)
         if d <= _CONTACT_CUTOFF_NM
     )
 

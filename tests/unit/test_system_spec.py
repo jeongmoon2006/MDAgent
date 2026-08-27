@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import dataclasses
+
 import pytest
 
 from mdpilot.adapters.system_spec import SystemSpec
@@ -58,7 +60,7 @@ def test_is_hashable_and_frozen() -> None:
     b = SystemSpec(pdb_id="1L2Y")
     assert a == b
     assert hash(a) == hash(b)
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         a.pdb_id = "1UAO"  # frozen dataclass
 
 

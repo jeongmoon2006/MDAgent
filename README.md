@@ -1,5 +1,7 @@
 # MDPilot
 
+[![CI](https://github.com/jeongmoon2006/MDPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/jeongmoon2006/MDPilot/actions/workflows/ci.yml)
+
 A closed-loop scientific reasoning agent for molecular dynamics.
 
 > An MD operator runs the simulation you describe.
@@ -140,9 +142,14 @@ result = run_campaign(
 ## Tests
 
 ```sh
-pytest tests/unit          # 401 tests, ~5 s — no API key, no MD
+pytest tests/unit          # 401 tests, ~9 s — no API key, no MD
 pytest tests/integration   # live MD; PLUMED and API-key tests skip if unavailable
+ruff check                 # correctness rules only; config in pyproject.toml
 ```
+
+CI runs the unit suite on Python 3.10 and 3.12, lints, and checks that a built
+wheel actually carries `mdpilot/knowledge/*.md` — the prompt is Markdown
+package data, and an editable install cannot catch it going missing.
 
 Integration coverage includes equilibration physics (velocities, temperature,
 barostat, density) and metadynamics against PLUMED's own HILLS and COLVAR

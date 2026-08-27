@@ -77,6 +77,7 @@ mdpilot/
 ├── pyproject.toml
 ├── .env.example
 │
+├── .github/workflows/ci.yml           # lint + unit tests (3.10, 3.12) + wheel check
 ├── app.py                             # Streamlit control surface (optional extra)
 │
 ├── src/mdpilot/

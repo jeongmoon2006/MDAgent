@@ -301,6 +301,19 @@ First campaign launched from the Streamlit UI. The task file said chignolin, `st
 
 ## 2. Session journal
 
+### 2026-08-26 (end) — Continuous integration
+Branch `test`. `.github/workflows/ci.yml`: three jobs on push and PR.
+
+**lint** — `ruff check --select F,E9,B`, kept separate from the test job so a typo fails in seconds rather than after an OpenMM install. Correctness rules only: the same run with `E,W,I` reports 98 issues, 79 of them line-length, against 6 real ones. Enforcing style here would mean reformatting a codebase whose long explanatory comments are deliberate — the churn CLAUDE.md's "surgical changes" rule exists to prevent. The same selection lives in `[tool.ruff.lint]` so a local `ruff check` and CI cannot disagree.
+
+**test** — unit suite on Python **3.10 and 3.12**. The floor is what `requires-python` claims and was never verified; parsing every module with `ast.parse(feature_version=(3, 10))` finds nothing incompatible, but that only covers syntax. `tests/integration` is excluded deliberately rather than left to skip.
+
+**package** — builds a wheel and asserts `mdpilot/knowledge/*.md` is inside it. That regression is invisible to every other job, because they all run an editable install; without the `package-data` line a wheel ships the code and none of the prose and every `decide()` fails on its first chunk read.
+
+**The six lint findings, all fixed**: an f-string with no placeholders, an unused import, a blind `pytest.raises(Exception)` on a frozen dataclass (now `FrozenInstanceError`), and three `zip()` calls without `strict=`. The last were worth the attention — two are same-length by construction (`strict=True`), one is the pairwise `zip(xs, xs[1:])` idiom where the shorter second argument is the point (`strict=False`, stated).
+
+401 unit tests pass; `ruff check` clean.
+
 ### 2026-08-26 (very late) — Contacts CVs are fractions; viewer aligned; headless runner
 Branch `test`. Three fixes from reading a real campaign's free-energy plot.
 

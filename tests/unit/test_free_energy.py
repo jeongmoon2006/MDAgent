@@ -46,7 +46,7 @@ def _write_fes(path: Path, s: FreeEnergySurface) -> Path:
              f"#! SET min_{s.cv_label} {s.cv.min()}",
              f"#! SET max_{s.cv_label} {s.cv.max()}",
              f"#! SET periodic_{s.cv_label} {'true' if s.periodic else 'false'}"]
-    for x, f in zip(s.cv, s.free_energy):
+    for x, f in zip(s.cv, s.free_energy, strict=True):
         lines.append(f"  {x:.9f}   {f:.9f}   0.0")
     path.write_text("\n".join(lines) + "\n")
     return path

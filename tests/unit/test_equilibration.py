@@ -77,7 +77,9 @@ def test_heating_ramp_is_monotonic(tmp_path: Path) -> None:
     adapter._heat_nvt(sim, integrator)  # type: ignore[arg-type]
 
     temps = integrator.temperatures_k
-    assert all(b > a for a, b in zip(temps, temps[1:]))
+    # strict=False: the pairwise idiom, where the second sequence is meant
+    # to be one shorter.
+    assert all(b > a for a, b in zip(temps, temps[1:], strict=False))
 
 
 def test_heating_spends_the_requested_step_budget(tmp_path: Path) -> None:

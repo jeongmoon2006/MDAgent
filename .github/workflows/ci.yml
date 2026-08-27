@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main, test]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes the previous run on the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    # Separate from `test` because it needs none of the heavy scientific
+    # wheels, so it fails fast on a typo without waiting on an OpenMM install.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pipx install ruff
+      - name: ruff (correctness rules only)
+        # F/E9/B catch real defects — unused names, syntax errors, silently
+        # truncating zips. Style and line length are deliberately not enforced:
+        # the codebase carries long explanatory comments on purpose, and
+        # reformatting to satisfy a linter is the kind of churn CLAUDE.md's
+        # "surgical changes" rule exists to prevent.
+        run: ruff check --select F,E9,B --line-length 88 src tests benchmarks app.py
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is what pyproject claims to support; the ceiling is what
+        # the project is developed on. Testing only one of them makes the
+        # other a guess.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        # `[ui]` too: app.py's helpers are unit-tested, and those tests skip
+        # rather than fail without it — which would hide a break instead of
+        # reporting one.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,ui]"
+      - name: Unit tests
+        # `tests/integration` is excluded on purpose: it runs real MD, and
+        # wants PLUMED and an API key. It is not skippable-by-accident here —
+        # it is simply not this job's business.
+        run: pytest tests/unit -q
+
+  package:
+    # The scientist's prompt is Markdown under `mdpilot/knowledge/`, shipped by
+    # `[tool.setuptools.package-data]`. Without that line a wheel installs the
+    # code and none of the prose, and every decide() call fails on the first
+    # chunk read — a break invisible to an editable install, which is how all
+    # the other jobs run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip build
+      - run: python -m build --wheel
+      - name: The wheel must carry the knowledge base
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheel = sorted(glob.glob("dist/mdpilot-*.whl"))[-1]
+          shipped = {
+              n.split("/")[-1]
+              for n in zipfile.ZipFile(wheel).namelist()
+              if n.startswith("mdpilot/knowledge/") and n.endswith(".md")
+          }
+          on_disk = {p.split("/")[-1] for p in glob.glob("src/mdpilot/knowledge/*.md")}
+          missing = on_disk - shipped
+          print(f"{wheel}: {len(shipped)} chunks shipped")
+          if missing:
+              sys.exit(f"missing from the wheel: {sorted(missing)}")
+          PY

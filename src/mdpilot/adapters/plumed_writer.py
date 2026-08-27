@@ -413,7 +413,7 @@ class PlumedInput:
             )
         cv_labels = {cv.label for cv in self.cvs}
         if len(cv_labels) != len(self.cvs):
-            raise ValueError(f"PlumedInput: CV labels must be unique")
+            raise ValueError("PlumedInput: CV labels must be unique")
         used = self._bias_cv_labels() | {w.cv_label for w in self.walls}
         missing = used - cv_labels
         if missing:
