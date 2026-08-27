@@ -215,15 +215,23 @@ def test_choosing_a_campaign_still_renders_it() -> None:
     """The other half: manual override must actually work."""
     from streamlit.testing.v1 import AppTest
 
+    from mdpilot.memory import store
+
     repo = Path(__file__).resolve().parents[2]
-    known = sorted(p.name for p in (repo / "campaigns").glob("*")
-                   if (p / "state.db").exists())
-    if not known:
-        pytest.skip("no campaigns on disk to inspect")
+    # A campaign that actually has completed rounds. Picking whichever sorts
+    # last is brittle: a campaign mid-setup has a state.db and no rounds, so
+    # the viewer stops before the round picker and the assertions below fail
+    # for a reason that has nothing to do with the app.
+    with_rounds = sorted(
+        d.name for d in (repo / "campaigns").glob("*")
+        if (d / "state.db").exists() and store.list_rounds(d)
+    )
+    if not with_rounds:
+        pytest.skip("no campaign with completed rounds to inspect")
 
     at = AppTest.from_file(str(repo / "app.py"), default_timeout=180)
     at.run()
-    at.selectbox[0].select(known[-1]).run()
+    at.selectbox[0].select(with_rounds[-1]).run()
 
     assert not at.exception, at.exception
     assert [s.label for s in at.selectbox] == ["Campaign", "Round"]

@@ -39,6 +39,8 @@ This is **not** a multi-agent design pattern. There are no multiple persistent a
 
 The test for spawning a subagent: does the subtask have a clean input and a structured output? If yes, subagent. If it needs the campaign narrative to make sense, it stays with the scientist.
 
+`setup_agent.py` is the worked example: bounded input (a sentence plus a fixed corpus), structured output (a task file), no need for campaign narrative, and it dies when the file is written. It runs *before* the loop, so the scientist still sees exactly one LLM call per round.
+
 ### Externalized state
 
 The hypothesis ledger, findings log, and trajectory store live on disk (SQLite + filesystem) — not in the agent's context window. The scientist reads what it needs each round and writes back what it learned. Context is for active reasoning, not memory.
@@ -174,8 +176,9 @@ notebooks/                             # [planned] demo notebooks
 
 **Deliberately not built, though earlier drafts of this file listed them.**
 `tools/` — the scientist has no tool-dispatch layer; the loop calls
-`decide()` directly and everything else is deterministic Python, which is what
-"the LLM is called exactly once per round" means in practice.
+`decide()` directly and everything else is deterministic Python. That is what
+"the LLM is called once per round" means in practice — plus one call per
+*campaign*, in `setup_agent.py`, before the loop starts.
 `diagnostics/effective_sample_size.py` — ESS is returned by
 `autocorrelation.py` rather than living alone. `orchestrator/planner.py`,
 `replanner.py` and `state.py` — `loop.py` is the state machine and there is no
