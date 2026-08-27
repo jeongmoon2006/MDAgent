@@ -14,10 +14,29 @@ the transition you were asked for;
 `cv_min`/`cv_max` — and many rounds have passed without it returning;
 - `recrossings` has stayed at 0 across several rounds while
 `fes_depth_kj_per_mol` keeps growing, which is a bias filling a basin it
-cannot escape along this coordinate.
+cannot escape along this coordinate;
+- **the walker is trapped**: `rounds_confined` is 2 or more, meaning this
+round's observable range and the previous rounds' all sat entirely inside the
+single state named by `confined_to_state`, while `fes_depth_kj_per_mol` kept
+rising. This is the clearest trap signal you have, and it is the one the
+cumulative `cv_min`/`cv_max` cannot show you — those keep reporting the widest
+excursion the campaign ever made. A bounded coordinate does not protect you
+here: a contact count collapses every disordered conformation onto roughly the
+same value, so once the system is disordered the bias fills one degenerate bin
+and cannot lead it back. Prefer a replacement that separates the states on the
+side you are stuck in — an `rmsd` with an upper wall, or a `gyration`, both of
+which still distinguish disordered structures a contact count cannot.
+
+`cv_switches_remaining` says how many revisions the campaign has left. When it
+reaches 0 the action disappears from your tool; spend one on a coordinate you
+have evidence against, not on a surface that is merely still filling.
 
 Prefer a coordinate that is bounded on both sides when the failure was a
-walker that left and did not come back. Justify the replacement in `reason` by
+walker that left and did not come back — but do not mistake `rmsd`, `distance`
+or `gyration` for bounded. They are unbounded above; what makes `rmsd` a usable
+replacement is the upper wall the campaign configures, not the coordinate
+itself. Say which it is in `reason`; claiming a coordinate is bounded when it
+is not is how the previous CV was chosen. Justify the replacement in `reason` by
 naming what the previous CV failed to do, and record the diagnosis in
 `ledger_note` — the next rounds will be judged on a different coordinate and
 the history has to explain the discontinuity.

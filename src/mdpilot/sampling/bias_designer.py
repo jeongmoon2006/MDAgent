@@ -81,9 +81,11 @@ _SIGMA_FLOORS: tuple[tuple[type, float], ...] = (
     (GyrationCV, 0.02),
     (TorsionCV, 0.15),
     (RmsdCV, 0.05),
-    # A contact count is dimensionless, not a length. A folded basin spans
-    # roughly two to three formed contacts, so 0.5 gives the same ~5 deposits
-    # across a basin that the length floors above are sized for.
+    # A contact fraction is dimensionless, not a length. A folded basin spans
+    # roughly two to three formed contacts, so 0.5 *contacts* gives the same ~5
+    # deposits across a basin that the length floors above are sized for — and
+    # because the CV is a fraction, `sigma_floor` divides this by the pair
+    # count to express it on the coordinate actually being biased.
     (ContactsCV, 0.5),
 )
 
@@ -140,10 +142,14 @@ def design_bias(
 
 
 def sigma_floor(cv: CV) -> float:
-    """Narrowest hill width worth depositing for this CV type."""
+    """Narrowest hill width worth depositing for this CV type.
+
+    Contacts bounds are stated in *contacts* and converted to the fraction the
+    CV actually is, so they keep meaning the same thing whatever the pair count.
+    """
     for cv_type, floor in _SIGMA_FLOORS:
         if isinstance(cv, cv_type):
-            return floor
+            return floor / len(cv.pairs) if isinstance(cv, ContactsCV) else floor
     raise TypeError(f"bias_designer: no SIGMA floor for {type(cv).__name__}")
 
 
@@ -151,7 +157,7 @@ def sigma_ceiling(cv: CV) -> float:
     """Widest hill still worth depositing for this CV type."""
     for cv_type, ceiling in _SIGMA_CEILINGS:
         if isinstance(cv, cv_type):
-            return ceiling
+            return ceiling / len(cv.pairs) if isinstance(cv, ContactsCV) else ceiling
     raise TypeError(f"bias_designer: no SIGMA ceiling for {type(cv).__name__}")
 
 
@@ -204,7 +210,10 @@ def cv_series(cv: CV, traj: md.Trajectory) -> np.ndarray:
         # singularity at x == 1, where (1-x**NN)/(1-x**MM) is 0/0.
         distances = md.compute_distances(traj, np.array(cv.pairs))
         switched = 1.0 / (1.0 + (distances / cv.r0_nm) ** cv.NN)
-        return switched.sum(axis=1)
+        # Divided by the pair count, matching what `ContactsCV.render` biases:
+        # PLUMED's COMBINE turns the SUM into a fraction, so SIGMA has to be
+        # sized in fractions too or the hills are `len(pairs)` times too wide.
+        return switched.sum(axis=1) / len(cv.pairs)
     raise TypeError(f"bias_designer: unsupported CV type {type(cv).__name__}")
 
 
@@ -236,17 +245,99 @@ _WALL_KAPPA_KJ_PER_MOL_NM2 = 1000.0
 _LENGTH_DIMENSIONED = (DistanceCV, GyrationCV, RmsdCV)
 
 
-def design_upper_wall(cv: CV, at_nm: float | None) -> UpperWall | None:
+# Solvent that must remain between the solute and its periodic image. The
+# nonbonded cutoff: closer than this and the solute interacts with its own
+# image directly, which is F11.
+_MIN_IMAGE_CLEARANCE_NM = 1.0
+# Below this correlation the CV does not predict the solute's extent well
+# enough to extrapolate a box limit from, and guessing is worse than declining.
+_MIN_SPAN_CORRELATION = 0.15
+
+
+def box_limited_wall(
+    cv: CV,
+    trajectory_path: Path,
+    topology_path: Path,
+    *,
+    clearance_nm: float = _MIN_IMAGE_CLEARANCE_NM,
+) -> float | None:
+    """The CV value at which the solute would reach the edge of its own box.
+
+    Measured, not assumed. For every frame of the source trajectory this takes
+    the CV and the solute's widest extent, fits extent against CV, and solves
+    for the extent at which only `clearance_nm` of solvent would remain between
+    the solute and its periodic image.
+
+    This exists because the relationship between the padding a campaign asks
+    for and the clearance it actually gets is not obvious — measured on CLN025,
+    padding of 1.0 / 1.5 / 2.0 nm produced 0.88 / 1.10 / 1.38 nm of clearance
+    around the *folded* structure, and the unfolded ensemble a biased run goes
+    looking for is far wider than that. A wall chosen by hand from the task's
+    own state thresholds knows none of this: the 0.8 nm wall on the first
+    CLN025 campaign sat well above what its box could hold.
+
+    Returns None when the fit cannot support the extrapolation — a folded
+    trajectory barely varies, and a bad ceiling is worse than none.
+    """
+    if not isinstance(cv, _LENGTH_DIMENSIONED):
+        return None
+    traj = md.load(str(trajectory_path), top=str(topology_path))
+    if traj.unitcell_lengths is None or traj.n_frames < 8:
+        return None
+    solute = traj.topology.select("protein and element != H")
+    if solute.size < 2:
+        solute = traj.topology.select("protein")
+    if solute.size < 2:
+        return None
+
+    values = cv_series(cv, traj)
+    span = np.array([np.ptp(f, axis=0).max() for f in traj.atom_slice(solute).xyz])
+    if np.std(values) <= 0 or np.std(span) <= 0:
+        return None
+    if abs(float(np.corrcoef(values, span)[0, 1])) < _MIN_SPAN_CORRELATION:
+        return None
+
+    slope, intercept = np.polyfit(values, span, 1)
+    if slope <= 0:
+        return None
+    tolerable_span = float(traj.unitcell_lengths[:, 0].min()) - clearance_nm
+    limit = (tolerable_span - float(intercept)) / float(slope)
+    return limit if limit > 0 else None
+
+
+def design_upper_wall(
+    cv: CV,
+    at_nm: float | None,
+    *,
+    trajectory_path: Path | None = None,
+    topology_path: Path | None = None,
+) -> UpperWall | None:
     """Bound an unbounded CV from above, or None if no wall applies.
 
-    Returns None when no wall was requested, and also when the CV is not
-    length-dimensioned — a wall at "0.8" means nothing on a torsion, which is
-    already bounded on [-pi, pi]. The position comes from the campaign (the
-    task knows what counts as unfolded); only the stiffness is a constant here,
-    the same boundary `design_bias` draws for SIGMA and HEIGHT.
+    Returns None when the CV is not length-dimensioned — a wall at "0.8" means
+    nothing on a torsion, which is already bounded on [-pi, pi], nor on a
+    contact count bounded on [0, n_pairs].
+
+    An explicit `at_nm` from the campaign wins: the task knows what counts as
+    unfolded, and this is not the place to overrule it. What is added here is
+    the *box* limit, measured from the trajectory — used as the position when
+    the campaign gave none, and recorded either way so a wall placed beyond
+    what the box can hold does not pass silently.
     """
-    if at_nm is None or not isinstance(cv, _LENGTH_DIMENSIONED):
+    if not isinstance(cv, _LENGTH_DIMENSIONED):
+        return None
+    limit = (
+        box_limited_wall(cv, trajectory_path, topology_path)
+        if trajectory_path is not None and topology_path is not None
+        else None
+    )
+    position = at_nm if at_nm is not None else limit
+    if position is None:
         return None
     return UpperWall(
-        cv_label=cv.label, at=at_nm, kappa=_WALL_KAPPA_KJ_PER_MOL_NM2
+        cv_label=cv.label,
+        at=position,
+        kappa=_WALL_KAPPA_KJ_PER_MOL_NM2,
+        box_limit_nm=limit,
+        derived_from_box=at_nm is None,
     )

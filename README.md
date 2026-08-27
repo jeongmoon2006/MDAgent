@@ -66,6 +66,18 @@ First call fetches PDB 1L2Y, solvates, minimizes and equilibrates; the state is
 cached, so later calls on the same `work_dir` skip straight to dynamics.
 Per-round artifacts land in `campaigns/demo/rounds/`.
 
+## Run a campaign from a task file
+
+```sh
+python -m mdpilot.run benchmarks/tasks/cln025_contacts.yaml campaigns/run1 \
+    --opening-ns 1.0 --max-rounds 20 --biased-cap-ns 20
+```
+
+Resumable: re-running the same command after an interruption continues from the
+last checkpoint. The task file owns what the campaign *is*; the flags own only
+the loop bounds. Suitable for `nohup`/`tmux` on a server — the log is
+line-flushed for `tail -f`.
+
 ## Web app
 
 A three-column control surface: draft a campaign from a sentence, watch the

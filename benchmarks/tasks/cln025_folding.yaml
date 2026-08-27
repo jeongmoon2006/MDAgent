@@ -21,6 +21,20 @@ description: |
   MD is short of the transition by roughly two orders of magnitude and the
   campaign must pivot to enhanced sampling to succeed.
 
+# Reproducibility. Covers the integrator, the barostat's Monte Carlo moves and
+# the initial velocities — but NOT solvation: `Modeller.addSolvent` takes no
+# seed, so two campaigns at the same seed differ by a handful of waters (F8).
+seed: 42
+
+# How the system reaches the target state before production. Picoseconds, not
+# steps, so changing the timestep does not silently change how long it was
+# equilibrated for.
+equilibration:
+  nvt_ps: 100.0          # staged heating at constant volume
+  npt_ps: 100.0          # density relaxation at the target pressure
+  heat_start_k: 50.0     # bottom of the ramp
+  heat_stages: 6
+
 system:
   starting_pdb: "5AWL"        # downloaded via PDBFixer; 10 residues, ~5380 atoms solvated
   forcefield: amber14/tip3p       # a validated protein+water pair; see mdpilot.forcefields

@@ -267,6 +267,29 @@ First campaign launched from the Streamlit UI. The task file said chignolin, `st
 
 **What the pre-flight checks are actually worth.** `check_residue_count` did fire on this campaign — the description said 10 residues, the built structure had 20. It caught a real inconsistency at round zero. What it could not tell anyone is *why*, and the obvious reading — "the agent picked the wrong PDB" — was the wrong one. A check that compares two artifacts tells you they disagree; it does not tell you which is at fault, and the first explanation that fits is not evidence.
 
+### F13 — A bounded CV trapped the walker anyway, and the cumulative range hid it (2026-08-26)
+`campaigns/ui_campaign_chignolin`, biased on native-contact count. The walker left the folded state in round 2 and never returned:
+
+| round | observable this round | folded | unfolded | fes_depth |
+|---|---|---|---|---|
+| 2 | [0.110, 0.781] | 10.8% | 25.9% | 51 kJ/mol |
+| 3 | [0.038, 0.436] | 0.0% | 92.5% | 92 kJ/mol |
+| 4 | [0.030, 0.126] | 0.0% | 100% | 116 kJ/mol |
+
+`recrossings` stuck at 1 against a criterion of 2. 116 kJ/mol over the *sampled* range is an order of magnitude past chignolin's real folding free energy.
+
+**Bounded is not reversible.** `cv_vocabulary.md` claimed `torsion` and `contacts` "do not have that failure mode" — true for *range*, false for *return*. A contact count maps every disordered conformation onto roughly the same value, so once the chain is disordered the coordinate cannot separate those states and the bias fills one degenerate bin forever. Guidance corrected.
+
+**The scientist could not see it.** Its round-4 reasoning quoted `cv_min=0.39 to cv_max=10.01` and concluded "the full CV range is being explored" — correct, but cumulative: COLVAR appends across the whole biased phase under RESTART, so those fields keep reporting the widest excursion the campaign ever made long after the walker stopped. Nothing gave a per-round view.
+
+**Fixed with computed signals rather than more prose.** `observable_min_this_round` / `observable_max_this_round`, plus `confined_to_state` and `rounds_confined` from `_confinement`, which walks back through the per-round observable files and stops at the first round that was not confined (or was confined to the other state). Replayed on the real campaign it reports `('low', 1)` at round 4 — a threshold of 2 fires at round 5. `cv_switches_used` / `cv_switches_remaining` are in the report too, so a switch can be weighed against what is left instead of the action simply vanishing.
+
+**Escape verified against the live model.** Given the trapped report it chose `switch_cv` to `rmsd` on `name CA`, citing `rounds_confined=2`, the per-round range "entirely in [0.03, 0.126]", and the 131 kJ/mol depth. Given a healthy unconverged round it chose `extend` — the check does not over-trigger.
+
+**And the escape exposed one more gap.** The model justified RMSD as "bounded", which it is not (F6), and `cln025_contacts.yaml` carried no `cv_upper_wall_nm` — so the escape would have landed straight back in the runaway F6 came from. A campaign that allows a CV switch must carry a wall in case the replacement is length-dimensioned; `design_upper_wall` ignores it for types that do not need one. Wall added, guidance corrected to say what actually makes `rmsd` usable is the wall, not the coordinate.
+
+**Also fixed:** the viewer plotted the raw `sum_hills` grid, which extends a few SIGMA past the outermost hill — so the axis ran to *negative contacts* and the frozen extrapolated shelf inflated the apparent depth (139 vs 116 kJ/mol). `metad_report` had always cropped; the plot now does too, using the round's own COLVAR snapshot.
+
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
 - Do not build a persistent multi-agent system; subagents are ephemeral function calls returning structured artifacts, not prose.
@@ -277,6 +300,39 @@ First campaign launched from the Streamlit UI. The task file said chignolin, `st
 ---
 
 ## 2. Session journal
+
+### 2026-08-26 (very late) — Contacts CVs are fractions; viewer aligned; headless runner
+Branch `test`. Three fixes from reading a real campaign's free-energy plot.
+
+**`ContactsCV` now renders a fraction, always.** The raw `CONTACTMAP ... SUM` is an intermediate (`<label>_count`) and the CV exposed under the label is that count divided by the pair count, via `COMBINE`. A campaign was judging its states on a normalised fraction (0.3 / 0.7) while biasing the raw count, with both carrying the name `native_contacts_fraction` — so the free-energy axis ran to 10 where every threshold in the campaign lived below 1. A count and a fraction of the same contacts are the same coordinate scaled; only one of them can be compared with the rest of the campaign. `cv_series` divides to match, and the contacts SIGMA floor/ceiling are still stated in *contacts* but divided by the pair count, so "half a contact" keeps meaning that whatever the map size.
+
+**The viewer superposes and centres.** `trajectory_pdb` now calls `superpose(traj, 0)` and `center_coordinates()`. Centre-of-mass drift across frames is 0.0000 nm where it was free to wander, and the residual RMSD (0-0.544 nm on a real round) is conformational change rather than tumbling.
+
+**`python -m mdpilot.run <task.yaml> <work_dir>`** — the headless counterpart to the app, and the piece missing for server use: the only campaign CLI was `run_cln025.py`, hardcoded to one task file. Unlike the app, omitting `--biased-cap-ns` keeps the budget the file asked for rather than overriding it.
+
+401 unit tests pass (4 new).
+
+### 2026-08-26 (night, last) — The upper wall is measured from the simulation
+Branch `test`. `bias_designer.box_limited_wall` fits the solute's widest extent against the CV over the source trajectory and solves for the extent at which only the nonbonded cutoff of solvent would remain between the solute and its periodic image. `design_upper_wall` uses it as the position when the campaign configured none, and records it either way so a configured wall beyond what the box can hold is flagged rather than silently honoured.
+
+**It reproduces F11 as a pre-run check.** On `cln025_metad`'s own trajectory the derived limit is 0.55 nm; that campaign ran with a hand-chosen 0.8 nm wall. On `ui_campaign_chignolin` the limit is 0.38 nm. Both would have been refused-with-warning before a single biased round.
+
+**It declines rather than guessing.** A 0.05 ns folded vanilla round has too little extent variation to extrapolate from, and returns None — the caller then emits the F6 warning ("no wall could be set") instead of inventing a ceiling.
+
+**Three warnings, routed to the ledger** rather than only into plumed.dat, which the scientist never reads: an unbounded CV with no wall (F6), a wall beyond the box limit (F11), and a wall the campaign did not choose (say so, and note that if the task's unfolded state lies beyond it the box is too small for the question).
+
+**Measured along the way, worth recording:** padding is applied correctly but not as `span + 2*padding`. Building CLN025 with equilibration disabled gives L = 3.76 / 4.26 / 4.78 nm for padding 1.0 / 1.5 / 2.0, i.e. clearances of 0.88 / 1.10 / 1.38 nm around the *folded* structure. The box grows by roughly the padding increment, not twice it. This is exactly why the wall is better measured than derived from the padding a campaign asked for.
+
+399 unit tests pass (8 new).
+
+### 2026-08-26 (night, later) — CV-switch escape hatch for trapped walkers
+Branch `test`. Recorded as F13. Trap detection is computed, not inferred: `_confinement` reports `confined_to_state` and `rounds_confined` from the per-round observable files, alongside `observable_min/max_this_round` and the remaining CV-switch allowance. `action_switch_cv.md` names `rounds_confined >= 2` with a growing `fes_depth_kj_per_mol` as the clearest trap signal, and says why the cumulative `cv_min`/`cv_max` cannot show it.
+
+`max_cv_switches` is now a task-file field (`sampling.max_cv_switches`) and is reported to the scientist as used/remaining.
+
+Tested three ways: `_confinement` replayed against the real campaign's data; an end-to-end fake-adapter campaign that replays the trap and asserts the loop offers the switch only while the allowance lasts, honours it, and rebuilds on a different coordinate; and two live tests against the real model — one that must escape a trap, one that must *not* mistake a healthy unconverged round for one.
+
+391 unit tests pass (4 new), plus 2 live.
 
 ### 2026-08-26 (latest) — Correcting F12: the app was dropping the system spec
 Branch `test`. Traced the "wrong molecule" campaign properly instead of accepting the first explanation that fit. `2RVD` is chignolin; the agent was right. `app.py` called `run_campaign` without an adapter, so the default `SystemSpec.trpcage()` (1L2Y) was used and the task file's whole `system:`/`integrator:` block — PDB, force field, padding, 340 K — was discarded silently. F12 rewritten.

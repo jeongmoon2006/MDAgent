@@ -53,9 +53,6 @@ _COMPRESSIBILITY = 4.5e-5   # bar^-1, water
 # interpolates the anneal linearly between points where OpenMM steps a
 # staircase; the endpoint state is what matters and both cover the same ramp
 # over the same number of steps.
-_HEAT_START_K = 50.0
-_NVT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
-_NPT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
 _EM_MAX_STEPS = 50_000
 _EM_TOLERANCE = 100.0
 # Wall-clock ceiling for *setup* subcommands only (pdb2gmx, editconf, solvate,
@@ -115,11 +112,11 @@ tc-grps              = System
 tau-t                = {_TAU_T_PS}
 ref-t                = {{ref_t}}
 
-; ramp {_HEAT_START_K:g} K -> {{ref_t}} K across the whole stage
+; ramp {{heat_start_k}} K -> {{ref_t}} K across the whole stage
 annealing            = single
 annealing-npoints    = 2
 annealing-time       = 0 {{anneal_ps}}
-annealing-temp       = {_HEAT_START_K} {{ref_t}}
+annealing-temp       = {{heat_start_k}} {{ref_t}}
 
 constraints          = h-bonds
 constraint-algorithm = LINCS
@@ -135,7 +132,7 @@ rvdw                 = {_CUTOFF_NM}
 pbc                  = xyz
 
 gen-vel              = yes
-gen-temp             = {_HEAT_START_K}
+gen-temp             = {{heat_start_k}}
 gen-seed             = {{seed}}
 ld-seed              = {{seed}}
 continuation         = no
@@ -261,10 +258,9 @@ class GROMACSAdapter:
     (amber99sb-ildn, TIP3P, sd, C-rescale barostat at 1 bar); temperature and
     timestep come from ``spec.ensemble``, box padding from ``spec.padding_nm``.
 
-    ``nvt_steps`` / ``npt_steps`` size the two equilibration stages. Setting
-    *both* to 0 skips equilibration entirely and falls back to the legacy
-    cold-start path (first production round generates its own velocities) —
-    only useful for tests that need the setup pipeline without the MD cost."""
+    The equilibration protocol comes from ``spec.equilibration``. Both stage
+    lengths at 0 skips it and falls back to the legacy cold-start path, where
+    the first production round generates its own velocities."""
 
     def __init__(
         self,
@@ -272,14 +268,10 @@ class GROMACSAdapter:
         work_dir: Path,
         seed: int = 42,
         spec: SystemSpec | None = None,
-        nvt_steps: int = _NVT_EQUIL_STEPS,
-        npt_steps: int = _NPT_EQUIL_STEPS,
     ):
         self._work_dir = Path(work_dir)
         self._seed = seed
         self._spec = spec if spec is not None else SystemSpec.trpcage()
-        self._nvt_steps = nvt_steps
-        self._npt_steps = npt_steps
         self._setup_dir = self._work_dir / "setup"
         self._inputs_dir = self._work_dir / "inputs"
         self._topology_path = self._work_dir / "topology.pdb"
@@ -560,6 +552,14 @@ class GROMACSAdapter:
         existing = sorted(self._setup_dir.glob("round_*.tpr"))
         return f"{len(existing) + 1:03d}"
 
+    def _equil_steps(self) -> tuple[int, int]:
+        """Stage lengths in steps, converted from the spec's picoseconds."""
+        equil = self._spec.equilibration
+        return (
+            equil.nvt_steps(self.timestep_fs),
+            equil.npt_steps(self.timestep_fs),
+        )
+
     def _equilibrate(self) -> None:
         """NVT staged heating then NPT density relaxation, starting from em.gro.
 
@@ -569,13 +569,15 @@ class GROMACSAdapter:
         with no preceding NVT checkpoint would start from zero velocities,
         which is the exact defect equilibration exists to remove.
         """
-        if self._nvt_steps <= 0 and self._npt_steps <= 0:
+        nvt_raw, npt_raw = self._equil_steps()
+        if nvt_raw <= 0 and npt_raw <= 0:
             return
-        nvt_steps = max(self._nvt_steps, 1)
-        npt_steps = max(self._npt_steps, 1)
+        nvt_steps = max(nvt_raw, 1)
+        npt_steps = max(npt_raw, 1)
 
         (self._setup_dir / "nvt.mdp").write_text(
             _NVT_MDP_TEMPLATE.format(
+                heat_start_k=self._spec.equilibration.heat_start_k,
                 ref_t=self.temperature_k,
                 dt_ps=self._timestep_ps,
                 nsteps=nvt_steps,
@@ -625,7 +627,7 @@ class GROMACSAdapter:
     def _final_setup_tag(self) -> str:
         """Basename of the last setup stage — the NPT equilibration, or the
         minimization when equilibration is disabled."""
-        if self._nvt_steps <= 0 and self._npt_steps <= 0:
+        if self._equil_steps() == (0, 0):
             return "em"
         return "npt"
 

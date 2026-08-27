@@ -267,7 +267,12 @@ def test_contact_count_has_its_own_sigma_floor() -> None:
     from mdpilot.adapters.plumed_writer import ContactsCV, DistanceCV
 
     contacts = ContactsCV(label="q", pairs=((0, 5), (1, 6)), r0_nm=0.75)
-    assert sigma_floor(contacts) == 0.5
+    # Stated in contacts, expressed on the fraction the CV actually is, so it
+    # keeps meaning "half a contact" whatever the pair count.
+    assert sigma_floor(contacts) == pytest.approx(0.5 / 2)
+    assert sigma_floor(
+        ContactsCV(label="q", pairs=tuple((i, i + 20) for i in range(10)), r0_nm=0.75)
+    ) == pytest.approx(0.5 / 10)
     assert sigma_floor(contacts) != sigma_floor(DistanceCV(label="d", atoms=(0, 1)))
 
 

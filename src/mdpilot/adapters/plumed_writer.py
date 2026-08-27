@@ -118,9 +118,17 @@ class ContactsCV:
     """Number of native contacts formed, via PLUMED's ``CONTACTMAP ... SUM``.
 
     Each pair contributes a rational switching function that goes to 1 when the
-    two atoms are closer than ``r0_nm`` and to 0 when they are far apart, so the
-    CV is a smooth count running from ~0 (no native contacts) to ~len(pairs)
-    (fully formed).
+    two atoms are closer than ``r0_nm`` and to 0 when they are far apart. The
+    raw ``SUM`` is a count, and the CV exposed under ``label`` is that count
+    divided by the number of pairs — a **fraction on [0, 1]**.
+
+    Normalised deliberately, and always. A campaign judged its states on a
+    normalised contact fraction (0.3 / 0.7) while biasing the raw count, and
+    both carried the name ``native_contacts_fraction``: the free-energy axis
+    ran to 10 where every threshold in the campaign lived below 1. A count and
+    a fraction of the same contacts are the same coordinate scaled, so there is
+    nothing to choose between them except which one can be compared with the
+    rest of the campaign.
 
     Unlike RMSD-to-native this coordinate is **bounded on both sides**, which is
     what makes it usable with well-tempered metadynamics on a folding problem:
@@ -152,11 +160,16 @@ class ContactsCV:
                 f"ContactsCV: r0_nm must be positive (got {self.r0_nm})"
             )
 
+    @property
+    def raw_label(self) -> str:
+        """The unnormalised count, an intermediate PLUMED value."""
+        return f"{self.label}_count"
+
     def render(self) -> str:
         # PLUMED's line-continuation form: one ATOMS<n> per pair, then a single
         # global SWITCH that applies to all of them, then SUM to collapse the
         # map into one number. NN/MM are the conventional rational exponents.
-        lines = [f"{self.label}: CONTACTMAP ..."]
+        lines = [f"{self.raw_label}: CONTACTMAP ..."]
         for n, (i, j) in enumerate(self.pairs, start=1):
             lines.append(f"  ATOMS{n}={i + 1},{j + 1}")
         lines.append(
@@ -167,6 +180,13 @@ class ContactsCV:
         # there only if it repeats the *label* ("... q:"), not the action name —
         # `... CONTACTMAP` is an assertion failure, not a comment.
         lines.append("...")
+        # Divide by the pair count so the biased coordinate, the COLVAR trace
+        # and the free-energy axis are all the fraction the campaign's state
+        # thresholds are stated in.
+        lines.append(
+            f"{self.label}: COMBINE ARG={self.raw_label} "
+            f"COEFFICIENTS={1.0 / len(self.pairs):.8g} PERIODIC=NO"
+        )
         return "\n".join(lines)
 
 
@@ -297,6 +317,18 @@ class UpperWall:
     kappa: float              # kJ/mol per CV-unit^exp
     exp: int = 2
     wall_label: str = "uwall"
+    # The CV value at which the solute would reach the edge of its box,
+    # measured from the source trajectory by `bias_designer.box_limited_wall`.
+    # None when it could not be derived.
+    box_limit_nm: float | None = None
+    # True when `at` *is* that limit because the campaign gave no position.
+    derived_from_box: bool = False
+
+    @property
+    def exceeds_box_limit(self) -> bool:
+        """A wall the box cannot honour. The bias will drive the solute into
+        its own periodic image before the wall ever pushes back (F11)."""
+        return self.box_limit_nm is not None and self.at > self.box_limit_nm
 
     def __post_init__(self) -> None:
         if self.kappa <= 0:
@@ -436,7 +468,23 @@ class PlumedInput:
         lines.append(self._bias_with_resolved_paths().render())
         if self.walls:
             lines += ["", "# Bounds"]
-            lines += [w.render() for w in self.walls]
+            for wall in self.walls:
+                if wall.derived_from_box:
+                    lines += [
+                        "# NOTE: no wall position was given, so this one is the",
+                        "#       box limit measured from the source trajectory —",
+                        "#       the CV value at which the solute would reach its",
+                        "#       own periodic image.",
+                    ]
+                elif wall.exceeds_box_limit:
+                    lines += [
+                        f"# WARNING: this wall sits at {wall.at:g}, beyond the",
+                        f"#          {wall.box_limit_nm:.2f} the box can hold. The bias will",
+                        "#          drive the solute into its own periodic image",
+                        "#          before the wall pushes back (F11). Enlarge the",
+                        "#          box or lower the wall.",
+                    ]
+                lines.append(wall.render())
         lines += ["", "# Periodic output"]
         print_args = ",".join([cv.label for cv in self.cvs] + [self.bias.bias_value])
         colvar = Path(self.output_dir) / self.colvar_file

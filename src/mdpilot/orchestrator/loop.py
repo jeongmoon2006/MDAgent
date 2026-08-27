@@ -534,6 +534,8 @@ def run_campaign(
             round_index=round_idx,
             state_thresholds=state_thresholds,
             observable=observable,
+            cv_switches_used=cv_switches_used,
+            max_cv_switches=max_cv_switches,
         )
         _emit(on_event, "report", round_index=round_idx, report=report)
         prior_summaries = [_compact_prior(r) for r in rounds]
@@ -610,6 +612,7 @@ def run_campaign(
                     on_event, work_dir, rounds, "switch_to_metad_requested"
                 )
             assert decision.metad_proposal is not None  # guaranteed by the parser
+            wall_notes: list[str] = []
             adapter = _pivot_to_metad(
                 decision.metad_proposal,
                 source_trajectory=dcd,
@@ -620,10 +623,16 @@ def run_campaign(
                 cv_upper_wall_nm=cv_upper_wall_nm,
                 bias_pace=bias_pace,
                 bias_factor=bias_factor,
+                notes=wall_notes,
             )
             in_metad = True
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
+            for note in wall_notes:
+                store.append_ledger_note(work_dir, round_index=round_idx, text=note)
+                ledger_notes.append(
+                    store.LedgerNote(round_index=round_idx, text=note)
+                )
             _emit(
                 on_event, "pivot",
                 round_index=round_idx, kind="switch_to_metad",
@@ -634,6 +643,7 @@ def run_campaign(
 
         if decision.decision == "switch_cv":
             assert decision.metad_proposal is not None  # guaranteed by the parser
+            wall_notes = []
             # The replacement CV is sized on *this* round's trajectory, which
             # was run under the outgoing bias. That spread is inflated by the
             # bias that drove the walker across the old coordinate, which is
@@ -649,10 +659,16 @@ def run_campaign(
                 cv_upper_wall_nm=cv_upper_wall_nm,
                 bias_pace=bias_pace,
                 bias_factor=bias_factor,
+                notes=wall_notes,
             )
             cv_switches_used += 1
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
+            for note in wall_notes:
+                store.append_ledger_note(work_dir, round_index=round_idx, text=note)
+                ledger_notes.append(
+                    store.LedgerNote(round_index=round_idx, text=note)
+                )
             _emit(
                 on_event, "pivot",
                 round_index=round_idx, kind="switch_cv",
@@ -795,6 +811,8 @@ def _round_report(
     round_index: int | None = None,
     state_thresholds: tuple[float, float] | None = None,
     observable: ObservableSpec | None = None,
+    cv_switches_used: int = 0,
+    max_cv_switches: int = 0,
 ) -> dict[str, Any]:
     """Diagnostic bundle for one round, chosen by phase.
 
@@ -818,13 +836,13 @@ def _round_report(
 
     # Only computed when there are task states to count against: it costs a
     # trajectory load, and without thresholds nothing consumes the result.
-    series = observable_name = None
+    series = observable_name = this_round = None
     if (
         state_thresholds is not None
         and rounds_dir is not None
         and round_index is not None
     ):
-        series, observable_name = _accumulated_observable(
+        series, observable_name, this_round = _accumulated_observable(
             rounds_dir, round_index, trajectory_path, topology_path, observable
         )
 
@@ -839,10 +857,74 @@ def _round_report(
         observable_name=observable_name,
         state_thresholds=state_thresholds,
     )
+    if this_round is not None and this_round.size:
+        # Where the walker was *this round*, not cumulatively. COLVAR appends
+        # across the whole biased phase, so `cv_min`/`cv_max` keep reporting the
+        # widest excursion the campaign ever made — which reads as "the full
+        # range is being explored" long after the walker has stopped moving.
+        # A campaign sat at 0.03-0.13 for two rounds while the scientist
+        # correctly quoted a cumulative 0.39-10.01 and concluded the opposite.
+        report["observable_min_this_round"] = float(this_round.min())
+        report["observable_max_this_round"] = float(this_round.max())
+        # Trapped-walker detection, computed rather than left to be inferred.
+        # A campaign sat between 0.03 and 0.13 of its native contacts for two
+        # rounds while the deposited bias grew past 115 kJ/mol and the
+        # scientist, reading only cumulative ranges, concluded the full
+        # coordinate was being explored.
+        confined, rounds_confined = _confinement(
+            rounds_dir, round_index, state_thresholds
+        )
+        report["confined_to_state"] = confined
+        report["rounds_confined"] = rounds_confined
+    # The CV-revision allowance, so the scientist can weigh a switch against
+    # what is left rather than only discovering the action is gone.
+    report["cv_switches_used"] = cv_switches_used
+    report["cv_switches_remaining"] = max(max_cv_switches - cv_switches_used, 0)
     report["phase"] = "metad"
     report["trajectory_path"] = str(trajectory_path)
     report["plumed_dat_path"] = str(plumed_dat_path)
     return report
+
+
+def _confinement(
+    rounds_dir: Path | None,
+    round_index: int | None,
+    state_thresholds: tuple[float, float] | None,
+) -> tuple[str | None, int]:
+    """Which task state the walker has been stuck in, and for how many rounds.
+
+    Walks backwards from this round and stops at the first one that was not
+    confined, or was confined to the *other* state. Vanilla rounds write no
+    observable file, so the count naturally stops at the pivot rather than
+    running back into the unbiased phase.
+
+    `None, 0` means the walker moved between the bands this round, which is the
+    healthy case — a biased run is supposed to traverse them.
+    """
+    if rounds_dir is None or round_index is None or state_thresholds is None:
+        return None, 0
+    low, high = float(state_thresholds[0]), float(state_thresholds[1])
+    state: str | None = None
+    count = 0
+    for index in range(round_index, 0, -1):
+        path = rounds_dir / f"round_{index:03d}.obs.npy"
+        if not path.exists():
+            break
+        series = np.load(path)
+        if not series.size:
+            break
+        if series.max() <= low:
+            here = "low"
+        elif series.min() >= high:
+            here = "high"
+        else:
+            break
+        if state is None:
+            state = here
+        elif here != state:
+            break
+        count += 1
+    return state, count
 
 
 def _accumulated_observable(
@@ -851,7 +933,7 @@ def _accumulated_observable(
     trajectory_path: Path,
     topology_path: Path,
     observable: ObservableSpec | None = None,
-) -> tuple[np.ndarray, str]:
+) -> tuple[np.ndarray, str, np.ndarray]:
     """The campaign observable over every biased round so far, in order.
 
     Cumulative, because the surface-derived count it replaces was cumulative:
@@ -874,7 +956,7 @@ def _accumulated_observable(
         path = rounds_dir / f"round_{index:03d}.obs.npy"
         if path.exists():
             chunks.append(np.load(path))
-    return (np.concatenate(chunks) if chunks else series), name
+    return (np.concatenate(chunks) if chunks else series), name, series
 
 
 def _refuse_premature_stop(
@@ -935,6 +1017,7 @@ def _pivot_to_metad(
     cv_upper_wall_nm: float | None = None,
     bias_pace: int | None = None,
     bias_factor: float | None = None,
+    notes: list[str] | None = None,
 ) -> MDAdapter:
     """Resolve a CV proposal into a biased, started adapter.
 
@@ -953,6 +1036,7 @@ def _pivot_to_metad(
         cv_upper_wall_nm=cv_upper_wall_nm,
         bias_pace=bias_pace,
         bias_factor=bias_factor,
+        notes=notes,
     )
     plumed_dat_path.write_text(plumed_input)
     biased = factory(plumed_input)
@@ -971,8 +1055,13 @@ def _build_plumed_input(
     cv_upper_wall_nm: float | None = None,
     bias_pace: int | None = None,
     bias_factor: float | None = None,
+    notes: list[str] | None = None,
 ) -> str:
     """Proposal → resolved CV → sized bias → rendered plumed.dat text.
+
+    `notes` collects anything the scientist needs to know about the bias that
+    the diagnostics cannot show it — currently the wall. plumed.dat records the
+    same thing as comments, but the scientist never reads plumed.dat.
 
     `output_dir` is where PLUMED writes HILLS and COLVAR. It has to be
     absolute and campaign-local: PLUMED resolves relative FILE= paths against
@@ -1004,13 +1093,61 @@ def _build_plumed_input(
     bias = design_bias(
         cv, trajectory_path, topology_path, temperature_k=temperature_k, **overrides
     )
-    wall = design_upper_wall(cv, cv_upper_wall_nm)
+    wall = design_upper_wall(
+        cv,
+        cv_upper_wall_nm,
+        trajectory_path=trajectory_path,
+        topology_path=topology_path,
+    )
+    if notes is not None:
+        notes.extend(_wall_notes(cv, wall, cv_upper_wall_nm))
     return PlumedInput(
         cvs=(cv,),
         bias=bias,
         walls=(wall,) if wall is not None else (),
         output_dir=Path(output_dir).resolve(),
     ).render()
+
+
+def _wall_notes(cv: Any, wall: Any, requested: float | None) -> list[str]:
+    """What the scientist should know about the bound on this coordinate.
+
+    Three cases matter. An unbounded coordinate with no bound at all is F6 —
+    the bias drives the walker outward forever. A bound beyond what the box can
+    hold is F11 — the solute reaches its own periodic image before the wall
+    pushes back. And a bound derived from the box is worth saying out loud,
+    because the campaign did not choose it.
+    """
+    from mdpilot.sampling.bias_designer import _LENGTH_DIMENSIONED
+
+    if not isinstance(cv, _LENGTH_DIMENSIONED):
+        return []
+    if wall is None:
+        return [
+            f"WARNING: the biased CV '{cv.label}' is length-dimensioned and so "
+            f"unbounded above, and no upper wall could be set — none was "
+            f"configured and the box limit could not be measured from the "
+            f"source trajectory. Well-tempered metadynamics will keep driving "
+            f"the walker outward with nothing to turn it around (F6). Set "
+            f"cv_upper_wall_nm for this campaign."
+        ]
+    if wall.derived_from_box:
+        return [
+            f"No wall position was configured for '{cv.label}', so one was "
+            f"measured from the source trajectory: {wall.at:.2f} is where the "
+            f"solute would reach its own periodic image. This bounds the "
+            f"artifact, not the science — if the task's unfolded state lies "
+            f"beyond it, the box is too small for the question being asked."
+        ]
+    if wall.exceeds_box_limit:
+        return [
+            f"WARNING: the wall on '{cv.label}' is at {wall.at:g}, but the box "
+            f"can only hold {wall.box_limit_nm:.2f} before the solute reaches "
+            f"its own periodic image (F11). Sampling past {wall.box_limit_nm:.2f} "
+            f"is contaminated by self-interaction. Enlarge padding_nm or lower "
+            f"the wall."
+        ]
+    return []
 
 
 def _require_checkpoint(row: store.RoundRow) -> None:
@@ -1064,6 +1201,11 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
             cv_label=r.report.get("cv_label"),
             fes_drift_kj_per_mol=r.report.get("fes_drift_kj_per_mol"),
             recrossings=r.report.get("recrossings"),
+            # Carried so the trend is visible: a range that shrinks round on
+            # round is a walker settling into one state, whatever the
+            # cumulative numbers say.
+            observable_min_this_round=r.report.get("observable_min_this_round"),
+            observable_max_this_round=r.report.get("observable_max_this_round"),
             # The boundaries move as the surface fills, so a count carried
             # forward without them is not comparable across rounds.
             recrossing_low=r.report.get("recrossing_low"),

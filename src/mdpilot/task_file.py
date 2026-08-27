@@ -43,7 +43,7 @@ from typing import Any
 import yaml
 
 from mdpilot.adapters import openmm_adapter as _omm
-from mdpilot.adapters.system_spec import Ensemble, SystemSpec
+from mdpilot.adapters.system_spec import Ensemble, Equilibration, SystemSpec
 from mdpilot.diagnostics.autocorrelation import autocorrelation
 from mdpilot.observables import ObservableSpec
 
@@ -83,9 +83,10 @@ _INFORMATIONAL = {
 }
 
 _TOP_LEVEL = {
-    "name", "description", "system", "integrator", "observable",
-    "diagnostics", "sampling", "expectation", "done_criterion",
+    "name", "description", "seed", "system", "integrator", "observable",
+    "equilibration", "diagnostics", "sampling", "expectation", "done_criterion",
 }
+_EQUILIBRATION_KEYS = {"nvt_ps", "npt_ps", "heat_start_k", "heat_stages"}
 _EXPECTATION_KEYS = {"objective", "characteristic_timescale_ns", "timescale_source"}
 _DONE_CRITERION_KEYS = {"states", "min_recrossings", "max_biased_ns", "pivot_required"}
 _STATE_KEYS = {"name", "threshold"}
@@ -104,7 +105,7 @@ class TaskFile:
     path: Path
     observable_name: str
 
-    def build_adapter(self, work_dir: Path, *, seed: int = 42) -> Any:
+    def build_adapter(self, work_dir: Path, *, seed: int | None = None) -> Any:
         """The engine adapter this task describes.
 
         `run_kwargs` deliberately does not carry the system spec — the spec
@@ -121,6 +122,10 @@ class TaskFile:
         """
         from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 
+        # The file's own seed unless the caller overrides it, so the adapter
+        # and `run_campaign` cannot end up seeded differently.
+        if seed is None:
+            seed = int(self.campaign.get("seed", 42))
         return OpenMMAdapter(work_dir=Path(work_dir), seed=seed, spec=self.spec)
 
     def run_kwargs(self, **overrides: Any) -> dict[str, Any]:
@@ -155,6 +160,10 @@ def load_task_file(path: Path) -> TaskFile:
     _reject_unknown("<top level>", set(doc), _TOP_LEVEL, path)
     _reject_unknown(
         "observable", set(doc.get("observable") or {}), _OBSERVABLE_KEYS, path
+    )
+    _reject_unknown(
+        "equilibration", set(doc.get("equilibration") or {}),
+        _EQUILIBRATION_KEYS, path,
     )
     _check_expectation(doc, path)
     _verify_declared_constants(doc, path)
@@ -203,6 +212,11 @@ def _build_spec(doc: dict[str, Any], path: Path) -> SystemSpec:
     spec_kwargs: dict[str, Any] = {}
     if "padding_nm" in system:
         spec_kwargs["padding_nm"] = float(system["padding_nm"])
+    if doc.get("equilibration"):
+        # Equilibration is part of what the campaign *is* — a system heated for
+        # 10 ps is not the same starting state as one heated for 100 ps — so it
+        # rides on the spec and locks with it.
+        spec_kwargs["equilibration"] = Equilibration.from_dict(doc["equilibration"])
     if "forcefield" in system:
         # A key into `mdpilot.forcefields`, which pairs the protein force field
         # with a water model that engine can actually solvate. There is no
@@ -355,11 +369,18 @@ def _build_campaign(doc: dict[str, Any]) -> dict[str, Any]:
     if doc.get("description"):
         campaign["description"] = str(doc["description"])
 
+    # Locked, because it is what makes a campaign reproducible. Note F8: it
+    # covers the integrator, the barostat's Monte Carlo moves and the initial
+    # velocities, but NOT solvation — `Modeller.addSolvent` takes no seed, so
+    # two campaigns at the same seed are still different systems.
+    if doc.get("seed") is not None:
+        campaign["seed"] = int(doc["seed"])
+
     if doc.get("expectation"):
         campaign["task_expectation"] = render_task_expectation(doc)
 
     sampling = doc.get("sampling") or {}
-    for key in ("cv_upper_wall_nm", "bias_pace", "bias_factor"):
+    for key in ("cv_upper_wall_nm", "bias_pace", "bias_factor", "max_cv_switches"):
         if key in sampling:
             campaign[key] = sampling[key]
 

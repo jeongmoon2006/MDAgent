@@ -7,8 +7,18 @@ this round, and never both:
 Pick the type that matches the physical coordinate you believe is slow. Note
 that `distance`, `gyration` and `rmsd` are unbounded above, so a bias on them
 can drive the system into an ever-larger unfolded space and never return;
-`torsion` and `contacts` are bounded on both sides and do not have that
+`torsion` and `contacts` are bounded on both sides, which removes that
 failure mode.
+
+Bounded is not the same as reversible. A contact count collapses every
+disordered conformation onto roughly the same value, so once the system is
+disordered the coordinate cannot tell those states apart and the bias fills one
+degenerate bin without ever pushing the system back. A real campaign left the
+folded state, sat between 0.03 and 0.13 of its native contacts for two rounds
+while the deposited bias grew past 115 kJ/mol — an order of magnitude beyond
+any real folding free energy — and never recrossed. Ask not only whether a
+coordinate is bounded but whether it distinguishes states on *both* sides well
+enough to lead the system back.
 - `selections` — MDTraj selection strings. Arity is type-specific:
 - `distance`: 2 selections, each must resolve to exactly 1 atom. Example:
 `["name CA and resSeq 1", "name CA and resSeq 10"]`.

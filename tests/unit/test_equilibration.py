@@ -25,13 +25,17 @@ from mdpilot.adapters.gromacs_adapter import (
     _NVT_MDP_TEMPLATE,
     GROMACSAdapter,
 )
-from mdpilot.adapters.openmm_adapter import (
-    _BAROSTAT_INTERVAL,
-    _HEAT_STAGES,
-    _HEAT_START_K,
-    OpenMMAdapter,
-)
-from mdpilot.adapters.system_spec import Ensemble, SystemSpec
+from mdpilot.adapters.openmm_adapter import _BAROSTAT_INTERVAL, OpenMMAdapter
+from mdpilot.adapters.system_spec import Ensemble, Equilibration, SystemSpec
+
+_DEFAULT_EQUIL = Equilibration()
+
+
+def _spec(**equil: float) -> SystemSpec:
+    """A Trp-cage spec with a shortened equilibration, for tests that need the
+    setup pipeline without paying 200 ps of CPU MD."""
+    return SystemSpec(pdb_id="1L2Y", equilibration=Equilibration(**equil))
+
 
 
 class _FakeIntegrator:
@@ -53,21 +57,21 @@ class _FakeSim:
 # ---------- OpenMM: staged heating ----------
 
 def test_heating_ramp_ends_at_target_temperature(tmp_path: Path) -> None:
-    adapter = OpenMMAdapter(work_dir=tmp_path, nvt_steps=6000, npt_steps=0)
+    adapter = OpenMMAdapter(work_dir=tmp_path, spec=_spec(nvt_ps=12.0, npt_ps=0.0))
     integrator, sim = _FakeIntegrator(), _FakeSim()
 
     adapter._heat_nvt(sim, integrator)  # type: ignore[arg-type]
 
-    assert len(integrator.temperatures_k) == _HEAT_STAGES
+    assert len(integrator.temperatures_k) == _DEFAULT_EQUIL.heat_stages
     # The last stage must be the production temperature exactly — an NPT stage
     # that inherits 290 K would relax the density at the wrong state point.
     assert integrator.temperatures_k[-1] == pytest.approx(adapter.temperature_k)
-    assert integrator.temperatures_k[0] > _HEAT_START_K
+    assert integrator.temperatures_k[0] > _DEFAULT_EQUIL.heat_start_k
     assert integrator.temperatures_k[0] < adapter.temperature_k
 
 
 def test_heating_ramp_is_monotonic(tmp_path: Path) -> None:
-    adapter = OpenMMAdapter(work_dir=tmp_path, nvt_steps=6000, npt_steps=0)
+    adapter = OpenMMAdapter(work_dir=tmp_path, spec=_spec(nvt_ps=12.0, npt_ps=0.0))
     integrator, sim = _FakeIntegrator(), _FakeSim()
 
     adapter._heat_nvt(sim, integrator)  # type: ignore[arg-type]
@@ -77,17 +81,17 @@ def test_heating_ramp_is_monotonic(tmp_path: Path) -> None:
 
 
 def test_heating_spends_the_requested_step_budget(tmp_path: Path) -> None:
-    adapter = OpenMMAdapter(work_dir=tmp_path, nvt_steps=6000, npt_steps=0)
+    adapter = OpenMMAdapter(work_dir=tmp_path, spec=_spec(nvt_ps=12.0, npt_ps=0.0))
     integrator, sim = _FakeIntegrator(), _FakeSim()
 
     adapter._heat_nvt(sim, integrator)  # type: ignore[arg-type]
 
     assert sum(sim.steps) == 6000
-    assert len(sim.steps) == _HEAT_STAGES
+    assert len(sim.steps) == _DEFAULT_EQUIL.heat_stages
 
 
 def test_heating_is_skipped_when_disabled(tmp_path: Path) -> None:
-    adapter = OpenMMAdapter(work_dir=tmp_path, nvt_steps=0, npt_steps=0)
+    adapter = OpenMMAdapter(work_dir=tmp_path, spec=_spec(nvt_ps=0.0, npt_ps=0.0))
     integrator, sim = _FakeIntegrator(), _FakeSim()
 
     adapter._heat_nvt(sim, integrator)  # type: ignore[arg-type]
@@ -119,21 +123,21 @@ def test_barostat_carries_pressure_temperature_and_seed(tmp_path: Path) -> None:
 
 def test_nvt_mdp_anneals_from_start_to_target_and_generates_velocities() -> None:
     mdp = _NVT_MDP_TEMPLATE.format(
-        nsteps=50_000, anneal_ps="100", seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
+        nsteps=50_000, anneal_ps="100", seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002, heat_start_k=50.0
     )
 
     assert "annealing            = single" in mdp
-    assert f"annealing-temp       = {_HEAT_START_K} 300.0" in mdp
+    assert f"annealing-temp       = {_DEFAULT_EQUIL.heat_start_k} 300.0" in mdp
     assert "annealing-time       = 0 100" in mdp
     assert "gen-vel              = yes" in mdp
-    assert f"gen-temp             = {_HEAT_START_K}" in mdp
+    assert f"gen-temp             = {_DEFAULT_EQUIL.heat_start_k}" in mdp
     # Heating is NVT — the barostat only comes on for the density stage.
     assert "pcoupl" not in mdp
 
 
 def test_npt_mdp_couples_pressure_and_continues_from_nvt() -> None:
     mdp = _NPT_MDP_TEMPLATE.format(
-        nsteps=50_000, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
+        nsteps=50_000, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002, heat_start_k=50.0
     )
 
     assert "pcoupl               = C-rescale" in mdp
@@ -145,7 +149,7 @@ def test_npt_mdp_couples_pressure_and_continues_from_nvt() -> None:
 
 def test_production_mdp_keeps_the_barostat_on() -> None:
     mdp = _MD_MDP_TEMPLATE.format(
-        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
+        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002, heat_start_k=50.0
     )
 
     assert "pcoupl               = C-rescale" in mdp
@@ -156,7 +160,7 @@ def test_production_mdp_cold_start_override_still_matches() -> None:
     """`run_steps` rewrites two exact lines for the equilibration-disabled
     path. If the template's spacing drifts, that surgery silently no-ops."""
     mdp = _MD_MDP_TEMPLATE.format(
-        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002
+        nsteps=1000, report_interval=500, seed=42, ref_t=300.0, ref_p=1.0, dt_ps=0.002, heat_start_k=50.0
     )
 
     assert "gen-vel              = no" in mdp
@@ -219,7 +223,7 @@ def test_final_setup_tag_is_npt_when_equilibrating(tmp_path: Path) -> None:
 def test_final_setup_tag_falls_back_to_em_when_equilibration_disabled(
     tmp_path: Path,
 ) -> None:
-    adapter = GROMACSAdapter(work_dir=tmp_path, nvt_steps=0, npt_steps=0)
+    adapter = GROMACSAdapter(work_dir=tmp_path, spec=_spec(nvt_ps=0.0, npt_ps=0.0))
     assert adapter._final_setup_tag() == "em"
 
 
@@ -230,9 +234,11 @@ def test_openmm_heating_ramp_targets_a_non_default_ensemble(tmp_path: Path) -> N
     300 K whatever the campaign asked for."""
     adapter = OpenMMAdapter(
         work_dir=tmp_path,
-        spec=SystemSpec(pdb_id="1L2Y", ensemble=Ensemble(temperature_k=240.0)),
-        nvt_steps=6000,
-        npt_steps=0,
+        spec=SystemSpec(
+            pdb_id="1L2Y",
+            ensemble=Ensemble(temperature_k=240.0),
+            equilibration=Equilibration(nvt_ps=12.0, npt_ps=0.0),
+        ),
     )
     integrator, sim = _FakeIntegrator(), _FakeSim()
 
@@ -261,7 +267,7 @@ def test_gromacs_mdp_renders_the_ensemble_not_a_baked_constant() -> None:
     """`ref-t` and `dt` were f-string-interpolated at import, so no campaign
     could change them. They are format placeholders now."""
     mdp = _MD_MDP_TEMPLATE.format(
-        nsteps=1000, report_interval=500, seed=42, ref_t=240.0, ref_p=1.0, dt_ps=0.001
+        nsteps=1000, report_interval=500, seed=42, ref_t=240.0, ref_p=1.0, dt_ps=0.001, heat_start_k=50.0
     )
 
     assert "ref-t                = 240.0" in mdp

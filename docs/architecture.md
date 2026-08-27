@@ -81,6 +81,7 @@ mdpilot/
 │   │
 │   ├── task_file.py                   # task YAML -> SystemSpec + run_campaign kwargs
 │   │                                  #   (checks declared-but-fixed fields)
+│   ├── run.py                         # headless campaign runner (server-side)
 │   ├── forcefields.py                 # validated protein+water pairs, per engine
 │   ├── preflight.py                   # checks run on the built structure, before MD
 │   ├── observables.py                 # the coordinate every round is judged on,

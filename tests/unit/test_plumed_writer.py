@@ -309,7 +309,8 @@ def test_contacts_renders_a_summed_contactmap() -> None:
     cv = ContactsCV(label="q", pairs=((4, 46), (10, 52)), r0_nm=0.75)
     rendered = cv.render()
 
-    assert rendered.startswith("q: CONTACTMAP ...")
+    # The raw SUM is an intermediate; `q` is the normalised fraction.
+    assert rendered.startswith("q_count: CONTACTMAP ...")
     # 1-based, like every other CV here.
     assert "ATOMS1=5,47" in rendered
     assert "ATOMS2=11,53" in rendered
@@ -317,7 +318,13 @@ def test_contacts_renders_a_summed_contactmap() -> None:
     assert "  SUM" in rendered
     # PLUMED asserts on `... CONTACTMAP`: a second word there must repeat the
     # *label*, not the action name. Bare "..." is what closes the block.
-    assert rendered.splitlines()[-1] == "..."
+    assert "..." in rendered.splitlines()
+    # …and the label exposes the count divided by the pair count, so the biased
+    # coordinate, COLVAR and the free-energy axis are all the same fraction the
+    # campaign states its thresholds in.
+    assert rendered.splitlines()[-1] == (
+        "q: COMBINE ARG=q_count COEFFICIENTS=0.5 PERIODIC=NO"
+    )
 
 
 def test_contacts_rejects_an_empty_map() -> None:

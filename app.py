@@ -194,6 +194,12 @@ def trajectory_pdb(dcd_path: Path, topology: Path, max_frames: int = _MAX_VIEW_F
     solute = traj.topology.select("protein")
     if solute.size:
         traj = traj.atom_slice(solute)
+    # Remove rigid-body motion and centre what is left. Without this the whole
+    # peptide tumbles and drifts across the box, and the conformational change
+    # — the only thing worth watching — is buried under it. Superposing every
+    # frame on the first shows the motion in place.
+    traj.superpose(traj, frame=0)
+    traj.center_coordinates()
     if traj.n_frames > max_frames:
         traj = traj[:: max(1, traj.n_frames // max_frames)]
     # Via a real file: mdtraj's `save_pdb` takes a path, not a file object, and
@@ -208,8 +214,28 @@ def trajectory_pdb(dcd_path: Path, topology: Path, max_frames: int = _MAX_VIEW_F
         tmp.unlink(missing_ok=True)
 
 
-def fes_figure(fes_path: Path, temperature_k: float = 300.0):
+def fes_figure(fes_path: Path, colvar_path: Path | None = None,
+               temperature_k: float = 300.0):
+    """The free-energy profile, cropped to the range the walker actually visited.
+
+    `sum_hills` grids a few SIGMA past the outermost hill, so the raw profile
+    runs into territory no hill ever landed on — for a contact count that means
+    the axis extends to *negative contacts*, and the frozen extrapolated shelf
+    out there is the highest point on the grid, which inflates the apparent
+    depth. `metad_report` already crops for exactly this reason; plotting the
+    raw grid put the artifact straight back on screen.
+
+    The crop uses the round's own COLVAR snapshot rather than the live one,
+    which accumulates across the whole biased phase.
+    """
     surface = free_energy.load_fes(fes_path)
+    if colvar_path is not None and Path(colvar_path).exists():
+        try:
+            series = free_energy.load_colvar(Path(colvar_path)).get(surface.cv_label)
+            if series is not None and series.size:
+                surface = surface.restricted_to(float(series.min()), float(series.max()))
+        except Exception:
+            pass
     fig, ax = plt.subplots(figsize=(5.2, 3.4))
     ax.plot(surface.cv, surface.free_energy, lw=2, color="#3b7dd8")
     for i in surface.minima(temperature_k)[:2]:
@@ -597,8 +623,12 @@ def render_viewer() -> None:
             st.info("No free-energy surface — this round was unbiased.")
         else:
             try:
-                st.pyplot(fes_figure(fes_path), width="stretch")
-                st.caption(fes_path.name)
+                colvar = work_dir / "rounds" / f"round_{row.round_index:03d}.colvar"
+                st.pyplot(fes_figure(fes_path, colvar), width="stretch")
+                st.caption(
+                    f"{fes_path.name} — cropped to the range the walker visited; "
+                    f"`sum_hills` grids past the outermost hill."
+                )
             except Exception as exc:
                 st.warning(f"Could not plot the surface: {type(exc).__name__}: {exc}")
 

@@ -35,6 +35,16 @@ crossings. Do not treat a null as evidence the walker stayed put — check
 AND `recrossings >= 1`. Low drift *alone* is not convergence: a walker that
 never left its starting basin produces a surface that stops changing
 immediately, because nothing new is being sampled.
+- `observable_min_this_round` / `observable_max_this_round` — the range the
+walker covered on the task observable *in this round alone*. Compare them
+against `recrossing_low`/`recrossing_high`: a range that sits entirely inside
+one state, and shrinks round on round, is a walker that has settled there. That
+is the signal `cv_min`/`cv_max` cannot give you — those are cumulative over the
+whole biased phase, so they go on reporting the widest excursion the campaign
+ever made long after the walker stopped moving. If the per-round range has
+collapsed into one state while `fes_depth_kj_per_mol` keeps growing, the bias
+is filling a basin the coordinate cannot lead the system out of: say so in
+`reason` and record it in `ledger_note`.
 - `n_basins_fes`, `barrier_kj_per_mol`, `fes_depth_kj_per_mol`,
 `n_fes_estimates` — shape of the surface recovered so far. `cv_min` and
 `cv_max` are the range the walker actually visited, and `fes_depth` is

@@ -21,6 +21,20 @@ description: |
   The campaign is judged on the fraction of native CA-CA contacts formed,
   which runs from ~1 in the folded hairpin to ~0 when extended.
 
+# Reproducibility. Covers the integrator, the barostat's Monte Carlo moves and
+# the initial velocities — but NOT solvation: `Modeller.addSolvent` takes no
+# seed, so two campaigns at the same seed differ by a handful of waters (F8).
+seed: 42
+
+# How the system reaches the target state before production. Picoseconds, not
+# steps, so changing the timestep does not silently change how long it was
+# equilibrated for.
+equilibration:
+  nvt_ps: 100.0          # staged heating at constant volume
+  npt_ps: 100.0          # density relaxation at the target pressure
+  heat_start_k: 50.0     # bottom of the ramp
+  heat_stages: 6
+
 system:
   starting_pdb: "5AWL"
   forcefield: amber14/tip3p
@@ -60,6 +74,19 @@ expectation:
     free-energy surface along the slow coordinate.
   characteristic_timescale_ns: 800.0
   timescale_source: "CLN025 folding time 0.6-1.0 us; Lindorff-Larsen et al. 2011, Science 334:517"
+
+sampling:
+  # How many times the scientist may replace the biased coordinate. A contact
+  # count cannot lead a disordered chain back to folded (F13), so one revision
+  # is the escape hatch out of that trap.
+  max_cv_switches: 1
+  # Insurance for that switch, not for the starting CV. `contacts` is bounded
+  # and needs no wall, but the natural replacement is a length-dimensioned
+  # coordinate — the model reaches for `rmsd` — and RMSD-to-native is unbounded
+  # above (F6). A campaign that allows a CV switch should carry a wall in case
+  # the replacement needs one; `design_upper_wall` ignores it for CV types that
+  # do not.
+  cv_upper_wall_nm: 0.8
 
 done_criterion:
   pivot_required: true

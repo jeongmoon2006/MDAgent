@@ -52,6 +52,8 @@ def test_cln025_produces_the_kwargs_the_runner_hand_assembled() -> None:
         "state_thresholds": (1.5, 4.0),
         # Prose, carried only for the pre-flight structure check.
         "description": task.campaign["description"],
+        # Reproducibility, not a physics parameter — but locked all the same.
+        "seed": 42,
     }
     # (low, high) on the observable — the order run_campaign refuses inverted.
     assert task.campaign["state_thresholds"][0] < task.campaign["state_thresholds"][1]
@@ -64,7 +66,7 @@ def test_a_pure_convergence_task_yields_no_campaign_overrides() -> None:
 
     # `description` is prose for the pre-flight check, not a campaign
     # parameter; nothing here changes what the loop does.
-    assert set(task.campaign) <= {"description"}
+    assert set(task.campaign) <= {"description", "seed"}
     assert task.done_criterion == {}
 
 
@@ -426,3 +428,107 @@ def test_the_refusal_names_what_the_source_actually_quoted(tmp_path: Path) -> No
         load_task_file(_write(tmp_path, doc))
 
     assert "quotes [1000.0] ns" in str(excinfo.value)
+
+
+# ---------- equilibration and seed ----------
+
+def test_equilibration_is_stated_in_picoseconds_not_steps(tmp_path: Path) -> None:
+    """A step count silently changes meaning when the timestep changes — halve
+    the timestep and you halve how long the system was equilibrated for, with
+    nothing to catch it."""
+    from mdpilot.adapters.system_spec import Equilibration
+
+    doc = _minimal()
+    doc["integrator"] = {"timestep_fs": 1.0}
+    doc["equilibration"] = {"nvt_ps": 250.0, "npt_ps": 50.0, "heat_stages": 10}
+    spec = load_task_file(_write(tmp_path, doc)).spec
+
+    assert spec.equilibration == Equilibration(
+        nvt_ps=250.0, npt_ps=50.0, heat_start_k=50.0, heat_stages=10
+    )
+    # Converted against this campaign's own timestep, not a baked 2 fs.
+    assert spec.equilibration.nvt_steps(1.0) == 250_000
+    assert spec.equilibration.nvt_steps(2.0) == 125_000
+
+
+def test_equilibration_locks_with_the_spec(tmp_path: Path) -> None:
+    """A system heated for 10 ps is not the same starting state as one heated
+    for 100 ps, so it cannot change on resume."""
+    doc = _minimal()
+    doc["equilibration"] = {"nvt_ps": 10.0}
+    spec = load_task_file(_write(tmp_path, doc)).spec
+
+    assert "equilibration" in spec.to_dict()
+    assert "equilibration" not in load_task_file(_write(tmp_path, _minimal())).spec.to_dict()
+
+
+def test_the_seed_reaches_both_the_loop_and_the_adapter(tmp_path: Path) -> None:
+    """They must not end up seeded differently — the adapter seeds velocities
+    and the barostat, the loop seeds everything else."""
+    doc = _minimal()
+    doc["seed"] = 7
+    task = load_task_file(_write(tmp_path, doc))
+
+    assert task.run_kwargs()["seed"] == 7
+    assert task.build_adapter(tmp_path)._seed == 7
+    assert task.build_adapter(tmp_path, seed=99)._seed == 99   # caller may override
+
+
+def test_an_unknown_equilibration_key_raises(tmp_path: Path) -> None:
+    doc = _minimal()
+    doc["equilibration"] = {"nvt_steps": 50_000}      # the old, step-based name
+
+    with pytest.raises(ValueError, match="unknown equilibration key"):
+        load_task_file(_write(tmp_path, doc))
+
+
+def test_the_headless_runner_builds_the_same_campaign_as_the_app(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`python -m mdpilot.run` is the server-side counterpart to the Streamlit
+    app; both must produce the same campaign from the same file."""
+    from mdpilot import run as runner
+
+    captured: dict = {}
+
+    def fake_run_campaign(**kwargs):
+        captured.update(kwargs)
+        class R:
+            stop_reason = "max_rounds_reached"
+            rounds: tuple = ()
+        return R()
+
+    monkeypatch.setattr(runner, "run_campaign", fake_run_campaign)
+    monkeypatch.setattr(runner, "steps_per_ns_for", lambda a: 500_000)
+
+    assert runner.main([
+        "benchmarks/tasks/cln025_contacts.yaml", str(tmp_path),
+        "--opening-ns", "0.05", "--max-rounds", "4", "--biased-cap-ns", "0.1",
+    ]) == 0
+
+    # The file owns what the campaign is …
+    assert captured["state_thresholds"] == (0.3, 0.7)
+    assert captured["min_recrossings"] == 2
+    assert captured["adapter"].spec.pdb_id == "5AWL"
+    # … the flags own only the loop bounds.
+    assert captured["initial_steps"] == 25_000
+    assert captured["max_rounds"] == 4
+    assert captured["max_biased_ns"] == 0.1
+
+
+def test_the_runner_defaults_to_the_files_own_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Unlike the app, whose cap always overrides, omitting the flag here keeps
+    the budget the task file asked for."""
+    from mdpilot import run as runner
+
+    captured: dict = {}
+    monkeypatch.setattr(runner, "run_campaign",
+                        lambda **k: (captured.update(k) or type("R", (), {
+                            "stop_reason": "x", "rounds": ()})()))
+    monkeypatch.setattr(runner, "steps_per_ns_for", lambda a: 500_000)
+
+    runner.main(["benchmarks/tasks/cln025_contacts.yaml", str(tmp_path)])
+
+    assert captured["max_biased_ns"] == 20.0

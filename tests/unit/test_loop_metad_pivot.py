@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from mdpilot.adapters.system_spec import SystemSpec
@@ -1212,3 +1213,218 @@ def test_the_real_task_file_drives_the_loop_and_reopens_cleanly(
         adapter=_FakeAdapter(tmp_path, spec=task.spec),
         **kwargs,
     )
+
+
+def test_the_biased_report_says_where_the_walker_was_this_round(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """COLVAR appends across the whole biased phase, so `cv_min`/`cv_max` keep
+    reporting the widest excursion the campaign ever made. A real campaign sat
+    between 0.03 and 0.13 for two rounds while the scientist correctly quoted a
+    cumulative 0.39-10.01 and concluded the full range was being explored."""
+    import numpy as np
+
+    from mdpilot.orchestrator import loop as loop_mod
+
+    captured: dict = {}
+
+    def fake_accumulated(rounds_dir, round_index, traj, top, observable=None):
+        this_round = np.linspace(0.03, 0.13, 50)          # stuck, unfolded
+        cumulative = np.concatenate([np.linspace(0.03, 0.78, 50), this_round])
+        return cumulative, "native_contacts_fraction", this_round
+
+    monkeypatch.setattr(loop_mod, "_accumulated_observable", fake_accumulated)
+    monkeypatch.setattr(
+        loop_mod, "metad_report",
+        lambda *a, **k: (captured.update(k) or dict(_METAD_REPORT)),
+    )
+
+    report = loop_mod._round_report(
+        tmp_path / "r.dcd", tmp_path / "top.pdb",
+        plumed_dat_path=tmp_path / "plumed.dat", temperature_k=300.0,
+        fes_dir=tmp_path / "fes", rounds_dir=tmp_path, round_index=4,
+        state_thresholds=(0.3, 0.7),
+    )
+
+    assert report["observable_min_this_round"] == pytest.approx(0.03)
+    assert report["observable_max_this_round"] == pytest.approx(0.13)
+    # Entirely inside one state — the signal the cumulative range cannot give.
+    assert report["observable_max_this_round"] < 0.3
+    # The recrossing count is still taken against the cumulative series.
+    assert captured["observable"].size == 100
+
+
+# ---------- the CV-switch escape hatch out of a trap ----------
+#
+# Replays the observable from `campaigns/ui_campaign_chignolin`, which left the
+# folded state in round 2 and then sat between 0.03 and 0.13 of its native
+# contacts while the deposited bias grew past 115 kJ/mol. A contact count maps
+# every disordered conformation onto roughly the same value, so the bias fills
+# one degenerate bin and cannot lead the chain back. `switch_cv` is the way out.
+
+_TRAP_SERIES = [
+    np.linspace(0.78, 0.11, 40),   # round 2: crosses both bands
+    np.linspace(0.44, 0.04, 40),   # round 3: still crosses 0.3
+    np.linspace(0.13, 0.03, 40),   # round 4: confined below 0.3
+    np.linspace(0.12, 0.03, 40),   # round 5: still confined -> rounds_confined=2
+]
+
+
+def _stub_trap(monkeypatch, decisions, depths) -> dict:
+    """Like `_stub_collaborators`, but the observable really is trapped and the
+    surface really keeps deepening, so `_round_report` computes confinement
+    from data instead of being handed a verdict."""
+    record = _stub_collaborators(monkeypatch, decisions)
+    record["reports"] = []
+    biased_round = {"n": 0}
+
+    def fake_accumulated(rounds_dir, round_index, traj, top, observable=None):
+        i = biased_round["n"]
+        biased_round["n"] += 1
+        series = _TRAP_SERIES[min(i, len(_TRAP_SERIES) - 1)]
+        # Persist it so `_confinement` reads the same files the real loop would.
+        Path(rounds_dir).mkdir(parents=True, exist_ok=True)
+        np.save(Path(rounds_dir) / f"round_{round_index:03d}.obs.npy", series)
+        cumulative = np.concatenate(_TRAP_SERIES[: i + 1])
+        return cumulative, "native_contacts_fraction", series
+
+    monkeypatch.setattr(loop_mod, "_accumulated_observable", fake_accumulated)
+    depth_iter = iter(depths)
+
+    def fake_metad_report(*a, **k):
+        report = dict(_METAD_REPORT)
+        report.update(
+            fes_depth_kj_per_mol=next(depth_iter), recrossings=1,
+            fes_converged=False, recrossing_basis="task_states",
+        )
+        return report
+
+    monkeypatch.setattr(loop_mod, "metad_report", fake_metad_report)
+
+    inner = loop_mod.decide
+
+    def recording_decide(report, **kwargs):
+        record["reports"].append(report)
+        return inner(report, **kwargs)
+
+    monkeypatch.setattr(loop_mod, "decide", recording_decide)
+    return record
+
+
+def test_a_contact_space_trap_is_detected_and_escaped(tmp_path, monkeypatch) -> None:
+    record = _stub_trap(
+        monkeypatch,
+        [_switch(), _extend(), _extend(), _extend(), _switch_cv(), _stop()],
+        depths=[51.0, 92.0, 116.0, 131.0, 20.0],
+    )
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    result = run_campaign(
+        work_dir=tmp_path, adapter=base,
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text
+        ),
+        max_rounds=6, max_cv_switches=1,
+        state_thresholds=(0.3, 0.7), task_expectation="fold it",
+        **_run_kwargs(),
+    )
+
+    biased = [r for r in record["reports"] if r.get("phase") == "metad"]
+    confined = [(r.get("confined_to_state"), r.get("rounds_confined")) for r in biased]
+
+    # Rounds 2 and 3 traverse the bands; 4 and 5 are stuck below the low one.
+    assert confined[:2] == [(None, 0), (None, 0)]
+    assert confined[2] == ("low", 1)
+    assert confined[3] == ("low", 2)          # the trap is now unambiguous
+    # And the surface kept deepening while it sat there.
+    assert [r["fes_depth_kj_per_mol"] for r in biased][:4] == [51.0, 92.0, 116.0, 131.0]
+
+    # The escape actually happened: a fresh bias on the replacement coordinate.
+    assert "switch_cv" in [r.decision.decision for r in result.rounds]
+    assert record["cv_labels"][-1] != record["cv_labels"][0]
+
+
+def test_the_switch_is_offered_only_while_the_allowance_lasts(
+    tmp_path, monkeypatch
+) -> None:
+    """`max_cv_switches` is the budget; once spent the action leaves the tool
+    rather than being emitted and refused."""
+    record = _stub_trap(
+        monkeypatch,
+        [_switch(), _extend(), _extend(), _extend(), _switch_cv(), _stop()],
+        depths=[51.0, 92.0, 116.0, 131.0, 20.0],
+    )
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text
+        ),
+        max_rounds=6, max_cv_switches=1,
+        state_thresholds=(0.3, 0.7), task_expectation="fold it",
+        **_run_kwargs(),
+    )
+
+    offered = record["allow_cv_switch"]
+    assert offered[0] is False                      # vanilla round: not biased yet
+    assert all(offered[1:5])                        # biased, one switch in hand
+    assert offered[5] is False                      # spent — withdrawn from the tool
+
+
+def test_the_report_tells_the_scientist_what_allowance_is_left(
+    tmp_path, monkeypatch
+) -> None:
+    record = _stub_trap(
+        monkeypatch, [_switch(), _extend(), _switch_cv(), _stop()],
+        depths=[51.0, 92.0, 20.0],
+    )
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text
+        ),
+        max_rounds=4, max_cv_switches=1,
+        state_thresholds=(0.3, 0.7), task_expectation="fold it",
+        **_run_kwargs(),
+    )
+
+    biased = [r for r in record["reports"] if r.get("phase") == "metad"]
+    assert biased[0]["cv_switches_remaining"] == 1
+    assert biased[-1]["cv_switches_used"] == 1 and biased[-1]["cv_switches_remaining"] == 0
+
+
+def test_wall_warnings_reach_the_scientist_through_the_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """plumed.dat records the same thing as comments, but the scientist never
+    reads plumed.dat. An unbounded CV with no wall is F6 and it has to be said
+    somewhere the next round will see."""
+    from mdpilot.adapters.plumed_writer import RmsdCV
+    from mdpilot.orchestrator.loop import _wall_notes
+
+    cv = RmsdCV(label="rmsd_ca", atoms=(0, 1, 2), reference_path=Path("/tmp/r.pdb"))
+
+    # No wall at all: the F6 warning.
+    (note,) = _wall_notes(cv, None, None)
+    assert "unbounded above" in note and "F6" in note
+
+    # A wall the box cannot honour: the F11 warning.
+    from mdpilot.adapters.plumed_writer import UpperWall
+
+    (note,) = _wall_notes(
+        cv, UpperWall(cv_label="rmsd_ca", at=0.8, kappa=1000.0, box_limit_nm=0.55), 0.8
+    )
+    assert "0.55" in note and "periodic image" in note
+
+    # A wall the campaign did not choose: say so, without alarm.
+    (note,) = _wall_notes(
+        cv,
+        UpperWall(cv_label="rmsd_ca", at=0.55, kappa=1000.0,
+                  box_limit_nm=0.55, derived_from_box=True),
+        None,
+    )
+    assert "measured from the source trajectory" in note
+    assert "too small for the question" in note
+
+    # A bounded coordinate has nothing to warn about.
+    from mdpilot.adapters.plumed_writer import ContactsCV
+
+    assert _wall_notes(ContactsCV(label="q", pairs=((0, 1),), r0_nm=0.75), None, None) == []
