@@ -1,5 +1,7 @@
 # MDPilot
 
+[![CI](https://github.com/jeongmoon2006/MDPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/jeongmoon2006/MDPilot/actions/workflows/ci.yml)
+
 A closed-loop scientific reasoning agent for molecular dynamics.
 
 > An MD operator runs the simulation you describe.
@@ -48,30 +50,106 @@ micromamba install -y -n mdpilot -c conda-forge "cuda-version=13.2"
 
 The two environments pin different OpenMM builds and are not interchangeable.
 
-## Run a campaign
+## Quick start
+
+Describe the science, read what it proposes, then run it.
+
+```sh
+# 1 — draft a task file from one sentence
+python -m mdpilot.setup_agent "study chignolin folding and unfolding" \
+    --out campaigns/chignolin/task.yaml
+
+# 2 — read it. Nothing runs until you do.
+
+# 3 — run it (conda env: metadynamics needs PLUMED)
+micromamba run -n mdpilot python -m mdpilot.run \
+    campaigns/chignolin/task.yaml campaigns/chignolin \
+    --opening-ns 1.0 --max-rounds 20 --biased-cap-ns 20
+```
+
+Step 2 is not a formality. The loader checks every declared field against the
+code that consumes it, and pre-flight checks the built structure — but one
+field has no cross-check at all: `characteristic_timescale_ns` is what the
+pivot decision is taken against, and it comes from the model's own knowledge.
+Read it, and read the source it cites.
+
+## The task file
+
+One file defines the campaign. Every field is in one of three modes:
+
+| mode | meaning |
+|---|---|
+| **mapped** | a real parameter — system, force field, padding, ensemble, equilibration, seed, observable, thresholds, budgets |
+| **verified** | not yet tunable, but checked against the constant that governs it, so the file cannot disagree with the run |
+| **informational** | prose, carried not interpreted |
+
+Anything else is refused. See
+[`benchmarks/tasks/cln025_contacts.yaml`](benchmarks/tasks/cln025_contacts.yaml)
+for a fully commented example.
+
+## Running a campaign
+
+```sh
+python -m mdpilot.run <task.yaml> <work_dir> [--opening-ns …] [--max-rounds …]
+```
+
+Resumable: re-running the same command after an interruption continues from the
+last checkpoint, and a task file that changed what the campaign *is* is refused
+rather than silently spliced. The flags own only loop bounds. Line-flushed
+output, so `nohup`/`tmux` plus `tail -f` works on a server.
+
+## Web app
+
+A three-column control surface: draft a campaign from a sentence, watch the
+scientist decide, inspect what it produced.
+
+```sh
+micromamba run -n mdpilot pip install -e ".[ui]"
+micromamba run -n mdpilot streamlit run app.py
+```
+
+Run it in the conda environment — the app starts real campaigns, so it needs
+the same PLUMED-capable environment metadynamics does. The left column calls
+the setup agent (needs `ANTHROPIC_API_KEY`); the middle streams
+`run_campaign`'s event log; the right renders trajectories and free-energy
+surfaces straight out of `campaigns/`. It starts idle and follows whichever
+campaign you lock; pick one from its dropdown to inspect an earlier run.
+
+Run bounds in the left column default to shakedown sizes on purpose — a click
+should not start a 20 ns campaign.
+
+## Python API
+
+`run_campaign` can be called directly, but it bypasses the task file — and with
+it the pre-flight checks, the declared-field verification, and
+`TaskFile.build_adapter`. Calling it without an `adapter` silently uses the
+default Trp-cage system whatever you meant to simulate. Prefer a task file.
 
 ```python
 from pathlib import Path
-from mdpilot.orchestrator.loop import run_campaign
 
+from mdpilot.orchestrator.loop import run_campaign
+from mdpilot.task_file import load_task_file
+
+task = load_task_file("benchmarks/tasks/cln025_contacts.yaml")
 result = run_campaign(
     work_dir=Path("campaigns/demo"),
-    initial_steps=10_000,   # 20 ps at 2 fs
-    max_rounds=1,
+    adapter=task.build_adapter("campaigns/demo"),
+    **task.run_kwargs(max_rounds=1),
 )
-print(result.rounds[0].decision)
 ```
-
-First call fetches PDB 1L2Y, solvates, minimizes and equilibrates; the state is
-cached, so later calls on the same `work_dir` skip straight to dynamics.
-Per-round artifacts land in `campaigns/demo/rounds/`.
 
 ## Tests
 
 ```sh
-pytest tests/unit          # 130 tests, ~4 s — no API key, no MD
+pytest tests/unit          # 401 tests, ~9 s — no API key, no MD
 pytest tests/integration   # live MD; PLUMED and API-key tests skip if unavailable
+ruff check                 # correctness rules only; config in pyproject.toml
 ```
+
+CI runs the unit suite on Python 3.10 and 3.12, lints, and checks that a built
+wheel actually carries `mdpilot/knowledge/*.md` — the prompt is Markdown
+package data, and an editable install cannot catch it going missing.
 
 Integration coverage includes equilibration physics (velocities, temperature,
 barostat, density) and metadynamics against PLUMED's own HILLS and COLVAR
@@ -90,6 +168,7 @@ seed). Note these predate the equilibration work and are NVT — see F3 in
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — what MDPilot is and why
+- [`docs/diagrams.md`](docs/diagrams.md) — the same, as three diagrams
 - [`ROADMAP.md`](ROADMAP.md) — milestones and what's next
 - [`docs/activity-log.md`](docs/activity-log.md) — decisions, findings, session journal
 - [`docs/related_work.md`](docs/related_work.md) — positioning

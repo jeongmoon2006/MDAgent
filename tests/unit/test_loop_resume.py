@@ -35,6 +35,7 @@ def _full_config(cfg: dict, *, engine: str = "OpenMMAdapter") -> dict:
         "task_expectation": None,
         "cv_upper_wall_nm": None,
         "state_thresholds": None,
+        "min_recrossings": 1,
     }
 
 
@@ -134,3 +135,72 @@ def test_engine_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
             **cfg,
         )
     assert not (tmp_path / "setup").exists()
+
+
+def test_ensemble_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
+    """Temperature and timestep live on the spec precisely so this raises.
+
+    As adapter class constants they were covered only by the engine-name lock,
+    and that coverage would have evaporated the moment they became settable —
+    a campaign could then have been resumed at a different temperature with
+    the guard none the wiser.
+    """
+    import pytest
+
+    from mdpilot.adapters.openmm_adapter import OpenMMAdapter
+    from mdpilot.adapters.system_spec import Ensemble
+
+    cfg = _config_kwargs()
+    store.init_campaign(tmp_path, _full_config(cfg))  # default ensemble persisted
+
+    for changed in (Ensemble(temperature_k=240.0), Ensemble(timestep_fs=1.0)):
+        adapter = OpenMMAdapter(
+            work_dir=tmp_path,
+            seed=cfg["seed"],
+            spec=SystemSpec(pdb_id="1L2Y", ensemble=changed),
+        )
+        with pytest.raises(ValueError, match="different config"):
+            run_campaign(work_dir=tmp_path, max_rounds=1, adapter=adapter, **cfg)
+    # Refused before any engine setup was paid for.
+    assert not (tmp_path / "inputs").exists()
+
+
+def test_observable_mismatch_on_resume_is_rejected(tmp_path: Path) -> None:
+    """The observable is what every round was judged on, and `state_thresholds`
+    are positions on it. Resuming under a different one would compare rounds
+    scored on two different coordinates."""
+    import pytest
+
+    from mdpilot.adapters.openmm_adapter import OpenMMAdapter
+    from mdpilot.observables import ObservableSpec
+
+    cfg = _config_kwargs()
+    store.init_campaign(tmp_path, _full_config(cfg))   # default observable
+
+    adapter = OpenMMAdapter(work_dir=tmp_path, seed=cfg["seed"])
+    with pytest.raises(ValueError, match="different config"):
+        run_campaign(
+            work_dir=tmp_path, max_rounds=1, adapter=adapter,
+            observable=ObservableSpec(
+                cv_type="gyration", selections=("name CA",), name="rg_nm"
+            ),
+            **cfg,
+        )
+    assert not (tmp_path / "inputs").exists()
+
+
+def test_declaring_the_default_observable_does_not_break_resume(
+    tmp_path: Path,
+) -> None:
+    """Both shipped task files spell the CA-RMSD default out explicitly. That
+    must stay byte-identical to saying nothing, or every campaign recorded
+    before observables were declarable is stranded."""
+    from mdpilot.observables import ObservableSpec
+
+    store.init_campaign(tmp_path, _full_config(_config_kwargs()))
+    store.init_campaign(
+        tmp_path,
+        {**_full_config(_config_kwargs())},
+    )
+    assert "observable" not in store.get_campaign_config(tmp_path)
+    assert ObservableSpec.ca_rmsd_angstrom() == ObservableSpec.ca_rmsd_angstrom()

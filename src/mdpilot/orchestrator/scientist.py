@@ -19,10 +19,14 @@ Implementation notes:
       than merely discouraged. A second `switch_to_metad` is out of scope (the
       loop ends the campaign for human review), so it is dropped from the
       biased tool schema instead of being emitted and rejected.
-- Action space (vanilla): `extend | stop | switch_to_metad`. On `switch_to_metad`
-  the model also returns a `MetadProposal` — a structured CV proposal in the
-  same shape `cv_designer.CVProposal` consumes (cv_type, MDTraj selection
-  strings, label). Bias parameters (sigma, height, pace) are *not* in the
+- Action space (vanilla): `extend | stop`, plus `switch_to_metad` when a
+  `task_expectation` was supplied — that string is the only thing the pivot
+  rule compares against, so without it the campaign is a pure convergence task
+  and the action is dropped from the enum rather than left available and
+  discouraged in prose. On `switch_to_metad` the model also returns a
+  `MetadProposal` — a structured CV proposal in the same shape
+  `cv_designer.CVProposal` consumes (cv_type, MDTraj selection strings,
+  label). Bias parameters (sigma, height, pace) are *not* in the
   model's output: they are physics-unit numbers, derivable deterministically
   from the prior trajectory and from rule-of-thumb constants; a small helper
   in `sampling/` will fill them at the point of use (step 4 of the M4 plan).
@@ -38,18 +42,34 @@ Implementation notes:
   `metad_proposal` is a nullable object so the discriminated union stays in
   one tool call; the cross-field invariant (`metad_proposal` non-null iff
   decision == switch_to_metad) is enforced in `decide()`'s parser.
-- Caching: `cache_control` on the system prompt. Sonnet 4.6's minimum
-  cacheable prefix is 1024 tokens; the two-phase prompt is around that size,
-  so caching may now actually engage. Note the render order is tools →
-  system → messages, so swapping the tool at the pivot invalidates the
-  system prefix for one round. That happens once per campaign and is not
-  worth designing around.
+- Prompt assembly: the system prompt is retrieved per round from the
+  Markdown knowledge base in `mdpilot/knowledge/`, keyed on the same facts
+  that select the tool schema (phase, whether a CV proposal is possible,
+  whether a CV switch is offered). A round is never shown rules it cannot
+  act on — a biased round gets no equilibrium rubric, a pure-convergence
+  campaign gets no CV vocabulary. See `build_system_prompt`.
+- Caching: `cache_control` on the assembled system prompt. There are four
+  possible assemblies and the prompt is constant within a campaign phase, so
+  each variant caches after its first round. The render order is tools →
+  system → messages, so a breakpoint on the system block caches the tool
+  schema *with* it: the ~715-token tool sits inside the cached prefix, not
+  before it. That is what keeps even the smallest assembly clear of Sonnet
+  4.6's 1024-token minimum — a pure-convergence vanilla round is a
+  1,014-token system block but a 1,729-token prefix, and it does cache
+  (measured `cache_read_input_tokens` 1,413 on the second call). Retrieval
+  therefore never trims a round out of the cache; an earlier note here
+  claiming the smallest assembly might miss it compared the system block
+  against the minimum instead of the prefix. That same render order is why
+  swapping the tool at the pivot invalidates the prefix for one round — the
+  same round the assembly changes anyway.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from functools import lru_cache
+from importlib import resources
 from typing import Any, Literal
 
 import anthropic
@@ -60,205 +80,89 @@ load_dotenv()
 _MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 2048
 
-_SYSTEM_PROMPT = """\
-You are the scientist agent for MDPilot — a closed-loop reasoning system for \
-molecular dynamics simulations.
+# --- Prompt knowledge base -------------------------------------------------
+#
+# The rubrics, CV vocabulary and physics constraints live as Markdown under
+# `mdpilot/knowledge/`, one file per retrievable chunk, and are assembled per
+# round by `build_system_prompt`. Moved out of this module because a single
+# static prompt sent every round carried both phases' rules and the whole CV
+# vocabulary regardless of which were usable — ~2.9k tokens, of which roughly
+# half was unreachable guidance for the round being decided.
+#
+# Retrieval is by key, not by similarity: the keys are exactly the facts that
+# already select the tool schema, so the prose the model reads and the actions
+# it can emit cannot drift apart. There is deliberately no retrieval *within*
+# `cv_vocabulary` — the scientist is choosing among the CV types, so showing it
+# a filtered subset would pre-decide the science it exists to decide (the same
+# argument `benchmarks/tasks/cln025_folding.yaml` makes about not pre-selecting
+# an RMSD CV; run 1 and run 3 differed only in the model picking `contacts`).
 
-Your responsibility per round: decide what to do next.
+Phase = Literal["vanilla", "metad"]
 
-A campaign runs in one of two phases, named by `diagnostic_report.phase`. \
-The report you receive and the actions available to you both depend on it. \
-Read `phase` first.
+_KNOWLEDGE_PACKAGE = "mdpilot.knowledge"
 
-You receive four structured inputs per round:
 
-1. `diagnostic_report` — this round's numbers. Phase-dependent; see below.
+@lru_cache(maxsize=None)
+def _chunk(name: str) -> str:
+    """Read one knowledge chunk by key (its filename stem), cached per process.
 
-2. `prior_round_summaries` — lean view of past rounds (decision + key \
-numbers). Each carries its own `phase`, so rounds from before a pivot are \
-not comparable to rounds after one.
+    A missing key raises rather than resolving to empty. Silently dropping a
+    chunk would ship a prompt with, say, the bounded-vs-unbounded CV warning
+    absent — which is F6 exactly, and it would show up as a bad campaign weeks
+    later rather than as an error here.
+    """
+    try:
+        return (
+            resources.files(_KNOWLEDGE_PACKAGE)
+            .joinpath(f"{name}.md")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except (FileNotFoundError, ModuleNotFoundError) as e:
+        available = sorted(
+            f.name.removesuffix(".md")
+            for f in resources.files(_KNOWLEDGE_PACKAGE).iterdir()
+            if f.name.endswith(".md")
+        )
+        raise FileNotFoundError(
+            f"scientist: no knowledge chunk {name!r} in {_KNOWLEDGE_PACKAGE}; "
+            f"available: {available}"
+        ) from e
 
-3. `hypothesis_ledger` — text notes you wrote in previous rounds about \
-persistent observations. Your across-round memory.
 
-4. `task_expectation` — campaign-level expectation: what the trajectory must \
-accomplish, characteristic timescale, compute budget. Free text, may be null \
-for pure convergence tasks (a single-basin equilibration with no required \
-transition).
+def knowledge_keys(
+    phase: Phase, *, can_propose_cv: bool, allow_cv_switch: bool
+) -> tuple[str, ...]:
+    """Which knowledge chunks this round needs, in assembly order.
 
-=== PHASE `vanilla` — unbiased MD ===
+    `can_propose_cv` is whether the tool this round carries a `metad_proposal`
+    field at all — true for a vanilla round that may pivot, and for a biased
+    round with a CV switch still in its allowance. It is the caller's job to
+    keep it in step with the tool selected in `decide`; `test_scientist` pins
+    the two together.
 
-Action space is three-way:
+    Always-on chunks come first so the four variants share the longest possible
+    cache prefix.
+    """
+    keys = ["role", f"phase_{phase}"]
+    if allow_cv_switch:
+        keys.append("action_switch_cv")
+    if can_propose_cv:
+        keys.append("cv_vocabulary")
+    keys.append("output_contract")
+    return tuple(keys)
 
-- `extend` — run more vanilla MD; the trajectory needs more time.
-- `stop` — the observable has converged for the task at hand; the campaign \
-ends.
-- `switch_to_metad` — vanilla MD is *inadequate*: the system is pinned in a \
-single basin AND the task requires a transition the budget cannot reach. \
-Propose a collective variable for metadynamics.
 
-Report fields. Convergence: `plateau_reached`, `ess`, `tau_int_frames`, \
-`statistical_inefficiency_*`. Exploration: `bimodality_coefficient`, \
-`n_basins`, `minor_basin_occupancy`, `exploring`. The two \
-statistical-inefficiency fields (block-averaging, autocorrelation) should \
-agree if the diagnostic is reliable; flag >2× disagreement in `reason`.
-
-Decision rule:
-
-- `exploring=true` (n_basins >= 2): the system has visited multiple states; \
-vanilla MD is reaching them. Decide between `extend` and `stop` on \
-convergence numbers — `plateau_reached AND well_sampled AND ess>=50` → \
-`stop`, else `extend`.
-
-- `exploring=false` (pinned, n_basins == 1) AND `task_expectation` does not \
-require a transition (or is null): single-basin convergence. Same rule — \
-`plateau_reached AND well_sampled AND ess>=50` → `stop`, else `extend`.
-
-- `exploring=false` AND `task_expectation` explicitly requires a transition \
-that the budget cannot reach (compare cumulative simulation time to the \
-characteristic timescale in the expectation): vanilla is inadequate. Decide \
-`switch_to_metad` and propose a CV.
-
-=== PHASE `metad` — well-tempered metadynamics ===
-
-Action space is `extend` or `stop`, and — only when `switch_cv` appears in \
-the `decision` enum of your tool — `switch_cv`. When it is absent the \
-campaign has spent its CV-revision allowance and the choice is not yours to \
-make; do not argue for it. Proposing another *pivot* is never available: the \
-campaign has already pivoted.
-
-`switch_cv` replaces the biased collective variable and starts a fresh bias \
-on the new coordinate. The deposited hills on the old CV are kept as a record \
-but are not carried over — they describe a different coordinate. The compute \
-already spent is *not* refunded: the biased budget is cumulative across CVs, \
-so a switch late in a campaign buys little. Use it when the evidence says the \
-coordinate is wrong, not when the surface is merely still filling:
-
-- the boundaries `recrossings` was counted between sit on the same side of \
-the states your task describes (see the rule below), so the count is not \
-measuring the transition you were asked for;
-- the walker left the region it started in — compare `cv_start` against \
-`cv_min`/`cv_max` — and many rounds have passed without it returning;
-- `recrossings` has stayed at 0 across several rounds while \
-`fes_depth_kj_per_mol` keeps growing, which is a bias filling a basin it \
-cannot escape along this coordinate.
-
-Prefer a coordinate that is bounded on both sides when the failure was a \
-walker that left and did not come back. Justify the replacement in `reason` \
-by naming what the previous CV failed to do, and record the diagnosis in \
-`ledger_note` — the next rounds will be judged on a different coordinate and \
-the history has to explain the discontinuity.
-
-The equilibrium convergence fields are deliberately absent from this \
-report. A biased trajectory is not an equilibrium ensemble — the bias drives \
-the observable — so a long autocorrelation would mean the bias is still \
-filling and a bimodal marginal would mean the bias worked, not that the \
-system is sampling freely. Do not ask for those numbers or reason as if you \
-had them.
-
-Report fields, all derived from the deposited bias (HILLS) integrated into a \
-free-energy surface:
-
-- `fes_drift_kj_per_mol` — how much the surface changed between the last two \
-cumulative estimates. The standard well-tempered convergence test.
-- `recrossings` — barrier crossings, counted with hysteresis between \
-`recrossing_low` and `recrossing_high`. `barrier_crossed` is `recrossings >= \
-1`. `recrossing_basis` says what those boundaries are:
-  - `task_states` — the states your task defines, measured on \
-`recrossing_observable`, which is usually *not* the CV you are biasing. Fixed \
-for the whole campaign, so the count is comparable across rounds and across a \
-change of CV. Trust this one.
-  - `fes_basins` — the two deepest basins of the *current* surface. These move \
-as the bias fills, so a count on this basis means something different every \
-round; compare the boundaries against your task's states before reading it.
-- `recrossings` may be `null`, meaning the count could not be taken at all \
-(fewer than two basins resolved on the surface). That is not the same as zero \
-crossings. Do not treat a null as evidence the walker stayed put — check \
-`cv_min`/`cv_max` against `cv_start` to see how far it has actually moved.
-- `fes_converged` — true only when drift is below kT (≈2.5 kJ/mol at 300 K) \
-AND `recrossings >= 1`. Low drift *alone* is not convergence: a walker that \
-never left its starting basin produces a surface that stops changing \
-immediately, because nothing new is being sampled.
-- `n_basins_fes`, `barrier_kj_per_mol`, `fes_depth_kj_per_mol`, \
-`n_fes_estimates` — shape of the surface recovered so far. `cv_min` and \
-`cv_max` are the range the walker actually visited, and `fes_depth` is \
-measured over that range only, not over the wider grid `sum_hills` writes.
-
-Decision rule:
-
-- `fes_converged=true` → `stop`. The surface has stopped moving and the \
-walker has crossed the barrier at least once.
-- otherwise → `extend`. This includes `fes_converged=null` (not enough \
-estimates or no COLVAR yet) and the low-drift/zero-recrossing case, which is \
-an under-filled basin, not a converged surface.
-- If many rounds have passed with `recrossings=0` and a large \
-`fes_depth_kj_per_mol`, say so in `reason` and record it in `ledger_note` — \
-that pattern suggests the biased CV is not the slow coordinate. You cannot \
-act on it, but a human reading the ledger can.
-- Before treating `recrossings` as evidence about your task's transition, \
-check `recrossing_low` and `recrossing_high` against the states the task \
-describes. If both boundaries sit on the same side of those states, the count \
-is measuring motion *within* one state rather than the transition you were \
-asked for, and a non-zero count is then not evidence that the CV is working. \
-Say so in `reason` and record it in `ledger_note`.
-
-=== BOTH PHASES ===
-
-Sizing `extra_ns` when extending: proportional to the gap — 0.5 ns when \
-borderline, up to 2.0 ns when far (vanilla: ess<5 or no plateau; metad: \
-drift well above kT or zero recrossings). When `stop` or `switch_to_metad`, \
-`extra_ns` must be null.
-
-When `switch_to_metad`, populate `metad_proposal`:
-
-- `cv_type` — one of `distance`, `torsion`, `gyration`, `rmsd`, `contacts`. \
-Pick the type that matches the physical coordinate you believe is slow. Note \
-that `distance`, `gyration` and `rmsd` are unbounded above, so a bias on them \
-can drive the system into an ever-larger unfolded space and never return; \
-`torsion` and `contacts` are bounded on both sides and do not have that \
-failure mode.
-- `selections` — MDTraj selection strings. Arity is type-specific:
-  - `distance`: 2 selections, each must resolve to exactly 1 atom. \
-Example: `["name CA and resSeq 1", "name CA and resSeq 10"]`.
-  - `torsion`: 4 selections, each must resolve to exactly 1 atom. \
-Example: `["resSeq 2 and name N", "resSeq 2 and name CA", \
-"resSeq 2 and name C", "resSeq 3 and name N"]`.
-  - `gyration`: 1 selection, must resolve to ≥2 atoms. \
-Example: `["backbone and resSeq 1 to 10"]`.
-  - `rmsd`: 1 selection, must resolve to ≥3 atoms. RMSD to the campaign's \
-reference structure after optimal superposition — the usual folding order \
-parameter. Example: `["name CA"]`.
-  - `contacts`: 1 selection, must resolve to ≥2 atoms. A smooth count of the \
-native contacts formed among the selected atoms, running from ~0 (none) to \
-the number of contacts present in the reference structure. Pairs closer than \
-3 residues in sequence are excluded, since those are formed in any \
-conformation. Example: `["name CA"]`. For folding and unfolding this is \
-usually a better coordinate than `rmsd`: it measures how much of the native \
-structure is present rather than how far the whole chain has moved, and \
-because it is bounded the unfolded side cannot run away.
-- `label` — short snake_case identifier (e.g. `rg_back`, `d_term`). It MUST \
-name the coordinate you are actually biasing. Do not name it after a \
-coordinate you would have preferred but did not select: the label is written \
-into plumed.dat, HILLS, COLVAR and every downstream report, and a label that \
-misdescribes the CV makes the run unreadable afterwards. If you want RMSD, \
-choose `cv_type: rmsd` — do not call a `distance` an rmsd.
-
-Bias parameters (sigma, height, pace) are *not* your concern — a \
-deterministic helper computes them from the prior trajectory.
-
-When not switching, `metad_proposal` must be null.
-
-For `ledger_note`: record insights worth carrying across rounds — a \
-hypothesis about the slow coordinate, the reason for an unusual CV choice, a \
-rate estimate. Pass null when nothing new is worth recording.
-
-For `reason`: cite the specific numbers that drove the call \
-(`plateau_reached`, `ess`, `exploring`, `n_basins`, `bimodality_coefficient`) \
-and, if switching, briefly justify the CV in physical terms. One to three \
-sentences.
-
-You MUST call the `record_decision` tool. Do not respond in plain text.
-"""
+def build_system_prompt(
+    phase: Phase, *, can_propose_cv: bool, allow_cv_switch: bool
+) -> str:
+    """Assemble the round's system prompt from the knowledge base."""
+    return "\n\n".join(
+        _chunk(k)
+        for k in knowledge_keys(
+            phase, can_propose_cv=can_propose_cv, allow_cv_switch=allow_cv_switch
+        )
+    )
 
 _METAD_PROPOSAL_SCHEMA = {
     "type": ["object", "null"],
@@ -418,7 +322,45 @@ _METAD_SWITCH_TOOL = {
     },
 }
 
-Phase = Literal["vanilla", "metad"]
+# The vanilla action space for a campaign that cannot pivot. `task_expectation`
+# is the sole input the `switch_to_metad` rule compares against — it is where
+# the required transition and the characteristic timescale are stated — so with
+# no expectation there is nothing to judge "the budget cannot reach it" on.
+# Dropping the action from the enum makes the pivot unrepresentable rather than
+# merely discouraged by the prompt, the same argument as `_METAD_DECISION_TOOL`
+# for a second pivot and `_METAD_SWITCH_TOOL` for a spent CV-revision budget.
+#
+# This is load-bearing beyond tidiness: a pivot from a campaign with no
+# expectation also has no `state_thresholds` (`run_campaign` only requires them
+# when `task_expectation` is set), so the biased phase would fall back to
+# counting recrossings between the two deepest basins of the current surface —
+# the F9 behaviour that fallback exists to keep unreachable.
+_CONVERGENCE_TOOL = {
+    "name": "record_decision",
+    "description": "Record the decision (extend or stop) for this round.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            **{
+                k: v
+                for k, v in _DECISION_TOOL["input_schema"]["properties"].items()
+                if k != "metad_proposal"
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["extend", "stop"],
+                "description": "What to do next with the trajectory.",
+            },
+        },
+        "required": [
+            k
+            for k in _DECISION_TOOL["input_schema"]["required"]
+            if k != "metad_proposal"
+        ],
+        "additionalProperties": False,
+    },
+}
 
 _TOOL_FOR_PHASE: dict[str, dict[str, Any]] = {
     "vanilla": _DECISION_TOOL,
@@ -430,7 +372,7 @@ _TOOL_FOR_PHASE: dict[str, dict[str, Any]] = {
 class MetadProposal:
     """Structured metaD CV proposal. Mirrors `sampling.cv_designer.CVProposal`."""
 
-    cv_type: Literal["distance", "torsion", "gyration", "rmsd"]
+    cv_type: Literal["distance", "torsion", "gyration", "rmsd", "contacts"]
     selections: tuple[str, ...]
     label: str
 
@@ -477,6 +419,13 @@ def decide(
     being passed — an equilibrium bundle with phase="metad" would offer the
     right actions against the wrong numbers.
 
+    `task_expectation` also gates the pivot. It is the only input the
+    switch_to_metad rule has to compare against, so with none supplied the
+    campaign is a pure convergence task and `switch_to_metad` is dropped from
+    the vanilla enum. Not merely tidier: a pivot from such a campaign also has
+    no `state_thresholds`, and the biased phase would then count recrossings
+    against whichever two basins are currently deepest (F9).
+
     `allow_cv_switch` adds `switch_cv` to the biased action space. The caller
     owns that budget: once the campaign has spent its allowance the action is
     dropped from the enum rather than refused after the fact, so the model
@@ -489,8 +438,19 @@ def decide(
             f"{sorted(_TOOL_FOR_PHASE)}"
         )
     tool = _TOOL_FOR_PHASE[phase]
-    if phase == "metad" and allow_cv_switch:
+    if phase == "vanilla" and task_expectation is None:
+        tool = _CONVERGENCE_TOOL
+    elif phase == "metad" and allow_cv_switch:
         tool = _METAD_SWITCH_TOOL
+    # One source of truth for "can the model propose a CV this round": the tool
+    # it is actually given. Deriving the prompt key from the schema rather than
+    # re-deriving it from (phase, task_expectation, allow_cv_switch) means the
+    # vocabulary is present exactly when the field that consumes it is, with no
+    # second condition to keep in step.
+    can_propose_cv = "metad_proposal" in tool["input_schema"]["properties"]
+    system_prompt = build_system_prompt(
+        phase, can_propose_cv=can_propose_cv, allow_cv_switch=allow_cv_switch
+    )
     payload = {
         "round_index": (len(prior_round_summaries) if prior_round_summaries else 0) + 1,
         "diagnostic_report": diagnostic_report,
@@ -509,7 +469,7 @@ def decide(
         system=[
             {
                 "type": "text",
-                "text": _SYSTEM_PROMPT,
+                "text": system_prompt,
                 "cache_control": {"type": "ephemeral"},
             }
         ],

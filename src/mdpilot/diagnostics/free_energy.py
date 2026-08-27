@@ -165,6 +165,16 @@ def sum_hills(
     out_dir.mkdir(parents=True, exist_ok=True)
     outfile = out_dir / f"{basename}.dat"
 
+    # Drop surfaces left by an earlier attempt at this same round. sum_hills
+    # writes one file per stride block and never cleans up, so a round re-run
+    # after a crash — which resumes from the *previous* round's restored HILLS
+    # and therefore integrates fewer hills — writes fewer indexed files while
+    # the leftover higher indices survive. `indexed.sort()` then puts a stale
+    # surface last and `surfaces[-1]` is a profile from the aborted attempt.
+    for stale in out_dir.glob(f"{basename}.dat*"):
+        if stale.is_file():
+            stale.unlink()
+
     cmd = [
         "plumed", "sum_hills",
         "--hills", str(hills_path),
@@ -325,6 +335,27 @@ def count_recrossings(cv_series: np.ndarray, low: float, high: float) -> int:
     return crossings
 
 
+def _baseline_index(n_surfaces: int) -> int:
+    """Index of the estimate to measure drift *against*, given `n_surfaces`.
+
+    The half-way surface, so the two estimates are meaningfully separated in
+    time: with a stride of 10 over thousands of hills, consecutive estimates
+    are ~0.25% of the run apart and their difference is near zero however
+    unconverged the surface is.
+
+    Clamped to stay strictly below the last index. At exactly two estimates
+    ``n // 2`` *is* the last one, so the surface was compared against itself
+    and the drift came out 0.0 by construction — on a profile still moving by
+    tens of kJ/mol. That is the same vacuous comparison the trailing-duplicate
+    pop in `sum_hills` exists to remove, arriving by a different route, and it
+    is worse than vacuous: `_fes_converged` needs only low drift plus a
+    recrossing, so a first biased round short enough to produce two estimates
+    (~10 ps at PACE=500, stride=10) could report `fes_converged=true` and let
+    `_refuse_premature_stop` wave a `stop` straight through.
+    """
+    return min(n_surfaces // 2, n_surfaces - 2)
+
+
 def metad_report(
     hills_path: Path,
     colvar_path: Path | None,
@@ -351,7 +382,11 @@ def metad_report(
     if colvar_path is not None and Path(colvar_path).exists():
         series = load_colvar(Path(colvar_path)).get(final.cv_label)
 
-    baseline = load_fes(surfaces[len(surfaces) // 2]) if len(surfaces) >= 2 else None
+    baseline = (
+        load_fes(surfaces[_baseline_index(len(surfaces))])
+        if len(surfaces) >= 2
+        else None
+    )
 
     # Only *depth* is restricted to the sampled region. Depth is a max minus a
     # min, so the extrapolated shelf beyond the outermost hill — always the
@@ -367,11 +402,8 @@ def metad_report(
 
     minima = final.minima(temperature_k)
 
-    # Drift against the half-way surface, not the previous one. With a stride
-    # of 10 over thousands of hills, consecutive estimates are ~0.25% of the run
-    # apart, so their difference is near zero however unconverged the surface
-    # is. The standard well-tempered test compares estimates that are
-    # meaningfully separated in time.
+    # Drift against the half-way surface, not the previous one — see
+    # `_baseline_index` for why, and for why it is clamped off the last index.
     drift = fes_drift_kj_per_mol(baseline, final) if baseline is not None else None
 
     report: dict[str, Any] = {

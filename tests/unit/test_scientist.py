@@ -8,7 +8,7 @@ not set).
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 import pytest
 
@@ -227,6 +227,14 @@ def test_decision_tool_schema_includes_metad_proposal() -> None:
     from mdpilot.sampling.cv_designer import _CV_TYPES
 
     assert sub["cv_type"]["enum"] == list(_CV_TYPES)
+    # Third copy of the same vocabulary. It annotates the dataclass the parsed
+    # decision lands in, so it documents the contract without constraining it
+    # at runtime — which is exactly why it silently fell a type behind the
+    # other two when `contacts` was added.
+    # `get_type_hints`, not `__annotations__`: this module uses
+    # `from __future__ import annotations`, so the raw annotation is a string.
+    hints = get_type_hints(MetadProposal)
+    assert set(get_args(hints["cv_type"])) == set(_CV_TYPES)
 
 
 def test_metad_proposal_round_trips_through_dict() -> None:
@@ -272,6 +280,66 @@ def test_tool_schemas_avoid_keywords_strict_mode_rejects() -> None:
         assert tool["strict"] is True
         assert tool["input_schema"]["additionalProperties"] is False
         walk(tool["input_schema"])
+
+
+# ---------- switch_to_metad is gated on task_expectation ----------
+
+def test_a_campaign_with_no_expectation_cannot_express_a_pivot() -> None:
+    """`task_expectation` is the only input the switch_to_metad rule compares
+    against — the required transition and its timescale live in that string.
+    With none supplied there is nothing to judge "the budget cannot reach it"
+    on, so the action leaves the enum entirely.
+
+    Load-bearing beyond tidiness: `run_campaign` only requires
+    `state_thresholds` when `task_expectation` is set, so a pivot reached from
+    a campaign without one lands in a biased phase that counts recrossings
+    between whichever two basins are currently deepest (F9).
+    """
+    fake = _FakeClient(
+        tool_input={"decision": "extend", "reason": "ess=8", "extra_ns": 0.5,
+                    "ledger_note": None}
+    )
+    decide({"phase": "vanilla", "ess": 8}, client=fake, task_expectation=None)
+
+    schema = fake.last_request["tools"][0]["input_schema"]
+    assert schema["properties"]["decision"]["enum"] == ["extend", "stop"]
+    assert "metad_proposal" not in schema["properties"]
+    assert "metad_proposal" not in schema["required"]
+
+
+def test_a_campaign_with_an_expectation_keeps_the_pivot() -> None:
+    fake = _FakeClient(
+        tool_input={"decision": "extend", "reason": "ess=8", "extra_ns": 0.5,
+                    "ledger_note": None, "metad_proposal": None}
+    )
+    decide(
+        {"phase": "vanilla", "ess": 8},
+        client=fake,
+        task_expectation="fold the hairpin; 20 ns budget",
+    )
+
+    schema = fake.last_request["tools"][0]["input_schema"]
+    assert schema["properties"]["decision"]["enum"] == [
+        "extend", "stop", "switch_to_metad",
+    ]
+    assert schema["properties"]["metad_proposal"]["type"] == ["object", "null"]
+
+
+def test_the_convergence_tool_keeps_every_non_pivot_field() -> None:
+    """Dropping the pivot must not quietly drop `ledger_note` or `extra_ns`
+    with it — strict mode requires every property to be listed as required, so
+    a missing one is a 400 rather than a silently narrower action."""
+    from mdpilot.orchestrator.scientist import _CONVERGENCE_TOOL, _DECISION_TOOL
+
+    convergence = _CONVERGENCE_TOOL["input_schema"]
+    full = _DECISION_TOOL["input_schema"]
+
+    assert set(convergence["properties"]) == set(full["properties"]) - {
+        "metad_proposal"
+    }
+    assert set(convergence["required"]) == set(convergence["properties"])
+    assert _CONVERGENCE_TOOL["strict"] is True
+    assert _CONVERGENCE_TOOL["name"] == "record_decision"
 
 
 # ---------- switch_cv action space ----------
@@ -338,3 +406,177 @@ def test_switch_cv_round_trips_with_its_proposal() -> None:
     assert decision.decision == "switch_cv"
     assert decision.metad_proposal is not None
     assert decision.metad_proposal.cv_type == "contacts"
+
+
+# ---------- knowledge-base retrieval ----------
+#
+# The prompt is assembled per round from `mdpilot/knowledge/*.md`. What matters
+# is not that a chunk *can* be loaded but that guidance the round cannot act on
+# is absent, and that guidance it needs is never dropped silently.
+
+def _system_text(fake: _FakeClient) -> str:
+    assert fake.last_request is not None
+    return fake.last_request["system"][0]["text"]
+
+
+def _stub(**overrides: Any) -> _FakeClient:
+    payload: dict[str, Any] = {"decision": "extend", "reason": "stub", "extra_ns": 0.5}
+    payload.update(overrides)
+    return _FakeClient(tool_input=payload)
+
+
+def test_chunks_are_readable_and_unknown_keys_raise() -> None:
+    from mdpilot.orchestrator.scientist import _chunk
+
+    assert "`cv_type` — one of" in _chunk("cv_vocabulary")
+    with pytest.raises(FileNotFoundError, match="no knowledge chunk 'nope'"):
+        _chunk("nope")
+
+
+def test_keys_are_ordered_with_the_always_on_chunks_first() -> None:
+    """Assembly order is the shared cache prefix; role must lead every variant."""
+    from mdpilot.orchestrator.scientist import knowledge_keys
+
+    for phase in ("vanilla", "metad"):
+        for propose in (True, False):
+            for switch in (True, False):
+                keys = knowledge_keys(
+                    phase, can_propose_cv=propose, allow_cv_switch=switch
+                )
+                assert keys[0] == "role"
+                assert keys[1] == f"phase_{phase}"
+                assert keys[-1] == "output_contract"
+
+
+def test_a_biased_round_is_not_shown_the_vanilla_rubric() -> None:
+    """The equilibrium rubric names ess/plateau_reached, which the biased report
+    omits on purpose. Sending it invites exactly the category error the phase
+    split exists to prevent."""
+    fake = _stub()
+    decide({"phase": "metad", "fes_converged": False}, phase="metad", client=fake)
+    text = _system_text(fake)
+    assert "PHASE `metad`" in text
+    assert "PHASE `vanilla`" not in text
+    assert "plateau_reached AND well_sampled" not in text
+
+
+def test_a_vanilla_round_is_not_shown_the_free_energy_rubric() -> None:
+    fake = _stub()
+    decide({"ess": 8}, task_expectation="fold it", client=fake)
+    text = _system_text(fake)
+    assert "PHASE `vanilla`" in text
+    assert "PHASE `metad`" not in text
+    assert "fes_drift_kj_per_mol" not in text
+
+
+def test_cv_vocabulary_travels_with_the_metad_proposal_field() -> None:
+    """The vocabulary is present exactly when the tool can carry a proposal —
+    the invariant `decide` derives the key from. Checked against the schema
+    rather than restated, so the two cannot drift."""
+    for kwargs in (
+        {"task_expectation": "fold it"},                       # vanilla, may pivot
+        {},                                                    # vanilla, convergence only
+        {"phase": "metad"},                                    # biased, no switch left
+        {"phase": "metad", "allow_cv_switch": True},           # biased, switch offered
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        req = fake.last_request
+        assert req is not None
+        carries_proposal = "metad_proposal" in req["tools"][0]["input_schema"]["properties"]
+        has_vocabulary = "`cv_type` — one of" in req["system"][0]["text"]
+        assert carries_proposal == has_vocabulary, kwargs
+
+
+def test_switch_cv_guidance_appears_only_while_the_allowance_lasts() -> None:
+    spent = _stub()
+    decide({"stub": True}, phase="metad", client=spent)
+    assert "`switch_cv` replaces the biased" not in _system_text(spent)
+
+    offered = _stub()
+    decide({"stub": True}, phase="metad", allow_cv_switch=True, client=offered)
+    assert "`switch_cv` replaces the biased" in _system_text(offered)
+
+
+def test_the_unbounded_cv_warning_survives_every_round_that_can_propose_one() -> None:
+    """F6: RMSD-to-native is unbounded above and cost two campaigns. Whenever a
+    CV can be proposed, the round must carry that warning."""
+    for kwargs in (
+        {"task_expectation": "fold it"},
+        {"phase": "metad", "allow_cv_switch": True},
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        assert "unbounded above" in _system_text(fake), kwargs
+
+
+def test_retrieval_shortens_the_prompt_against_sending_everything() -> None:
+    from mdpilot.orchestrator.scientist import build_system_prompt
+
+    widest = build_system_prompt("metad", can_propose_cv=True, allow_cv_switch=True)
+    for phase, propose, switch in (
+        ("vanilla", True, False),
+        ("vanilla", False, False),
+        ("metad", False, False),
+    ):
+        got = build_system_prompt(
+            phase, can_propose_cv=propose, allow_cv_switch=switch
+        )
+        assert len(got) < len(widest)
+
+
+# ---------- the prompt names only actions the round's enum offers ----------
+#
+# Chunks are shared across variants, so a rule written for one round's action
+# space travels into rounds that do not have it. Both tests below read the
+# enum off the tool actually sent and check the prose against it, rather than
+# restating which actions each variant has.
+
+def _paragraph_containing(text: str, needle: str) -> str:
+    """The blank-line block stating one rule. Matched case-insensitively so the
+    test survives a rewording of the sentence and still checks the rule."""
+    for block in text.split("\n\n"):
+        if needle.lower() in block.lower():
+            return block
+    raise AssertionError(f"no paragraph containing {needle!r} in:\n{text}")
+
+
+def _decision_enum(fake: _FakeClient) -> list[str]:
+    assert fake.last_request is not None
+    schema = fake.last_request["tools"][0]["input_schema"]
+    return schema["properties"]["decision"]["enum"]
+
+
+def test_the_proposal_instruction_names_the_action_the_round_can_take() -> None:
+    """`cv_vocabulary` is shared by both proposal-carrying rounds. Naming only
+    `switch_to_metad` told a biased round to populate `metad_proposal` on an
+    action `phase_metad` had just called permanently unavailable."""
+    for kwargs, action in (
+        ({"task_expectation": "fold it"}, "switch_to_metad"),
+        ({"phase": "metad", "allow_cv_switch": True}, "switch_cv"),
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        assert action in _decision_enum(fake), kwargs
+        rule = _paragraph_containing(_system_text(fake), "populate `metad_proposal`")
+        assert f"`{action}`" in rule, (kwargs, rule)
+
+
+def test_every_non_extending_action_is_told_to_null_extra_ns() -> None:
+    """`extra_ns` is meaningful only on an extend, and the loop ignores it
+    otherwise — but the rule listed `stop` and `switch_to_metad` only, so a
+    `switch_cv` round was given no instruction and could persist a number that
+    means nothing."""
+    for kwargs in (
+        {"task_expectation": "fold it"},
+        {},
+        {"phase": "metad"},
+        {"phase": "metad", "allow_cv_switch": True},
+    ):
+        fake = _stub()
+        decide({"stub": True}, client=fake, **kwargs)
+        rule = _paragraph_containing(_system_text(fake), "`extra_ns` must be null")
+        for action in _decision_enum(fake):
+            if action == "extend":
+                continue
+            assert f"`{action}`" in rule, (kwargs, action, rule)

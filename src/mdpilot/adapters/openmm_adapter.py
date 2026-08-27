@@ -10,8 +10,9 @@ minimized structure. Velocities are seeded explicitly with
 `setVelocitiesToTemperature` at the first heating stage rather than left at
 zero for the thermostat to warm up — that zero-velocity start was a real
 physical mismatch with the GROMACS adapter, which has always generated
-velocities via `gen-vel`. Both engines now reach 300 K over an equivalent
-50 K → 300 K ramp under the same stochastic (Langevin / `sd`) thermostat.
+velocities via `gen-vel`. Both engines reach the ensemble temperature over
+an equivalent ramp from 50 K under the same stochastic (Langevin / `sd`)
+thermostat.
 
 The barostat added for the NPT stage stays in the cached `System`, so
 production runs NPT as well; the box is therefore free to fluctuate rather
@@ -53,25 +54,23 @@ from openmm import (
 )
 from pdbfixer import PDBFixer
 
+from mdpilot import forcefields
 from mdpilot.adapters.system_spec import SystemSpec
 
-_FORCEFIELD_FILES = ("amber14-all.xml", "amber14/tip3p.xml")
-_PADDING_NM = 1.0
+# Force field and water model come from `spec.forcefield`, a key into
+# `mdpilot.forcefields`.
 _SALT_M = 0.15
-_TEMPERATURE_K = 300.0
 _FRICTION_PER_PS = 1.0
-_TIMESTEP_FS = 2.0
 _NONBONDED_CUTOFF_NM = 1.0
+# Thermostat temperature and integrator timestep are NOT here: they come from
+# `spec.ensemble`, so they are locked by the campaign config on resume. The
+# rest of this block is still fixed per adapter.
 
-# Equilibration. Heating ramps from _HEAT_START_K to _TEMPERATURE_K in
-# _HEAT_STAGES equal steps under the production thermostat; NPT then relaxes
-# the density at 1 bar. Both stage lengths are constructor-overridable so the
-# test suite can run the pipeline without paying 200 ps of CPU MD.
-_HEAT_START_K = 50.0
-_HEAT_STAGES = 6
-_NVT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
-_NPT_EQUIL_STEPS = 50_000   # 100 ps at 2 fs
-_PRESSURE_BAR = 1.0
+# Equilibration comes from `spec.equilibration`: heating ramps from its
+# `heat_start_k` to the ensemble temperature in `heat_stages` equal steps under
+# the production thermostat, then NPT relaxes the density at the ensemble
+# pressure. Stage lengths are picoseconds there, converted here against this
+# adapter's own timestep.
 _BAROSTAT_INTERVAL = 25     # steps between volume-move attempts
 _EQUIL_REPORT_INTERVAL = 500
 
@@ -198,18 +197,18 @@ def _prepare_plumed_force(plumed_input: str, work_dir: Path):
 
 class OpenMMAdapter:
     """MDAdapter: direct OpenMM execution. System chosen by SystemSpec; the
-    integrator/forcefield/box/ions choices are still hardcoded (AMBER14,
-    TIP3P, 1 nm padding, 0.15 M NaCl, LangevinMiddle at 300 K, 2 fs,
-    MonteCarloBarostat at 1 bar).
+    ion concentration and integrator choices are still hardcoded (0.15 M NaCl,
+    LangevinMiddle, MonteCarloBarostat at 1 bar). Thermostat temperature and
+    timestep come from ``spec.ensemble``, box padding from ``spec.padding_nm``,
+    and the force field + water model from ``spec.forcefield``.
 
     ``platform`` pins the OpenMM platform by name; left at None the adapter
     picks the fastest one that actually works (GPU when present, CPU
     otherwise) via ``resolve_platform()``.
 
-    ``nvt_steps`` / ``npt_steps`` size the two equilibration stages. Set both
-    to 0 to skip equilibration entirely — only useful for tests that need the
-    setup pipeline without the MD cost; a run started that way is *not*
-    physically comparable to a production one.
+    The equilibration protocol comes from ``spec.equilibration`` — stage
+    lengths in picoseconds, the bottom of the temperature ramp, and how many
+    stages it climbs in.
 
     ``plumed_input`` (optional): a plumed.dat-format string. When set, a
     `PlumedForce` is attached to the runtime System on every ``start()``;
@@ -223,16 +222,12 @@ class OpenMMAdapter:
         seed: int = 42,
         spec: SystemSpec | None = None,
         plumed_input: str | None = None,
-        nvt_steps: int = _NVT_EQUIL_STEPS,
-        npt_steps: int = _NPT_EQUIL_STEPS,
         platform: str | None = None,
     ):
         self._work_dir = Path(work_dir)
         self._seed = seed
         self._spec = spec if spec is not None else SystemSpec.trpcage()
         self._plumed_input = plumed_input
-        self._nvt_steps = nvt_steps
-        self._npt_steps = npt_steps
         self._platform_name = platform
         self._pdb_path: Path | None = None
         self._sim: app.Simulation | None = None
@@ -241,6 +236,14 @@ class OpenMMAdapter:
     @property
     def spec(self) -> SystemSpec:
         return self._spec
+
+    @property
+    def timestep_fs(self) -> float:
+        return self._spec.ensemble.timestep_fs
+
+    @property
+    def temperature_k(self) -> float:
+        return self._spec.ensemble.temperature_k
 
     @property
     def trajectory_extension(self) -> str:
@@ -305,12 +308,13 @@ class OpenMMAdapter:
         box vectors at 300 K / 1 bar)."""
         assert self._pdb_path is not None
         pdb = app.PDBFile(str(self._pdb_path))
-        forcefield = app.ForceField(*_FORCEFIELD_FILES)
+        chosen = forcefields.resolve(self._spec.forcefield)
+        forcefield = app.ForceField(*chosen.openmm_files)
         modeller = app.Modeller(pdb.topology, pdb.positions)
         modeller.addSolvent(
             forcefield,
-            model="tip3p",
-            padding=_PADDING_NM * unit.nanometer,
+            model=chosen.openmm_water_model,
+            padding=self._spec.padding_nm * unit.nanometer,
             ionicStrength=_SALT_M * unit.molar,
         )
         system = forcefield.createSystem(
@@ -323,14 +327,14 @@ class OpenMMAdapter:
         cache_dir = system_xml.parent
 
         # NVT: minimize, seed velocities at the bottom of the ramp, heat.
-        integrator = self._make_integrator(_HEAT_START_K)
+        integrator = self._make_integrator(self._spec.equilibration.heat_start_k)
         sim = app.Simulation(
             modeller.topology, system, integrator, platform, platform_props
         )
         sim.context.setPositions(modeller.positions)
         sim.minimizeEnergy()
         sim.context.setVelocitiesToTemperature(
-            _HEAT_START_K * unit.kelvin, self._seed
+            self._spec.equilibration.heat_start_k * unit.kelvin, self._seed
         )
         _attach_equilibration_reporter(sim, cache_dir / "equilibration_nvt.csv")
         self._heat_nvt(sim, integrator)
@@ -358,19 +362,22 @@ class OpenMMAdapter:
     def _heat_nvt(
         self, sim: app.Simulation, integrator: LangevinMiddleIntegrator
     ) -> None:
-        """Ramp the thermostat from _HEAT_START_K to _TEMPERATURE_K in equal
-        stages. A staircase rather than a continuous ramp: the temperature can
-        only change between `step()` calls, and _HEAT_STAGES steps is fine
+        """Ramp the thermostat to the ensemble temperature in equal stages.
+
+        A staircase rather than a continuous ramp: the temperature can only
+        change between `step()` calls, and the default six stages are fine
         enough for a small solvated protein. No positional restraints — at
         Trp-cage scale a staged ramp from a minimized structure is gentle
         enough without them."""
-        if self._nvt_steps <= 0:
+        equil = self._spec.equilibration
+        total = equil.nvt_steps(self.timestep_fs)
+        if total <= 0:
             return
-        per_stage = max(self._nvt_steps // _HEAT_STAGES, 1)
-        for stage in range(1, _HEAT_STAGES + 1):
-            target = _HEAT_START_K + (_TEMPERATURE_K - _HEAT_START_K) * (
-                stage / _HEAT_STAGES
-            )
+        per_stage = max(total // equil.heat_stages, 1)
+        for stage in range(1, equil.heat_stages + 1):
+            target = equil.heat_start_k + (
+                self.temperature_k - equil.heat_start_k
+            ) * (stage / equil.heat_stages)
             integrator.setTemperature(target * unit.kelvin)
             sim.step(per_stage)
 
@@ -394,8 +401,9 @@ class OpenMMAdapter:
         )
         sim.context.setState(state)
         _attach_equilibration_reporter(sim, log_path)
-        if self._npt_steps > 0:
-            sim.step(self._npt_steps)
+        npt_steps = self._spec.equilibration.npt_steps(self.timestep_fs)
+        if npt_steps > 0:
+            sim.step(npt_steps)
         return sim
 
     @property
@@ -411,8 +419,8 @@ class OpenMMAdapter:
 
     def _make_barostat(self) -> MonteCarloBarostat:
         barostat = MonteCarloBarostat(
-            _PRESSURE_BAR * unit.bar,
-            _TEMPERATURE_K * unit.kelvin,
+            self._spec.ensemble.pressure_bar * unit.bar,
+            self.temperature_k * unit.kelvin,
             _BAROSTAT_INTERVAL,
         )
         # Volume moves are Monte Carlo; seed them so runs stay reproducible.
@@ -439,12 +447,19 @@ class OpenMMAdapter:
         shutil.copy(cached_topology, self._topology_path)
 
     def _make_integrator(
-        self, temperature_k: float = _TEMPERATURE_K
+        self, temperature_k: float | None = None
     ) -> LangevinMiddleIntegrator:
+        """Production integrator, or one pinned to a heating-stage temperature.
+
+        `temperature_k=None` means the ensemble's own temperature. The timestep
+        is never overridden: it defines what a step is worth, and the loop
+        converts nanoseconds to steps against `adapter.timestep_fs`.
+        """
         integrator = LangevinMiddleIntegrator(
-            temperature_k * unit.kelvin,
+            (self.temperature_k if temperature_k is None else temperature_k)
+            * unit.kelvin,
             _FRICTION_PER_PS / unit.picosecond,
-            _TIMESTEP_FS * unit.femtosecond,
+            self._spec.ensemble.timestep_fs * unit.femtosecond,
         )
         integrator.setRandomNumberSeed(self._seed)
         return integrator

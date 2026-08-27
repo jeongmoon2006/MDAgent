@@ -6,9 +6,11 @@
 # detect that inadequacy itself, pivot to metadynamics, and the biased run must
 # actually cross the barrier.
 #
-# `task_expectation` below is the string threaded into every scientist.decide()
-# call. It is the only input gating `switch_to_metad`, and it is locked into the
-# campaign config, so it must be passed identically on every resume.
+# The `task_expectation` string threaded into every scientist.decide() call is
+# rendered from `expectation:` + `done_criterion:` by mdpilot.task_file, not
+# authored here. It is the only input gating `switch_to_metad` and is locked
+# into the campaign config, so it must render identically on every resume —
+# which it does, because it is a function of these fields.
 
 name: cln025_folding
 description: |
@@ -19,49 +21,70 @@ description: |
   MD is short of the transition by roughly two orders of magnitude and the
   campaign must pivot to enhanced sampling to succeed.
 
+# Reproducibility. Covers the integrator, the barostat's Monte Carlo moves and
+# the initial velocities — but NOT solvation: `Modeller.addSolvent` takes no
+# seed, so two campaigns at the same seed differ by a handful of waters (F8).
+seed: 42
+
+# How the system reaches the target state before production. Picoseconds, not
+# steps, so changing the timestep does not silently change how long it was
+# equilibrated for.
+equilibration:
+  nvt_ps: 100.0          # staged heating at constant volume
+  npt_ps: 100.0          # density relaxation at the target pressure
+  heat_start_k: 50.0     # bottom of the ramp
+  heat_stages: 6
+
 system:
   starting_pdb: "5AWL"        # downloaded via PDBFixer; 10 residues, ~5380 atoms solvated
-  forcefield: ["amber14-all.xml", "amber14/tip3p.xml"]
-  water_model: tip3p
-  padding_nm: 1.0
+  forcefield: amber14/tip3p       # a validated protein+water pair; see mdpilot.forcefields
+  padding_nm: 1.5              # raised from 1.0 after F11 (periodic self-interaction)
   ionic_strength_M: 0.15
+  nonbonded_cutoff_nm: 1.0     # checked against the adapter
+  electrostatics: PME
   starting_state: folded      # 5AWL is the native beta-hairpin
 
 integrator:
-  type: LangevinMiddle
+  # Thermodynamic state — real parameters.
   temperature_K: 300.0
-  friction_per_ps: 1.0
+  pressure_bar: 1.0
   timestep_fs: 2.0
+  # Coupling algorithms and nonbonded treatment: declared here and checked
+  # against what the engine actually does, so the file cannot drift from the
+  # run. Not yet choosable — OpenMM's LangevinMiddle / MonteCarloBarostat are
+  # idiomatic equivalents of GROMACS's sd / C-rescale, not interchangeable.
+  type: LangevinMiddle
+  friction_per_ps: 1.0
+  barostat: MonteCarloBarostat
+  barostat_interval_steps: 25
   constraints: HBonds
 
+# The coordinate every round is judged on, and the one `done_criterion.states`
+# places its thresholds on. Declared as a collective variable, from the same
+# vocabulary the scientist proposes biased CVs from — a binding campaign writes
+# `cv_type: distance` here and nothing downstream changes.
 observable:
+  cv_type: rmsd
+  selections: ["protein and name CA"]
   name: rmsd_ca_to_reference_angstrom
-  selection: "protein and name CA"
+  scale: 10.0                    # mdtraj returns nm; this task states states in Angstrom
   reference: campaign_topology   # post-equilibration structure, constant across rounds
 
-# Free-form campaign-level expectation passed to run_campaign(task_expectation=...).
-# Written for the scientist, not for humans: it must state what has to be
-# accomplished, the characteristic timescale, and the budget, because those are
-# what the switch_to_metad rule compares against.
-task_expectation: |
-  Target: chignolin variant CLN025 (PDB 5AWL), a 10-residue beta-hairpin, in
-  TIP3P water at 300 K. The simulation starts from the folded native structure.
-
-  Objective: sample the folding/unfolding transition in both directions and
-  recover the free-energy surface along the slow coordinate.
-
-  Required transition: the campaign must connect the extended state (CA-RMSD to
-  the native structure > 4.0 A) and the native beta-hairpin state (CA-RMSD <
-  1.5 A), and must then cross back. A full A -> B -> A recrossing is required,
-  not a single one-way event: a one-way crossing leaves the reverse barrier
-  unsampled and the free-energy surface under-filled on one side.
-
-  Characteristic timescale: the CLN025 folding time is 0.6-1.0 microseconds.
-
-  Compute budget: 20 ns for the biased phase. Vanilla MD is therefore short of
-  the folding time by roughly two orders of magnitude. Unbiased runs under
-  50 ns are expected to stay trapped in whichever basin they start from, which
-  here is the folded state.
+# Campaign expectation. `task_expectation` — the string threaded into every
+# scientist.decide() call, and the only input gating `switch_to_metad` — is
+# RENDERED from these fields plus done_criterion below, not authored. It used to
+# be free prose that restated the thresholds, the round-trip requirement and the
+# budget in words; three of those four numbers existed twice, with nothing
+# linking the copies. Only `objective` and the timescale are genuinely free.
+expectation:
+  objective: |
+    Sample the folding/unfolding transition in both directions and recover the
+    free-energy surface along the slow coordinate.
+  # The one decision-driving number that exists nowhere else, so it carries a
+  # citation. The scientist compares cumulative simulation time against it to
+  # judge whether the budget can reach the transition.
+  characteristic_timescale_ns: 800.0
+  timescale_source: "CLN025 folding time 0.6-1.0 us; Lindorff-Larsen et al. 2011, Science 334:517"
 
 # Enhanced-sampling bounds. The position is a task-level fact (what counts as
 # unfolded), not something the scientist or a magic constant should decide; the
@@ -89,7 +112,12 @@ sampling:
 # decide.
 done_criterion:
   pivot_required: true
-  min_recrossings: 2                 # A -> B -> A, per count_recrossings semantics
-  extended_state_rmsd_angstrom: 4.0  # A basin
-  folded_state_rmsd_angstrom: 1.5    # B basin
+  # The two states, named, on the campaign observable. `low`/`high` are
+  # positions on that coordinate, not folding-specific roles — a ligand-binding
+  # campaign names them "bound"/"unbound" on a distance and the mechanics are
+  # unchanged. `count_recrossings` counts transitions between the two bands.
+  states:
+    low:  { name: "native beta-hairpin", threshold: 1.5 }
+    high: { name: "extended",            threshold: 4.0 }
+  min_recrossings: 2                 # 2 = a full A -> B -> A round trip
   max_biased_ns: 20.0

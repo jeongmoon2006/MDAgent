@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
@@ -43,15 +44,15 @@ from mdpilot.adapters.openmm_adapter import OpenMMAdapter
 from mdpilot.adapters.plumed_writer import PlumedInput, enable_restart
 from mdpilot.adapters.system_spec import SystemSpec
 from mdpilot.diagnostics.free_energy import metad_report
-from mdpilot.diagnostics.report import campaign_observable, make_report
+from mdpilot.diagnostics.report import make_report
+from mdpilot import preflight
+from mdpilot.observables import ObservableSpec, campaign_observable
 from mdpilot.memory import store
 from mdpilot.orchestrator.scientist import Decision, MetadProposal, decide
 from mdpilot.sampling.bias_designer import design_bias, design_upper_wall
 from mdpilot.sampling.cv_designer import CVProposal, design_cv
 
-_TIMESTEP_FS = 2.0  # matches the OpenMM adapter's integrator timestep
-_STEPS_PER_NS = int(1_000_000.0 / _TIMESTEP_FS)  # 500_000 steps/ns at 2 fs
-_METAD_TEMPERATURE_K = 300.0  # matches the adapters' thermostat; follows SystemSpec when temperature does
+_FS_PER_NS = 1_000_000.0
 _PLUMED_DAT_NAME = "plumed.dat"  # canonical bias artifact (the OpenMM adapter also writes here)
 # PLUMED's own outputs, alongside plumed.dat. These names must match the
 # defaults `_build_plumed_input` leaves on MetadynamicsBias.hills_file and
@@ -68,6 +69,38 @@ StopReason = Literal[
 
 # Given a rendered plumed.dat string, build an adapter that runs biased MD.
 BiasedAdapterFactory = Callable[[str], MDAdapter]
+
+# Optional observer, called as the campaign progresses. Purely for watching —
+# a progress bar, a log file, an HPC monitor. It cannot influence the campaign,
+# and `_emit` swallows anything it raises: a long biased run must not die
+# because something that was only watching it threw.
+CampaignEvent = Callable[[str, dict[str, Any]], None]
+
+
+def _emit(on_event: CampaignEvent | None, name: str, **payload: Any) -> None:
+    if on_event is None:
+        return
+    try:
+        on_event(name, payload)
+    except Exception:  # noqa: BLE001 - an observer must never break the run
+        pass
+
+
+def steps_per_ns_for(adapter: MDAdapter) -> int:
+    """Steps in one nanosecond at this engine's timestep (500_000 at 2 fs).
+
+    Read from the adapter rather than hardcoded. `extra_ns`, `max_extra_ns`
+    and `max_biased_ns` are all stated in nanoseconds and converted here, so a
+    constant that merely happened to match both adapters would have made every
+    round the wrong length on an engine at a different timestep — with
+    `extra_ns` quietly no longer meaning nanoseconds anywhere in the campaign
+    record.
+
+    Public because `benchmarks/run_cln025.py` states its budget in nanoseconds
+    too, and a second copy of the conversion is exactly the drift this exists
+    to remove.
+    """
+    return max(int(round(_FS_PER_NS / adapter.timestep_fs)), 1)
 
 
 @dataclass(frozen=True)
@@ -100,6 +133,11 @@ def run_campaign(
     state_thresholds: tuple[float, float] | None = None,
     max_cv_switches: int = 1,
     cv_upper_wall_nm: float | None = None,
+    bias_pace: int | None = None,
+    bias_factor: float | None = None,
+    observable: ObservableSpec | None = None,
+    description: str | None = None,
+    on_event: CampaignEvent | None = None,
     seed: int = 42,
     report_interval_steps: int = 500,    # 1 ps/frame at 2 fs
     equilibration_steps: int = 0,
@@ -111,9 +149,11 @@ def run_campaign(
     `adapter` defaults to `OpenMMAdapter(work_dir=work_dir, seed=seed)`.
     Pass a different `MDAdapter` to run through another engine.
 
-    `state_thresholds` is `(folded, extended)` on the campaign observable
-    (CA-RMSD to the campaign reference, in Angstrom) — the states the *task*
-    defines. When given, biased-round recrossings are counted there rather than
+    `state_thresholds` is `(low, high)` on the campaign observable — the two
+    states the *task* defines, as positions on that coordinate rather than as
+    roles. For a folding campaign that is (native, extended) on CA-RMSD; for a
+    binding campaign it is (bound, unbound) on a distance, and nothing here
+    changes. When given, biased-round recrossings are counted there rather than
     between the two deepest basins of the current free-energy surface. The
     surface-derived band moves as the bias fills, vanishes when fewer than two
     basins resolve, and collapses once the barrier is filled, so a count taken
@@ -127,10 +167,16 @@ def run_campaign(
     schema, so a further revision is unrepresentable rather than emitted and
     then refused. Counted across resumes from the persisted rounds.
 
-    `max_rounds`, `max_extra_ns` and `max_biased_ns` are loop-control bounds
-    and may differ between invocations; the physics-bound params (seed,
-    initial_steps, report_interval_steps, equilibration_steps) are locked at
-    first init and a mismatch on resume raises.
+    `max_rounds`, `max_extra_ns`, `max_biased_ns` and `max_cv_switches` are
+    loop-control bounds and may differ between invocations. Everything that
+    defines what the campaign *is* — seed, initial_steps,
+    report_interval_steps, equilibration_steps, the system spec, the engine,
+    task_expectation, cv_upper_wall_nm, state_thresholds, min_recrossings and
+    the bias shape — is locked at first init and a mismatch on resume raises.
+    The thermostat temperature and timestep live on `spec.ensemble` and so are
+    covered by the system-spec half of that lock; they used to be adapter class
+    constants covered only by the engine-name lock, which would have stopped
+    covering them the moment they became settable.
 
     `max_biased_ns` caps *cumulative* simulation time in the metadynamics
     phase, counting across rounds and across resumes (it is recomputed from
@@ -147,6 +193,31 @@ def run_campaign(
     characteristic timescale, the compute budget. Required for campaigns
     where the scientist may need to choose `switch_to_metad`; otherwise the
     LLM has no basis to judge "the budget cannot reach the transition."
+
+    `observable` is the coordinate every round is judged on — the vanilla
+    convergence bundle summarizes it and `state_thresholds` are positions on
+    it. Left at None it is CA-RMSD to the campaign topology in Angstrom, the
+    M1 observable. It defines what the campaign measures, so it locks with the
+    rest of the config.
+
+    `bias_pace` and `bias_factor` override the METAD deposition stride and the
+    well-tempered gamma that `sampling.bias_designer` would otherwise pick.
+    Left at None the designer's own defaults apply, so there is one source of
+    truth for them rather than a second copy in this signature. Both are
+    biased-phase physics and lock with the rest of the campaign config.
+    gamma=10 flattens barriers up to ~gamma*kT; a surface deeper than that
+    wants a larger one.
+
+    `description` is prose about the system, used only by the pre-flight
+    checks — it is compared against the structure that was actually fetched.
+    It is deliberately *not* part of the locked config: editing prose must not
+    stop a campaign resuming.
+
+    `on_event` is an optional observer called with `(name, payload)` as the
+    campaign progresses — `campaign_start`, `round_start`, `simulated`,
+    `report`, `decision`, `override`, `pivot`, `campaign_end`. It cannot change
+    what happens and anything it raises is swallowed, because a multi-hour
+    biased run must not die because something watching it threw.
 
     `biased_adapter_factory` builds the adapter used after a `switch_to_metad`
     pivot from a rendered plumed.dat string. Defaults to an `OpenMMAdapter`
@@ -167,16 +238,15 @@ def run_campaign(
             "needs the task's own state definitions to count recrossings "
             "against; without them the count is taken between whichever two "
             "basins are currently deepest, which means something different "
-            "every round. Pass state_thresholds=(folded, extended) on the "
-            "campaign observable (CA-RMSD to the campaign reference, in "
-            "Angstrom)."
+            "every round. Pass state_thresholds=(low, high) on the campaign "
+            "observable."
         )
     if state_thresholds is not None:
         low, high = state_thresholds
         if not high > low:
             raise ValueError(
-                f"run_campaign: state_thresholds must be (folded, extended) "
-                f"with extended > folded; got {state_thresholds!r}. "
+                f"run_campaign: state_thresholds must be (low, high) on the "
+                f"campaign observable with high > low; got {state_thresholds!r}. "
                 f"`count_recrossings` silently returns 0 for an inverted band, "
                 f"so a swapped pair would read as a run that never crossed."
             )
@@ -190,6 +260,13 @@ def run_campaign(
         adapter = OpenMMAdapter(work_dir=work_dir, seed=seed)
 
     base_spec = adapter.spec
+    # Captured once, from the vanilla adapter. The biased adapter is built by
+    # `_default_biased_factory` over the same engine (and an injected factory
+    # is documented as engine-matching, since the CV's atom indices are
+    # resolved against this adapter's topology), so one reading holds for the
+    # whole campaign.
+    steps_per_ns = steps_per_ns_for(adapter)
+    temperature_k = adapter.temperature_k
 
     if biased_adapter_factory is None:
         biased_adapter_factory = _default_biased_factory(
@@ -221,13 +298,35 @@ def run_campaign(
         "state_thresholds": (
             list(state_thresholds) if state_thresholds is not None else None
         ),
+        # The other half of that same definition: `state_thresholds` says where
+        # the states are, `min_recrossings` says how many transitions between
+        # them count as done. It is the threshold `fes_converged` compares the
+        # count against, and `_refuse_premature_stop` reads that verdict to
+        # decide whether the scientist may stop — so resuming with a different
+        # one changes when the campaign is allowed to end, retroactively, for
+        # rounds already judged under the old value.
+        "min_recrossings": min_recrossings,
     }
+    # Bias shape is biased-phase physics: resuming under a different gamma or
+    # deposition stride would join two differently-filled surfaces into one
+    # `sum_hills` integration. Added to the lock only when set, for the same
+    # reason `SystemSpec.to_dict` omits a default ensemble — an unconditional
+    # key would make every campaign recorded before this existed unresumable.
+    # Omitted when default for the same reason `SystemSpec.to_dict` omits a
+    # default ensemble: an unconditional key would strand campaigns recorded
+    # before observables were declarable.
+    if observable is not None and observable != ObservableSpec.ca_rmsd_angstrom():
+        config["observable"] = observable.to_dict()
+    if bias_pace is not None:
+        config["bias_pace"] = bias_pace
+    if bias_factor is not None:
+        config["bias_factor"] = bias_factor
     store.init_campaign(work_dir, config)
     prior_rows = store.list_rounds(work_dir)
     rounds: list[RoundResult] = [_row_to_result(r) for r in prior_rows]
 
     if rounds and rounds[-1].decision.decision == "stop":
-        return CampaignResult(work_dir, tuple(rounds), "scientist_said_stop")
+        return _finish(on_event, work_dir, rounds, "scientist_said_stop")
 
     if (
         rounds
@@ -239,13 +338,35 @@ def run_campaign(
         # not quietly perform the pivot the live run declined — the resume
         # branches would otherwise rebuild a bias from a *biased* trajectory's
         # spread, which is not the width anything was measured against.
-        return CampaignResult(work_dir, tuple(rounds), "switch_to_metad_requested")
+        return _finish(on_event, work_dir, rounds, "switch_to_metad_requested")
 
     # Build the vanilla engine state up front. This is idempotent and cheap on
     # resume (rebuilds from cache), and it guarantees the cached System +
     # minimized state + topology exist for a biased adapter to reuse.
     adapter.prepare()
     adapter.start()
+
+    # Pre-flight, on the starting structure, before a single step is
+    # integrated. These compare across the one seam no schema can check: what
+    # the task file *says* against what was actually built, and the
+    # observable's own magnitude against the bands it will be judged in. A
+    # campaign that cannot reach its own done criterion should cost seconds,
+    # not the forty minutes it once did.
+    preflight.check_residue_count(adapter.topology_path, description)
+    reference = md.load(str(adapter.topology_path))
+    first_value, observable_name = campaign_observable(
+        reference, adapter.topology_path, observable
+    )
+    preflight.check_observable_scale(
+        float(first_value[0]), state_thresholds, observable_name
+    )
+    _emit(
+        on_event, "preflight_ok",
+        residues=sum(1 for r in reference.topology.residues if r.is_protein),
+        observable=observable_name,
+        first_value=float(first_value[0]),
+        state_thresholds=list(state_thresholds) if state_thresholds else None,
+    )
 
     in_metad = False
     current_plumed_dat: Path | None = None
@@ -272,7 +393,10 @@ def run_campaign(
             topology_path=adapter.topology_path,
             factory=biased_adapter_factory,
             plumed_dat_path=plumed_dat_path,
+            temperature_k=temperature_k,
             cv_upper_wall_nm=cv_upper_wall_nm,
+            bias_pace=bias_pace,
+            bias_factor=bias_factor,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
@@ -295,7 +419,10 @@ def run_campaign(
             topology_path=adapter.topology_path,
             factory=biased_adapter_factory,
             plumed_dat_path=plumed_dat_path,
+            temperature_k=temperature_k,
             cv_upper_wall_nm=cv_upper_wall_nm,
+            bias_pace=bias_pace,
+            bias_factor=bias_factor,
         )
         in_metad = True
         current_plumed_dat = plumed_dat_path
@@ -320,13 +447,13 @@ def run_campaign(
         in_metad = True
         current_plumed_dat = last.plumed_dat_path
         start_round = last.round_index + 1
-        n_steps = _extend_steps(last.extra_ns, max_extra_ns)
+        n_steps = _extend_steps(last.extra_ns, max_extra_ns, steps_per_ns)
     else:
         # Vanilla resume.
         _require_checkpoint(last)
         adapter.load_checkpoint(last.checkpoint_path)  # type: ignore[arg-type]
         start_round = last.round_index + 1
-        n_steps = _extend_steps(last.extra_ns, max_extra_ns)
+        n_steps = _extend_steps(last.extra_ns, max_extra_ns, steps_per_ns)
 
     # Cumulative biased steps already spent, so a resume continues the meter
     # rather than restarting it.
@@ -337,27 +464,52 @@ def run_campaign(
     # restart cannot buy the scientist a second allowance of CV switches.
     cv_switches_used = sum(1 for r in prior_rows if r.decision == "switch_cv")
     biased_step_budget = (
-        int(max_biased_ns * _STEPS_PER_NS) if max_biased_ns is not None else None
+        int(max_biased_ns * steps_per_ns) if max_biased_ns is not None else None
     )
 
     ledger_notes: list[store.LedgerNote] = list(store.list_ledger_notes(work_dir))
+
+    _emit(
+        on_event,
+        "campaign_start",
+        work_dir=str(work_dir),
+        engine=type(adapter).__name__,
+        forcefield=base_spec.forcefield,
+        temperature_k=temperature_k,
+        padding_nm=base_spec.padding_nm,
+        timestep_fs=adapter.timestep_fs,
+        observable=(observable or ObservableSpec.ca_rmsd_angstrom()).name,
+        resuming_from_round=len(prior_rows),
+        start_round=start_round,
+        max_rounds=max_rounds,
+        phase="metad" if in_metad else "vanilla",
+    )
 
     for round_idx in range(start_round, max_rounds + 1):
         if in_metad and biased_step_budget is not None:
             remaining = biased_step_budget - biased_steps_run
             if remaining <= 0:
-                return CampaignResult(
-                    work_dir, tuple(rounds), "biased_budget_exhausted"
-                )
+                return _finish(on_event, work_dir, rounds, "biased_budget_exhausted")
             # Shorten the round that would overshoot rather than skipping it —
             # a partial round still deposits hills and still gets diagnosed.
             n_steps = min(n_steps, remaining)
 
         dcd = rounds_dir / f"round_{round_idx:03d}{adapter.trajectory_extension}"
+        _emit(
+            on_event, "round_start",
+            round_index=round_idx, n_steps=n_steps,
+            ns=n_steps / steps_per_ns, phase="metad" if in_metad else "vanilla",
+        )
+        started = time.monotonic()
         adapter.run_steps(
             n_steps,
             trajectory_path=dcd,
             report_interval_steps=report_interval_steps,
+        )
+        _emit(
+            on_event, "simulated",
+            round_index=round_idx, seconds=time.monotonic() - started,
+            trajectory=str(dcd),
         )
         if in_metad:
             biased_steps_run += n_steps
@@ -375,12 +527,17 @@ def run_campaign(
             dcd,
             adapter.topology_path,
             plumed_dat_path=current_plumed_dat,
+            temperature_k=temperature_k,
             fes_dir=rounds_dir / f"round_{round_idx:03d}_fes",
             min_recrossings=min_recrossings,
             rounds_dir=rounds_dir,
             round_index=round_idx,
             state_thresholds=state_thresholds,
+            observable=observable,
+            cv_switches_used=cv_switches_used,
+            max_cv_switches=max_cv_switches,
         )
+        _emit(on_event, "report", round_index=round_idx, report=report)
         prior_summaries = [_compact_prior(r) for r in rounds]
         decision = decide(
             report,
@@ -401,7 +558,17 @@ def run_campaign(
             decision, override_note = _refuse_premature_stop(
                 decision, report, remaining
             )
+            if override_note:
+                _emit(on_event, "override", round_index=round_idx, note=override_note)
 
+        _emit(
+            on_event, "decision",
+            round_index=round_idx, decision=decision.decision,
+            reason=decision.reason, extra_ns=decision.extra_ns,
+            metad_proposal=(
+                decision.metad_proposal.to_dict() if decision.metad_proposal else None
+            ),
+        )
         summary_path = rounds_dir / f"round_{round_idx:03d}.json"
         _persist_round_json(
             summary_path, round_idx, n_steps, dcd, report, decision, current_plumed_dat
@@ -435,31 +602,48 @@ def run_campaign(
         )
 
         if decision.decision == "stop":
-            return CampaignResult(work_dir, tuple(rounds), "scientist_said_stop")
+            return _finish(on_event, work_dir, rounds, "scientist_said_stop")
 
         if decision.decision == "switch_to_metad":
             if in_metad:
                 # Already biased: a second switch is out of scope. End cleanly
                 # so a human can inspect rather than rebuild the bias in a loop.
-                return CampaignResult(
-                    work_dir, tuple(rounds), "switch_to_metad_requested"
+                return _finish(
+                    on_event, work_dir, rounds, "switch_to_metad_requested"
                 )
             assert decision.metad_proposal is not None  # guaranteed by the parser
+            wall_notes: list[str] = []
             adapter = _pivot_to_metad(
                 decision.metad_proposal,
                 source_trajectory=dcd,
                 topology_path=adapter.topology_path,
                 factory=biased_adapter_factory,
                 plumed_dat_path=plumed_dat_path,
+                temperature_k=temperature_k,
                 cv_upper_wall_nm=cv_upper_wall_nm,
+                bias_pace=bias_pace,
+                bias_factor=bias_factor,
+                notes=wall_notes,
             )
             in_metad = True
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
+            for note in wall_notes:
+                store.append_ledger_note(work_dir, round_index=round_idx, text=note)
+                ledger_notes.append(
+                    store.LedgerNote(round_index=round_idx, text=note)
+                )
+            _emit(
+                on_event, "pivot",
+                round_index=round_idx, kind="switch_to_metad",
+                plumed_dat=str(plumed_dat_path),
+                cv=decision.metad_proposal.to_dict(),
+            )
             continue
 
         if decision.decision == "switch_cv":
             assert decision.metad_proposal is not None  # guaranteed by the parser
+            wall_notes = []
             # The replacement CV is sized on *this* round's trajectory, which
             # was run under the outgoing bias. That spread is inflated by the
             # bias that drove the walker across the old coordinate, which is
@@ -471,16 +655,46 @@ def run_campaign(
                 topology_path=adapter.topology_path,
                 factory=biased_adapter_factory,
                 plumed_dat_path=plumed_dat_path,
+                temperature_k=temperature_k,
                 cv_upper_wall_nm=cv_upper_wall_nm,
+                bias_pace=bias_pace,
+                bias_factor=bias_factor,
+                notes=wall_notes,
             )
             cv_switches_used += 1
             current_plumed_dat = plumed_dat_path
             n_steps = initial_steps
+            for note in wall_notes:
+                store.append_ledger_note(work_dir, round_index=round_idx, text=note)
+                ledger_notes.append(
+                    store.LedgerNote(round_index=round_idx, text=note)
+                )
+            _emit(
+                on_event, "pivot",
+                round_index=round_idx, kind="switch_cv",
+                plumed_dat=str(plumed_dat_path),
+                cv=decision.metad_proposal.to_dict(),
+            )
             continue
 
-        n_steps = _extend_steps(decision.extra_ns, max_extra_ns)
+        n_steps = _extend_steps(decision.extra_ns, max_extra_ns, steps_per_ns)
 
-    return CampaignResult(work_dir, tuple(rounds), "max_rounds_reached")
+    return _finish(on_event, work_dir, rounds, "max_rounds_reached")
+
+
+def _finish(
+    on_event: CampaignEvent | None,
+    work_dir: Path,
+    rounds: list[RoundResult],
+    stop_reason: StopReason,
+) -> CampaignResult:
+    """Single exit point, so every `return` reports the outcome."""
+    _emit(
+        on_event, "campaign_end",
+        stop_reason=stop_reason, n_rounds=len(rounds),
+        biased_rounds=sum(1 for r in rounds if r.plumed_dat_path is not None),
+    )
+    return CampaignResult(work_dir, tuple(rounds), stop_reason)
 
 
 def _default_biased_factory(
@@ -590,11 +804,15 @@ def _round_report(
     topology_path: Path,
     *,
     plumed_dat_path: Path | None,
+    temperature_k: float,
     fes_dir: Path,
     min_recrossings: int = 1,
     rounds_dir: Path | None = None,
     round_index: int | None = None,
     state_thresholds: tuple[float, float] | None = None,
+    observable: ObservableSpec | None = None,
+    cv_switches_used: int = 0,
+    max_cv_switches: int = 0,
 ) -> dict[str, Any]:
     """Diagnostic bundle for one round, chosen by phase.
 
@@ -612,20 +830,20 @@ def _round_report(
     well-tempered convergence test wants — not per-round.
     """
     if plumed_dat_path is None:
-        report = make_report(trajectory_path, topology_path)
+        report = make_report(trajectory_path, topology_path, observable)
         report["phase"] = "vanilla"
         return report
 
     # Only computed when there are task states to count against: it costs a
     # trajectory load, and without thresholds nothing consumes the result.
-    observable = observable_name = None
+    series = observable_name = this_round = None
     if (
         state_thresholds is not None
         and rounds_dir is not None
         and round_index is not None
     ):
-        observable, observable_name = _accumulated_observable(
-            rounds_dir, round_index, trajectory_path, topology_path
+        series, observable_name, this_round = _accumulated_observable(
+            rounds_dir, round_index, trajectory_path, topology_path, observable
         )
 
     bias_dir = plumed_dat_path.parent
@@ -633,16 +851,80 @@ def _round_report(
         bias_dir / _HILLS_NAME,
         bias_dir / _COLVAR_NAME,
         fes_dir,
-        temperature_k=_METAD_TEMPERATURE_K,
+        temperature_k=temperature_k,
         min_recrossings=min_recrossings,
-        observable=observable,
+        observable=series,
         observable_name=observable_name,
         state_thresholds=state_thresholds,
     )
+    if this_round is not None and this_round.size:
+        # Where the walker was *this round*, not cumulatively. COLVAR appends
+        # across the whole biased phase, so `cv_min`/`cv_max` keep reporting the
+        # widest excursion the campaign ever made — which reads as "the full
+        # range is being explored" long after the walker has stopped moving.
+        # A campaign sat at 0.03-0.13 for two rounds while the scientist
+        # correctly quoted a cumulative 0.39-10.01 and concluded the opposite.
+        report["observable_min_this_round"] = float(this_round.min())
+        report["observable_max_this_round"] = float(this_round.max())
+        # Trapped-walker detection, computed rather than left to be inferred.
+        # A campaign sat between 0.03 and 0.13 of its native contacts for two
+        # rounds while the deposited bias grew past 115 kJ/mol and the
+        # scientist, reading only cumulative ranges, concluded the full
+        # coordinate was being explored.
+        confined, rounds_confined = _confinement(
+            rounds_dir, round_index, state_thresholds
+        )
+        report["confined_to_state"] = confined
+        report["rounds_confined"] = rounds_confined
+    # The CV-revision allowance, so the scientist can weigh a switch against
+    # what is left rather than only discovering the action is gone.
+    report["cv_switches_used"] = cv_switches_used
+    report["cv_switches_remaining"] = max(max_cv_switches - cv_switches_used, 0)
     report["phase"] = "metad"
     report["trajectory_path"] = str(trajectory_path)
     report["plumed_dat_path"] = str(plumed_dat_path)
     return report
+
+
+def _confinement(
+    rounds_dir: Path | None,
+    round_index: int | None,
+    state_thresholds: tuple[float, float] | None,
+) -> tuple[str | None, int]:
+    """Which task state the walker has been stuck in, and for how many rounds.
+
+    Walks backwards from this round and stops at the first one that was not
+    confined, or was confined to the *other* state. Vanilla rounds write no
+    observable file, so the count naturally stops at the pivot rather than
+    running back into the unbiased phase.
+
+    `None, 0` means the walker moved between the bands this round, which is the
+    healthy case — a biased run is supposed to traverse them.
+    """
+    if rounds_dir is None or round_index is None or state_thresholds is None:
+        return None, 0
+    low, high = float(state_thresholds[0]), float(state_thresholds[1])
+    state: str | None = None
+    count = 0
+    for index in range(round_index, 0, -1):
+        path = rounds_dir / f"round_{index:03d}.obs.npy"
+        if not path.exists():
+            break
+        series = np.load(path)
+        if not series.size:
+            break
+        if series.max() <= low:
+            here = "low"
+        elif series.min() >= high:
+            here = "high"
+        else:
+            break
+        if state is None:
+            state = here
+        elif here != state:
+            break
+        count += 1
+    return state, count
 
 
 def _accumulated_observable(
@@ -650,7 +932,8 @@ def _accumulated_observable(
     round_index: int,
     trajectory_path: Path,
     topology_path: Path,
-) -> tuple[np.ndarray, str]:
+    observable: ObservableSpec | None = None,
+) -> tuple[np.ndarray, str, np.ndarray]:
     """The campaign observable over every biased round so far, in order.
 
     Cumulative, because the surface-derived count it replaces was cumulative:
@@ -664,7 +947,7 @@ def _accumulated_observable(
     biased phase — over a gigabyte by the end of a 20 ns campaign.
     """
     traj = md.load(str(trajectory_path), top=str(topology_path))
-    series, name = campaign_observable(traj, topology_path)
+    series, name = campaign_observable(traj, topology_path, observable)
     rounds_dir.mkdir(parents=True, exist_ok=True)
     np.save(rounds_dir / f"round_{round_index:03d}.obs.npy", series)
 
@@ -673,7 +956,7 @@ def _accumulated_observable(
         path = rounds_dir / f"round_{index:03d}.obs.npy"
         if path.exists():
             chunks.append(np.load(path))
-    return (np.concatenate(chunks) if chunks else series), name
+    return (np.concatenate(chunks) if chunks else series), name, series
 
 
 def _refuse_premature_stop(
@@ -711,14 +994,16 @@ def _refuse_premature_stop(
     return replace(decision, decision="extend", extra_ns=decision.extra_ns or 0.5), note
 
 
-def _extend_steps(extra_ns: float | None, max_extra_ns: float) -> int:
+def _extend_steps(
+    extra_ns: float | None, max_extra_ns: float, steps_per_ns: int
+) -> int:
     """Steps for an extend round, clamped to the caller's `max_extra_ns`.
 
     What SQLite stores is the model's raw request, so the clamp has to be
     re-applied on every read. Applying it only in the live loop made a resumed
     campaign run a longer round than the uninterrupted one would have.
     """
-    return max(int(min(extra_ns or 0.5, max_extra_ns) * _STEPS_PER_NS), 1)
+    return max(int(min(extra_ns or 0.5, max_extra_ns) * steps_per_ns), 1)
 
 
 def _pivot_to_metad(
@@ -728,7 +1013,11 @@ def _pivot_to_metad(
     topology_path: Path,
     factory: BiasedAdapterFactory,
     plumed_dat_path: Path,
+    temperature_k: float,
     cv_upper_wall_nm: float | None = None,
+    bias_pace: int | None = None,
+    bias_factor: float | None = None,
+    notes: list[str] | None = None,
 ) -> MDAdapter:
     """Resolve a CV proposal into a biased, started adapter.
 
@@ -743,7 +1032,11 @@ def _pivot_to_metad(
         source_trajectory,
         topology_path,
         plumed_dat_path.parent,
+        temperature_k=temperature_k,
         cv_upper_wall_nm=cv_upper_wall_nm,
+        bias_pace=bias_pace,
+        bias_factor=bias_factor,
+        notes=notes,
     )
     plumed_dat_path.write_text(plumed_input)
     biased = factory(plumed_input)
@@ -757,9 +1050,18 @@ def _build_plumed_input(
     trajectory_path: Path,
     topology_path: Path,
     output_dir: Path,
+    *,
+    temperature_k: float,
     cv_upper_wall_nm: float | None = None,
+    bias_pace: int | None = None,
+    bias_factor: float | None = None,
+    notes: list[str] | None = None,
 ) -> str:
     """Proposal → resolved CV → sized bias → rendered plumed.dat text.
+
+    `notes` collects anything the scientist needs to know about the bias that
+    the diagnostics cannot show it — currently the wall. plumed.dat records the
+    same thing as comments, but the scientist never reads plumed.dat.
 
     `output_dir` is where PLUMED writes HILLS and COLVAR. It has to be
     absolute and campaign-local: PLUMED resolves relative FILE= paths against
@@ -781,16 +1083,71 @@ def _build_plumed_input(
         reference=reference,
         output_dir=output_dir,
     )
+    # None means "let bias_designer decide", so its defaults stay the single
+    # definition of PACE and BIASFACTOR rather than being restated here.
+    overrides = {
+        k: v
+        for k, v in (("pace", bias_pace), ("bias_factor", bias_factor))
+        if v is not None
+    }
     bias = design_bias(
-        cv, trajectory_path, topology_path, temperature_k=_METAD_TEMPERATURE_K
+        cv, trajectory_path, topology_path, temperature_k=temperature_k, **overrides
     )
-    wall = design_upper_wall(cv, cv_upper_wall_nm)
+    wall = design_upper_wall(
+        cv,
+        cv_upper_wall_nm,
+        trajectory_path=trajectory_path,
+        topology_path=topology_path,
+    )
+    if notes is not None:
+        notes.extend(_wall_notes(cv, wall, cv_upper_wall_nm))
     return PlumedInput(
         cvs=(cv,),
         bias=bias,
         walls=(wall,) if wall is not None else (),
         output_dir=Path(output_dir).resolve(),
     ).render()
+
+
+def _wall_notes(cv: Any, wall: Any, requested: float | None) -> list[str]:
+    """What the scientist should know about the bound on this coordinate.
+
+    Three cases matter. An unbounded coordinate with no bound at all is F6 —
+    the bias drives the walker outward forever. A bound beyond what the box can
+    hold is F11 — the solute reaches its own periodic image before the wall
+    pushes back. And a bound derived from the box is worth saying out loud,
+    because the campaign did not choose it.
+    """
+    from mdpilot.sampling.bias_designer import _LENGTH_DIMENSIONED
+
+    if not isinstance(cv, _LENGTH_DIMENSIONED):
+        return []
+    if wall is None:
+        return [
+            f"WARNING: the biased CV '{cv.label}' is length-dimensioned and so "
+            f"unbounded above, and no upper wall could be set — none was "
+            f"configured and the box limit could not be measured from the "
+            f"source trajectory. Well-tempered metadynamics will keep driving "
+            f"the walker outward with nothing to turn it around (F6). Set "
+            f"cv_upper_wall_nm for this campaign."
+        ]
+    if wall.derived_from_box:
+        return [
+            f"No wall position was configured for '{cv.label}', so one was "
+            f"measured from the source trajectory: {wall.at:.2f} is where the "
+            f"solute would reach its own periodic image. This bounds the "
+            f"artifact, not the science — if the task's unfolded state lies "
+            f"beyond it, the box is too small for the question being asked."
+        ]
+    if wall.exceeds_box_limit:
+        return [
+            f"WARNING: the wall on '{cv.label}' is at {wall.at:g}, but the box "
+            f"can only hold {wall.box_limit_nm:.2f} before the solute reaches "
+            f"its own periodic image (F11). Sampling past {wall.box_limit_nm:.2f} "
+            f"is contaminated by self-interaction. Enlarge padding_nm or lower "
+            f"the wall."
+        ]
+    return []
 
 
 def _require_checkpoint(row: store.RoundRow) -> None:
@@ -844,6 +1201,11 @@ def _compact_prior(r: RoundResult) -> dict[str, Any]:
             cv_label=r.report.get("cv_label"),
             fes_drift_kj_per_mol=r.report.get("fes_drift_kj_per_mol"),
             recrossings=r.report.get("recrossings"),
+            # Carried so the trend is visible: a range that shrinks round on
+            # round is a walker settling into one state, whatever the
+            # cumulative numbers say.
+            observable_min_this_round=r.report.get("observable_min_this_round"),
+            observable_max_this_round=r.report.get("observable_max_this_round"),
             # The boundaries move as the surface fills, so a count carried
             # forward without them is not comparable across rounds.
             recrossing_low=r.report.get("recrossing_low"),

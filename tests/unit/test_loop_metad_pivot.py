@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from mdpilot.adapters.system_spec import SystemSpec
@@ -22,13 +23,36 @@ from mdpilot.orchestrator.loop import run_campaign
 from mdpilot.orchestrator.scientist import Decision, MetadProposal
 
 
+# A real (if tiny) topology, not a marker file. `run_campaign`'s pre-flight
+# loads this and computes the campaign observable on it before any dynamics,
+# so a fake that writes "PDB" would exercise a path no real adapter takes.
+# Four alanines in a line: enough CA atoms for an rmsd observable to resolve.
+_MINIMAL_PDB = "".join(
+    f"ATOM  {i * 2 + 1:>5d}  N   ALA A{i + 1:>4d}    "
+    f"{i * 3.8:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           N\n"
+    f"ATOM  {i * 2 + 2:>5d}  CA  ALA A{i + 1:>4d}    "
+    f"{i * 3.8 + 1.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C\n"
+    for i in range(4)
+) + "END\n"
+
+
 class _FakeAdapter:
     """Minimal MDAdapter that writes marker files and records calls."""
 
-    def __init__(self, work_dir: Path, *, spec: SystemSpec, plumed_input: str | None = None):
+    def __init__(
+        self,
+        work_dir: Path,
+        *,
+        spec: SystemSpec,
+        plumed_input: str | None = None,
+        timestep_fs: float = 2.0,
+        temperature_k: float = 300.0,
+    ):
         self._work_dir = Path(work_dir)
         self._spec = spec
         self.plumed_input = plumed_input
+        self._timestep_fs = timestep_fs
+        self._temperature_k = temperature_k
         self.run_calls: list[int] = []
         self.loaded: list[Path] = []
         self.started = False
@@ -37,6 +61,14 @@ class _FakeAdapter:
     @property
     def spec(self) -> SystemSpec:
         return self._spec
+
+    @property
+    def timestep_fs(self) -> float:
+        return self._timestep_fs
+
+    @property
+    def temperature_k(self) -> float:
+        return self._temperature_k
 
     @property
     def trajectory_extension(self) -> str:
@@ -52,7 +84,7 @@ class _FakeAdapter:
     def start(self) -> None:
         self.started = True
         self._topology_path.parent.mkdir(parents=True, exist_ok=True)
-        self._topology_path.write_text("PDB")
+        self._topology_path.write_text(_MINIMAL_PDB)
 
     def run_steps(self, n_steps, *, trajectory_path=None, report_interval_steps=500):
         self.run_calls.append(n_steps)
@@ -161,6 +193,7 @@ def _full_config(tmp_path: Path) -> dict:
         "task_expectation": None,
         "cv_upper_wall_nm": None,
         "state_thresholds": None,
+        "min_recrossings": 1,
     }
 
 
@@ -877,7 +910,15 @@ def test_a_pure_convergence_campaign_needs_no_state_thresholds(
 ) -> None:
     """Strict, not indiscriminate. With no task_expectation the scientist
     cannot propose a pivot, so no biased phase can occur and there is nothing
-    for the thresholds to anchor."""
+    for the thresholds to anchor.
+
+    What makes that premise true is
+    `test_a_campaign_with_no_expectation_cannot_express_a_pivot` in
+    test_scientist.py: `switch_to_metad` leaves the tool enum entirely. Before
+    that it was only asserted here and discouraged in the prompt, so the
+    action stayed emittable and a pivot could still reach a biased phase with
+    no band to count recrossings against.
+    """
     _stub_collaborators(monkeypatch, [_stop()])
 
     result = run_campaign(
@@ -896,7 +937,7 @@ def test_inverted_state_thresholds_are_refused(
     so a swapped pair would read as a campaign that never crossed."""
     _stub_collaborators(monkeypatch, [_stop()])
 
-    with pytest.raises(ValueError, match="extended > folded"):
+    with pytest.raises(ValueError, match="high > low"):
         run_campaign(
             work_dir=tmp_path / "campaign",
             adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
@@ -923,3 +964,467 @@ def test_state_thresholds_are_locked_against_a_changed_resume(
     _stub_collaborators(monkeypatch, [_stop()])
     with pytest.raises(ValueError, match="different config"):
         run_campaign(work_dir=work_dir, state_thresholds=(2.0, 5.0), **kwargs)
+
+
+def test_min_recrossings_is_locked_against_a_changed_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same definition. `state_thresholds` says where the
+    states are; `min_recrossings` says how many transitions between them count
+    as done — it is the threshold `fes_converged` compares against, and
+    `_refuse_premature_stop` reads that verdict to decide whether the scientist
+    may stop. Changing it mid-campaign re-judges rounds already decided under
+    the old value.
+    """
+    work_dir = tmp_path / "campaign"
+    kwargs = dict(
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        task_expectation="cross the barrier",
+        state_thresholds=(1.5, 4.0),
+        **_run_kwargs(),
+    )
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(work_dir=work_dir, min_recrossings=2, **kwargs)
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    with pytest.raises(ValueError, match="different config"):
+        run_campaign(work_dir=work_dir, min_recrossings=1, **kwargs)
+
+
+# ---------- the loop reads its physics constants off the adapter ----------
+
+def test_round_length_follows_the_adapter_timestep(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`extra_ns` is nanoseconds, and the step count has to be derived from the
+    engine's own dt. Against a hardcoded 2 fs, an engine at 4 fs would have run
+    every round at twice the requested length with `extra_ns` silently no
+    longer meaning nanoseconds anywhere in the campaign record.
+    """
+    _stub_collaborators(monkeypatch, [_extend(), _stop()])
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), timestep_fs=4.0)
+
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        max_rounds=2,
+        max_extra_ns=2.0,
+        **_run_kwargs(),
+    )
+
+    # `_extend()` asks for 0.5 ns. At 4 fs that is 125_000 steps, not the
+    # 250_000 a 2 fs assumption would have produced.
+    assert base.run_calls == [100, 125_000]
+
+
+def test_biased_phase_uses_the_adapter_thermostat_temperature(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """PLUMED's `METAD ... TEMP=` must match the thermostat or the
+    well-tempered scaling factor is computed against the wrong temperature and
+    the bias converges to something other than -(1 - 1/gamma)F(s) — with no
+    error anywhere. The same temperature sets the kT the free-energy
+    convergence threshold is taken against.
+    """
+    record = _stub_collaborators(monkeypatch, [_switch(), _stop()])
+    seen: dict = {}
+
+    def spy_build(proposal, traj, top, output_dir, **kwargs):  # noqa: ANN001
+        seen["build"] = kwargs["temperature_k"]
+        record["cv_labels"].append(proposal.label)
+        return "PLUMED-TEXT\n"
+
+    def spy_metad_report(*_args, **kwargs):
+        seen["report"] = kwargs["temperature_k"]
+        return dict(_METAD_REPORT)
+
+    monkeypatch.setattr(loop_mod, "_build_plumed_input", spy_build)
+    monkeypatch.setattr(loop_mod, "metad_report", spy_metad_report)
+
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage(), temperature_k=277.0)
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=base,
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text, temperature_k=277.0
+        ),
+        max_rounds=3,
+        **_run_kwargs(),
+    )
+
+    assert seen == {"build": 277.0, "report": 277.0}
+
+
+# ---------- bias shape overrides ----------
+#
+# PACE and BIASFACTOR were already keyword arguments on `design_bias`; the loop
+# simply never passed them, so no campaign could change the shape of its own
+# bias. These pin the threading and the resume lock that has to come with it.
+
+def _two_atom_traj(tmp_path: Path) -> tuple[Path, Path]:
+    import mdtraj as md
+    import numpy as np
+
+    top = md.Topology()
+    res = top.add_residue("ALA", top.add_chain(), resSeq=1)
+    top.add_atom("A", md.element.carbon, res)
+    top.add_atom("B", md.element.carbon, res)
+    xyz = np.zeros((20, 2, 3))
+    xyz[:, 1, 0] = np.linspace(0.9, 1.4, 20)   # a real, non-degenerate spread
+    traj = md.Trajectory(xyz=xyz.astype(np.float32), topology=top)
+    pdb, dcd = tmp_path / "top.pdb", tmp_path / "traj.dcd"
+    traj[0].save_pdb(str(pdb))
+    traj.save_dcd(str(dcd))
+    return dcd, pdb
+
+
+def _render(tmp_path: Path, **overrides) -> str:
+    from mdpilot.orchestrator.loop import _build_plumed_input
+
+    dcd, pdb = _two_atom_traj(tmp_path)
+    return _build_plumed_input(
+        MetadProposal(cv_type="distance", selections=("name A", "name B"), label="d"),
+        dcd,
+        pdb,
+        tmp_path.resolve(),
+        temperature_k=300.0,
+        **overrides,
+    )
+
+
+def test_bias_overrides_reach_the_rendered_plumed_dat(tmp_path: Path) -> None:
+    rendered = _render(tmp_path, bias_pace=200, bias_factor=15.0)
+
+    assert "PACE=200" in rendered
+    assert "BIASFACTOR=15" in rendered
+
+
+def test_unset_bias_overrides_leave_the_designer_defaults(tmp_path: Path) -> None:
+    """None means "let bias_designer decide" — the loop must not restate its
+    defaults, or the two drift apart silently."""
+    from mdpilot.sampling.bias_designer import _DEFAULT_BIAS_FACTOR, _DEFAULT_PACE
+
+    rendered = _render(tmp_path)
+
+    assert f"PACE={_DEFAULT_PACE}" in rendered
+    assert f"BIASFACTOR={_DEFAULT_BIAS_FACTOR:g}" in rendered
+
+
+def test_bias_shape_locks_into_the_campaign_config_only_when_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Biased-phase physics, so it has to lock — but adding the keys
+    unconditionally would break resume for every campaign predating them."""
+    from mdpilot.memory import store
+
+    for kwargs, expected in (
+        ({}, False),
+        ({"bias_factor": 15.0}, True),
+    ):
+        work = tmp_path / f"c{int(expected)}"
+        _stub_collaborators(monkeypatch, [_stop()])
+        adapter = _FakeAdapter(work, spec=SystemSpec.trpcage())
+        run_campaign(
+            work_dir=work, adapter=adapter, max_rounds=1, **_run_kwargs(), **kwargs
+        )
+        config = store.get_campaign_config(work)
+        assert ("bias_factor" in config) is expected, kwargs
+
+
+def test_every_config_key_is_covered_by_the_compatibility_table(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Forget-proofing for the resume guard.
+
+    Adding a key to the campaign config without a compatibility entry silently
+    strands every campaign already on disk — the bug `_LEGACY_CONFIG_DEFAULTS`
+    exists to prevent, and one that had already cost four real campaigns before
+    it existed. If this fails, add the new key to
+    `store._LEGACY_CONFIG_DEFAULTS` with the behaviour that was in force
+    *before* the key existed, which is not necessarily its current default.
+    """
+    from mdpilot.memory import store
+    from mdpilot.memory.store import _LEGACY_CONFIG_DEFAULTS, _ORIGINAL_CONFIG_KEYS
+    from mdpilot.observables import ObservableSpec
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        max_rounds=1,
+        # Every optional parameter set, so the recorded config is the widest
+        # one run_campaign can produce.
+        task_expectation="fold it",
+        state_thresholds=(1.0, 2.0),
+        min_recrossings=2,
+        cv_upper_wall_nm=0.8,
+        bias_pace=200,
+        bias_factor=15.0,
+        observable=ObservableSpec(
+            cv_type="gyration", selections=("name CA",), name="rg_nm"
+        ),
+        **_run_kwargs(),
+    )
+
+    recorded = set(store.get_campaign_config(tmp_path))
+    uncovered = recorded - _ORIGINAL_CONFIG_KEYS - set(_LEGACY_CONFIG_DEFAULTS)
+    assert not uncovered, (
+        f"config key(s) {sorted(uncovered)} have no compatibility entry in "
+        f"store._LEGACY_CONFIG_DEFAULTS; campaigns already on disk would be "
+        f"stranded by them"
+    )
+
+
+def test_the_real_task_file_drives_the_loop_and_reopens_cleanly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The seam between `task_file` and `run_campaign`, which nothing else
+    covers: the two were built separately and only met in a benchmark script.
+
+    Also the round trip that matters operationally — the same task file must
+    reopen its own campaign, which is only true if the rendered
+    `task_expectation` is deterministic.
+    """
+    from mdpilot.memory import store
+    from mdpilot.task_file import load_task_file
+
+    task = load_task_file(Path("benchmarks/tasks/cln025_folding.yaml"))
+    kwargs = task.run_kwargs(
+        max_extra_ns=2.0, seed=42, initial_steps=100,
+        report_interval_steps=50, equilibration_steps=0, max_rounds=1,
+    )
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    result = run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=task.spec),
+        **kwargs,
+    )
+    assert result.stop_reason == "scientist_said_stop"
+
+    config = store.get_campaign_config(tmp_path)
+    assert config["state_thresholds"] == [1.5, 4.0]
+    assert config["min_recrossings"] == 2
+    assert config["task_expectation"] == kwargs["task_expectation"]
+
+    _stub_collaborators(monkeypatch, [_stop()])
+    run_campaign(
+        work_dir=tmp_path,
+        adapter=_FakeAdapter(tmp_path, spec=task.spec),
+        **kwargs,
+    )
+
+
+def test_the_biased_report_says_where_the_walker_was_this_round(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """COLVAR appends across the whole biased phase, so `cv_min`/`cv_max` keep
+    reporting the widest excursion the campaign ever made. A real campaign sat
+    between 0.03 and 0.13 for two rounds while the scientist correctly quoted a
+    cumulative 0.39-10.01 and concluded the full range was being explored."""
+    import numpy as np
+
+    from mdpilot.orchestrator import loop as loop_mod
+
+    captured: dict = {}
+
+    def fake_accumulated(rounds_dir, round_index, traj, top, observable=None):
+        this_round = np.linspace(0.03, 0.13, 50)          # stuck, unfolded
+        cumulative = np.concatenate([np.linspace(0.03, 0.78, 50), this_round])
+        return cumulative, "native_contacts_fraction", this_round
+
+    monkeypatch.setattr(loop_mod, "_accumulated_observable", fake_accumulated)
+    monkeypatch.setattr(
+        loop_mod, "metad_report",
+        lambda *a, **k: (captured.update(k) or dict(_METAD_REPORT)),
+    )
+
+    report = loop_mod._round_report(
+        tmp_path / "r.dcd", tmp_path / "top.pdb",
+        plumed_dat_path=tmp_path / "plumed.dat", temperature_k=300.0,
+        fes_dir=tmp_path / "fes", rounds_dir=tmp_path, round_index=4,
+        state_thresholds=(0.3, 0.7),
+    )
+
+    assert report["observable_min_this_round"] == pytest.approx(0.03)
+    assert report["observable_max_this_round"] == pytest.approx(0.13)
+    # Entirely inside one state — the signal the cumulative range cannot give.
+    assert report["observable_max_this_round"] < 0.3
+    # The recrossing count is still taken against the cumulative series.
+    assert captured["observable"].size == 100
+
+
+# ---------- the CV-switch escape hatch out of a trap ----------
+#
+# Replays the observable from `campaigns/ui_campaign_chignolin`, which left the
+# folded state in round 2 and then sat between 0.03 and 0.13 of its native
+# contacts while the deposited bias grew past 115 kJ/mol. A contact count maps
+# every disordered conformation onto roughly the same value, so the bias fills
+# one degenerate bin and cannot lead the chain back. `switch_cv` is the way out.
+
+_TRAP_SERIES = [
+    np.linspace(0.78, 0.11, 40),   # round 2: crosses both bands
+    np.linspace(0.44, 0.04, 40),   # round 3: still crosses 0.3
+    np.linspace(0.13, 0.03, 40),   # round 4: confined below 0.3
+    np.linspace(0.12, 0.03, 40),   # round 5: still confined -> rounds_confined=2
+]
+
+
+def _stub_trap(monkeypatch, decisions, depths) -> dict:
+    """Like `_stub_collaborators`, but the observable really is trapped and the
+    surface really keeps deepening, so `_round_report` computes confinement
+    from data instead of being handed a verdict."""
+    record = _stub_collaborators(monkeypatch, decisions)
+    record["reports"] = []
+    biased_round = {"n": 0}
+
+    def fake_accumulated(rounds_dir, round_index, traj, top, observable=None):
+        i = biased_round["n"]
+        biased_round["n"] += 1
+        series = _TRAP_SERIES[min(i, len(_TRAP_SERIES) - 1)]
+        # Persist it so `_confinement` reads the same files the real loop would.
+        Path(rounds_dir).mkdir(parents=True, exist_ok=True)
+        np.save(Path(rounds_dir) / f"round_{round_index:03d}.obs.npy", series)
+        cumulative = np.concatenate(_TRAP_SERIES[: i + 1])
+        return cumulative, "native_contacts_fraction", series
+
+    monkeypatch.setattr(loop_mod, "_accumulated_observable", fake_accumulated)
+    depth_iter = iter(depths)
+
+    def fake_metad_report(*a, **k):
+        report = dict(_METAD_REPORT)
+        report.update(
+            fes_depth_kj_per_mol=next(depth_iter), recrossings=1,
+            fes_converged=False, recrossing_basis="task_states",
+        )
+        return report
+
+    monkeypatch.setattr(loop_mod, "metad_report", fake_metad_report)
+
+    inner = loop_mod.decide
+
+    def recording_decide(report, **kwargs):
+        record["reports"].append(report)
+        return inner(report, **kwargs)
+
+    monkeypatch.setattr(loop_mod, "decide", recording_decide)
+    return record
+
+
+def test_a_contact_space_trap_is_detected_and_escaped(tmp_path, monkeypatch) -> None:
+    record = _stub_trap(
+        monkeypatch,
+        [_switch(), _extend(), _extend(), _extend(), _switch_cv(), _stop()],
+        depths=[51.0, 92.0, 116.0, 131.0, 20.0],
+    )
+    base = _FakeAdapter(tmp_path, spec=SystemSpec.trpcage())
+    result = run_campaign(
+        work_dir=tmp_path, adapter=base,
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text
+        ),
+        max_rounds=6, max_cv_switches=1,
+        state_thresholds=(0.3, 0.7), task_expectation="fold it",
+        **_run_kwargs(),
+    )
+
+    biased = [r for r in record["reports"] if r.get("phase") == "metad"]
+    confined = [(r.get("confined_to_state"), r.get("rounds_confined")) for r in biased]
+
+    # Rounds 2 and 3 traverse the bands; 4 and 5 are stuck below the low one.
+    assert confined[:2] == [(None, 0), (None, 0)]
+    assert confined[2] == ("low", 1)
+    assert confined[3] == ("low", 2)          # the trap is now unambiguous
+    # And the surface kept deepening while it sat there.
+    assert [r["fes_depth_kj_per_mol"] for r in biased][:4] == [51.0, 92.0, 116.0, 131.0]
+
+    # The escape actually happened: a fresh bias on the replacement coordinate.
+    assert "switch_cv" in [r.decision.decision for r in result.rounds]
+    assert record["cv_labels"][-1] != record["cv_labels"][0]
+
+
+def test_the_switch_is_offered_only_while_the_allowance_lasts(
+    tmp_path, monkeypatch
+) -> None:
+    """`max_cv_switches` is the budget; once spent the action leaves the tool
+    rather than being emitted and refused."""
+    record = _stub_trap(
+        monkeypatch,
+        [_switch(), _extend(), _extend(), _extend(), _switch_cv(), _stop()],
+        depths=[51.0, 92.0, 116.0, 131.0, 20.0],
+    )
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text
+        ),
+        max_rounds=6, max_cv_switches=1,
+        state_thresholds=(0.3, 0.7), task_expectation="fold it",
+        **_run_kwargs(),
+    )
+
+    offered = record["allow_cv_switch"]
+    assert offered[0] is False                      # vanilla round: not biased yet
+    assert all(offered[1:5])                        # biased, one switch in hand
+    assert offered[5] is False                      # spent — withdrawn from the tool
+
+
+def test_the_report_tells_the_scientist_what_allowance_is_left(
+    tmp_path, monkeypatch
+) -> None:
+    record = _stub_trap(
+        monkeypatch, [_switch(), _extend(), _switch_cv(), _stop()],
+        depths=[51.0, 92.0, 20.0],
+    )
+    run_campaign(
+        work_dir=tmp_path, adapter=_FakeAdapter(tmp_path, spec=SystemSpec.trpcage()),
+        biased_adapter_factory=lambda text: _FakeAdapter(
+            tmp_path, spec=SystemSpec.trpcage(), plumed_input=text
+        ),
+        max_rounds=4, max_cv_switches=1,
+        state_thresholds=(0.3, 0.7), task_expectation="fold it",
+        **_run_kwargs(),
+    )
+
+    biased = [r for r in record["reports"] if r.get("phase") == "metad"]
+    assert biased[0]["cv_switches_remaining"] == 1
+    assert biased[-1]["cv_switches_used"] == 1 and biased[-1]["cv_switches_remaining"] == 0
+
+
+def test_wall_warnings_reach_the_scientist_through_the_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """plumed.dat records the same thing as comments, but the scientist never
+    reads plumed.dat. An unbounded CV with no wall is F6 and it has to be said
+    somewhere the next round will see."""
+    from mdpilot.adapters.plumed_writer import RmsdCV
+    from mdpilot.orchestrator.loop import _wall_notes
+
+    cv = RmsdCV(label="rmsd_ca", atoms=(0, 1, 2), reference_path=Path("/tmp/r.pdb"))
+
+    # No wall at all: the F6 warning.
+    (note,) = _wall_notes(cv, None, None)
+    assert "unbounded above" in note and "F6" in note
+
+    # A wall the box cannot honour: the F11 warning.
+    from mdpilot.adapters.plumed_writer import UpperWall
+
+    (note,) = _wall_notes(
+        cv, UpperWall(cv_label="rmsd_ca", at=0.8, kappa=1000.0, box_limit_nm=0.55), 0.8
+    )
+    assert "0.55" in note and "periodic image" in note
+
+    # A wall the campaign did not choose: say so, without alarm.
+    (note,) = _wall_notes(
+        cv,
+        UpperWall(cv_label="rmsd_ca", at=0.55, kappa=1000.0,
+                  box_limit_nm=0.55, derived_from_box=True),
+        None,
+    )
+    assert "measured from the source trajectory" in note
+    assert "too small for the question" in note
+
+    # A bounded coordinate has nothing to warn about.
+    from mdpilot.adapters.plumed_writer import ContactsCV
+
+    assert _wall_notes(ContactsCV(label="q", pairs=((0, 1),), r0_nm=0.75), None, None) == []

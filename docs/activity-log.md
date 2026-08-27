@@ -167,7 +167,128 @@ Two distinct defects, both rooted in the band being re-derived from the current 
 
 **Verified by replaying run 3's stored rounds.** Anchored: `1,1,1,2,3,3,3,3,3,3,3` — monotone, no unmeasurable rounds, ending at 3 and agreeing exactly with `done_criterion.json`. Reported at the time: `1,2,2,2,2,None,None,30,None,22,26`. That series *decreases*, which is arithmetically impossible for a cumulative transition count and is the clearest evidence it was not measuring one quantity. The anchored count crosses `min_recrossings=2` at round 5, matching the mid-run hand computation.
 
-**Still open from F7:** nothing forces a task to supply `state_thresholds`. A campaign without them silently falls back to the surface-derived band with all of F9's behaviour intact, marked only by `recrossing_basis`.
+**Made strict (same day).** The fallback is no longer reachable by accident. `run_campaign` refuses at entry when `task_expectation` is set — the sole input gating `switch_to_metad`, so exactly the predicate for "this campaign can reach a biased phase" — and `state_thresholds` is None. Argument-only validation, so it raises before any filesystem or engine work rather than at the pivot, which would have thrown away the whole vanilla phase. A pure convergence task (no `task_expectation`, hence no possible pivot) still needs nothing. Inverted thresholds are refused too: `count_recrossings` returns 0 rather than raising for a band with `high <= low`, so a swapped pair would have read as a campaign that never crossed. `state_thresholds` joins the locked config alongside `task_expectation` and `cv_upper_wall_nm` — resuming with a different band would splice two definitions of "a transition" into one campaign's history.
+
+*Consequence:* campaigns created before this (runs 1-3) carry no `state_thresholds` key and will fail the config guard on resume. All three are finished, so this costs nothing, but a resume of any of them now needs the key added to its `campaign` row.
+
+**The "strict" claim was half true (2026-08-24) — CLOSED.** The entry-time refusal covers `task_expectation` set + `state_thresholds` None. It said nothing about the reverse, and nothing enforced the premise it rested on: `decide()` selected its tool by *phase alone*, so `_DECISION_TOOL` offered `switch_to_metad` on every vanilla round whether or not a `task_expectation` existed. A campaign with neither key passed the entry guard, and the model could still emit a pivot — landing in a biased phase with no band to count recrossings against, i.e. the F9 fallback with all its behaviour intact. `test_a_pure_convergence_campaign_needs_no_state_thresholds` asserted the false premise in its own docstring. Closed by giving that case its own tool: `_CONVERGENCE_TOOL` (`extend | stop`, no `metad_proposal`), selected when `task_expectation is None`. Same "unrepresentable beats emitted-then-rejected" rule as `_METAD_DECISION_TOOL` and `_METAD_SWITCH_TOOL`; the loop's own `switch_to_metad` branch is unchanged and still reachable by a caller that stubs `decide`, which is how the pivot orchestration tests drive it.
+
+**Also locked (2026-08-24):** `min_recrossings`. It is the other half of the same definition — `state_thresholds` says *where* the states are, `min_recrossings` says *how many* transitions between them count as done. It is the threshold `_fes_converged` compares against and `_refuse_premature_stop` reads to decide whether a `stop` is allowed, so resuming with a different value re-judges rounds already decided under the old one. Same migration consequence as above.
+
+### F10 — the well-tempered drift test was vacuous at exactly two FES estimates (2026-08-24) — FIXED
+
+`metad_report` measured drift against `surfaces[len(surfaces) // 2]` — the half-way estimate, deliberately not the previous one, because with `--stride 10` over thousands of hills consecutive estimates are ~0.25% of the run apart and their difference is near zero however unconverged the surface is. But at exactly **two** estimates `n // 2 == 1 == -1`: the baseline *is* the final surface, and drift came back `0.0` by construction.
+
+This is the same defect as the trailing-duplicate surface `sum_hills` already pops, arriving by a different route — and it is worse than merely uninformative. `_fes_converged` requires only `drift < kT AND recrossings >= min_recrossings`, so a first biased round short enough to yield two estimates (~10 ps at `PACE=500`, `stride=10` — which is where `run_cln025 --dry-run` lives) could report `fes_converged=true` on a surface still moving by tens of kJ/mol. `_refuse_premature_stop` explicitly passes a `stop` through when `fes_converged is True`, so the single guard against declaring victory against the diagnostic would have stood aside.
+
+**Reproduced** against two analytic double wells differing by 6.06 kJ/mol: reported drift `0.0`, `recrossings=1`, `fes_converged=True`. After the fix: drift `6.06`, `fes_converged=False`.
+
+**Fix.** `_baseline_index(n)` returns `min(n // 2, n - 2)` — the half-way surface, clamped to stay strictly below the last index. At two estimates that is index 0, which is also the most widely separated pair available, so the comparison is not merely non-vacuous but the right one. No test had covered `n_fes_estimates == 2`; there are now two, one on the index arithmetic and one end-to-end through `metad_report`.
+
+*Second defect, same session:* `sum_hills` never cleared `out_dir`. A round re-run after a crash resumes from the previous round's restored (shorter) HILLS and writes fewer indexed surfaces, while leftovers from the aborted attempt survive — `indexed.sort()` then puts a stale surface last and `surfaces[-1]`, the profile every statistic is taken on, is from the previous attempt. Stale outputs are now removed before plumed is invoked. The unit test that fabricated sum_hills' output beforehand was rewritten so the fake subprocess writes it *during* the call, which is what the real binary does.
+
+### D7 — The task file is the campaign contract, and `task_expectation` is rendered from it (2026-08-26)
+**Goal context:** MDPilot is aimed at being a *general* MD agent — chignolin folding is the current forcing function, protein-ligand binding/unbinding is the next, and others follow. Interfaces should therefore be named for mechanics, not for the first problem that used them.
+
+**One file owns what a campaign is.** `benchmarks/tasks/*.yaml` was decorative: `run_cln025.py` read four fields and every other declaration — force field, water model, padding, ionic strength, timestep, constraints, observable, target ESS — was documentation the adapters were free to contradict. `mdpilot/task_file.py` makes it load-bearing, in three modes per field: **mapped** (becomes a `SystemSpec`/`Ensemble` or a `run_campaign` keyword), **verified** (not yet tunable, so checked against the constant that really governs it — a mismatch raises), **informational** (prose, carried not interpreted). Unknown keys raise, which is how a generated file's typos surface.
+
+**`task_expectation` is rendered, not authored.** It is the only input gating `switch_to_metad`, and it was the one load-bearing input that escaped structuring — free prose that restated the state thresholds, the round-trip requirement and the compute budget in words. Three of its four decision-driving numbers existed twice with nothing linking the copies. It is now a *view* of `expectation:` + `done_criterion:`, so drift is unrepresentable. Only the objective and the characteristic timescale are genuinely free, and the timescale carries a source because it is the one decision-driving number that exists nowhere else. The budget-vs-timescale comparison the pivot rule asks for is computed rather than left as arithmetic on prose.
+
+**States are positions, not roles.** `done_criterion.states.{low,high}` each carry a `name` and a `threshold` on the campaign observable, replacing `folded_state_rmsd_angstrom` / `extended_state_rmsd_angstrom`. `count_recrossings` only ever wanted a low band and a high band; a binding campaign names them `bound`/`unbound` on a distance and nothing in the mechanics changes. `run_campaign`'s `state_thresholds` documentation and error messages were reworded the same way.
+
+**Known blocker for the next system class**, now tested rather than latent: `diagnostics.report.campaign_observable` selects `protein and name CA` and raises on an empty selection, so CA-RMSD is the only observable the loop can compute. `task_file` refuses a file declaring any other `observable.name` — see `test_a_non_protein_observable_is_refused_until_it_is_tunable`. A binding campaign needs that generalized first, and per the M3 lesson the abstraction should be discovered from the second real observable, not invented ahead of it.
+
+### F11 — CLN025 campaigns sampled configurations where the peptide interacts with its own periodic image (2026-08-26)
+Measured on the completed campaigns, not inferred. Box is cubic, L ≈ 3.66 nm (1.0 nm padding applied to the *folded* structure, then shrunk by NPT). Minimum heavy-atom distance between the solute and its nearest periodic image, per round:
+
+| campaign | biased CV | rounds within the 1.0 nm cutoff of their own image | closest approach |
+|---|---|---|---|
+| `cln025_metad` | `rmsd_ca` + 0.8 nm wall | **6 / 12** | **0.27 nm** |
+| `cln025_metad_run3` (criterion met) | `native_contacts_ca`, no wall | 2 / 12 | 0.63 nm |
+| `cln025_metad_run1` | (4 rounds, failed) | 0 / 4 | 1.54 nm |
+
+0.27 nm is contact distance — a hydrogen bond. The molecule is whole in the stored frames (max bonded heavy-atom distance 0.167 nm), so this is not a wrapping artifact. In `round_011` of `cln025_metad`, 100% of frames have a solute span exceeding L/2 = 1.83 nm (mean 3.34 nm, max 4.02 nm), meaning each chain end is nearer a periodic image of the other end than the end itself.
+
+**Cause.** Padding is applied to the starting (folded) structure, but metadynamics deliberately drives the chain to extended states. `_PADDING_NM = 1.0` on a folded 10-residue hairpin gives L/2 barely larger than the *folded* peptide (heavy-atom extent 1.87 nm vs L/2 = 1.83 nm), and nowhere near enough for the unfolded ensemble the campaign exists to sample. The 0.8 nm RMSD wall (added for F6) bounds the CV but not the chain's spatial extent, and is not tight enough for this box.
+
+**This is a deepening of F6, not a separate story.** RMSD-to-native being unbounded above did not only produce one-way excursions — it drove the chain into configurations the box cannot support. The `contacts` CV, chosen for F6 reasons, mitigated this too: run 3 is the least affected, by a wide margin.
+
+**What it does and does not invalidate.** The M4 done criterion is about *agent behaviour* — did the scientist detect vanilla inadequacy, pivot, choose a defensible CV, and recross. That result stands; run 3 met it, and its contamination is the mildest of the three. What is not trustworthy is the *physical* free-energy surface on the extended side: solute self-interaction perturbs the unfolded ensemble, so barrier heights and ΔG from these runs should not be quoted.
+
+**Resolved 2026-08-26 by raising the default box.** `padding_nm` is now a `SystemSpec` field, default **1.5 nm** (was a hardcoded 1.0). Sized against this campaign's own sampled spans rather than a rule of thumb — the box actually built at p=1.0 was L=3.78 nm (NPT shrink factor 0.976 on folded extent 1.87 nm), and the sampled heavy-atom span had median 2.24, p95 3.20, max 3.87 nm:
+
+| padding | L | atoms vs 1.0 | worst image gap | frames under 1.0 nm |
+|---|---|---|---|---|
+| 1.0 | 3.78 | 1.0x | −0.09 nm | 20.20% |
+| 1.2 | 4.17 | 1.3x | +0.30 nm | 5.69% |
+| **1.5** | **4.75** | **2.0x** | **+0.89 nm** | **0.18%** |
+| 2.0 | 5.73 | 3.5x | +1.86 nm | 0.00% |
+
+1.5 nm is a better default, not a guarantee: it leaves 0.18% of that ensemble inside the cutoff, and a campaign that drives its system further apart than CLN025 did should raise it. Both shipped task files now declare it, and `system.padding_nm` moved from the loader's verified-but-fixed table to a mapped field.
+
+**The default was *raised*, which the config-compatibility layer had to be taught.** `SystemSpec.to_dict` omits a default `ensemble` because that default equals what pre-ensemble campaigns ran under; padding cannot use the same trick, because absent (a pre-F11 campaign, built at 1.0) and default (1.5) mean *different boxes*. It is always serialized, and `store._LEGACY_SYSTEM_SPEC_DEFAULTS` supplies 1.0 for configs recorded before the field existed — so a pre-F11 campaign is correctly refused at the new default and still resumable at its own 1.0.
+
+**Still open:** the two cheaper mitigations remain available and independent — a tighter `cv_upper_wall_nm` (already tunable), and preferring bounded CVs, which run 3's numbers already argue for. Nothing yet checks box-versus-extent at pivot time, which would catch this class of problem before compute is spent rather than after.
+
+### D8 — The campaign observable is a declared CV, and setup gets one LLM call outside the loop (2026-08-26)
+**Observable.** `campaign_observable` was hardcoded to `protein and name CA`, which made every non-protein campaign impossible at round one. It is now an `ObservableSpec` — a `CVProposal` plus a display name and a unit `scale` — declared in the task file's `observable:` block and computed through `bias_designer.cv_series`, the same engine that sizes the bias. That reuse is the point: "size the bias from this coordinate" and "judge the campaign on this coordinate" must be one computation or they disagree with nothing to catch it. `rmsd` is the one type computed directly, because PLUMED's RMSD action needs a reference *file* while the campaign observable measures against the topology already in memory. Not a new abstraction: an observable is a collective variable, and `sampling/` already knew how to resolve and compute five.
+
+**Setup agent (`setup_agent.py`).** The only LLM call outside the round loop — once per campaign, before any compute. It emits a structured proposal via strict tool use; this module renders the YAML, so a syntactically invalid task file is unrepresentable and the only failures left are semantic ones `load_task_file` can explain. A refused proposal is retried with the loader's own message as a `tool_result`; the loader, not a rubric, is the judge. `out_path` only ever holds a file the loader accepted.
+
+**Why this does not violate D5.** The MDCrow anti-goal forbids rebuilding an LLM *agent layer that orchestrates setup tools*. Nothing here runs: the model proposes, `task_file` validates, a human reviews, deterministic Python builds. Same boundary `cv_designer` draws for the biased CV. D5's closing line — "revisit only when a campaign genuinely needs setup-from-natural-language" — is the trigger being pulled, deliberately and recorded here.
+
+**The tool schema cannot express the biased CV.** There is no field for it. Choosing which coordinate to bias is the scientist's judgment at the moment it decides unbiased MD is inadequate; a field here would answer the question the campaign asks. Unrepresentable rather than discouraged, the same argument the decision tool's enums make.
+
+### D9 — Force fields are a closed vocabulary of validated pairs, and engines refuse rather than substitute (2026-08-26)
+`mdpilot/forcefields.py` holds six protein+water combinations, each verified on **two** axes against the installed OpenMM: the XML set loads, *and* its water model is one `Modeller.addSolvent` can build. Both are necessary — `amber14/opc` passes the first and fails the second (`addSolvent` supports only tip3p, spce, tip4pew, tip5p, swm4ndp), and is left out rather than offered untested. `SystemSpec.forcefield` is a key into this table, so the spec stays engine-agnostic and each adapter resolves it; `tests/unit/test_forcefields.py` re-checks the whole table so an entry cannot rot.
+
+**Closed vocabulary, for the same reason `cv_type` is an enum.** Force-field choice is high-stakes and silent when wrong: a mismatched pairing builds, runs, and reports plausible numbers while sampling the wrong ensemble. A combination that is not in the table is unrepresentable rather than discouraged.
+
+**Engine coverage is uneven and is not hidden.** The stock GROMACS install ships amber94/96/99/99sb/99sb-ildn/03, charmm27, gromos and oplsaa — no ff14SB, no charmm36. `for_gromacs` therefore *raises* on an unmapped key. `amber99sb-ildn` is a different force field, not a translation of `amber14-all.xml`, and substituting it would turn a cross-engine comparison into a comparison of two force fields with nothing recording that it happened. `amber99sbildn/tip3p` is the only entry both engines can build, which makes it the only combination a genuine cross-engine study can use — and note the two adapters had until now *defaulted to different force fields* with nothing marking the difference.
+
+**Known gaps, stated in the guide rather than worked around:** no TIP4P/Ice ships with OpenMM (so the D6 ice showcase needs a parameter file this project does not carry), no OPC solvation, and no small-molecule force field (GAFF/OpenFF), so protein-ligand systems still cannot be parameterised. The setup agent is instructed to propose the closest listed combination and name the gap.
+
+### F12 — A task file's system spec was silently discarded, and the wrong molecule ran for 40 minutes (2026-08-26, **corrected 2026-08-26**)
+**This entry originally blamed the setup agent for proposing the wrong PDB. That was wrong, and the correction is the more useful finding.**
+
+First campaign launched from the Streamlit UI. The task file said chignolin, `starting_pdb: 2RVD`. What ran was 1L2Y — Trp-cage, 20 residues, `NLYIQWLKDGGPSSGRPPPS`.
+
+**`2RVD` is chignolin.** Fetched directly: `TYR-TYR-ASP-PRO-GLU-THR-GLY-THR-TRP-TYR` = YYDPETGTWY, 10 residues, CLN025. The agent's identifier was correct.
+
+**The cause was `app.py` calling `run_campaign` with no adapter.** `run_kwargs` deliberately excludes the system spec — the spec belongs to the adapter, which the caller constructs. `run_campaign(adapter=None)` then falls back to `OpenMMAdapter(work_dir, seed)`, whose default is `SystemSpec.trpcage()`. So the *entire* `system:` and `integrator:` block was discarded — PDB, force field, padding, and temperature (340 K requested, 300 K run) — with nothing anywhere recording that the file had been ignored. The stored config proves it: `system_spec: {'pdb_id': '1L2Y', ...}`, and `inputs/1L2Y_fixed.pdb` sits in the work directory. `benchmarks/run_cln025.py` had always done it correctly (`spec=task.spec`); the app did not.
+
+**Fixed by removing the footgun, not just the instance.** `TaskFile.build_adapter(work_dir, seed=...)` constructs the adapter from the file's own spec; both the app and the benchmark runner use it, so the two halves of a task file — what to simulate and how to judge it — are no longer separable by accident. A test asserts the spec reaches the engine.
+
+**What was genuine agent drift, and still stands.** The observable was named `native_contacts_fraction` with `scale: 1` — an absolute count, 938-2140, against thresholds of 0.3 and 0.7. Every frame read as the same state, so `recrossings` was fixed at 0, `fes_converged` could never be true, and `_refuse_premature_stop` converted every `stop` into an `extend`. That half of the original entry is correct.
+
+**And part of *that* was also ours.** `ObservableSpec.normalize` was added to the spec and the loader but not to the setup agent's tool schema, so the agent could not express a fraction at all and could only reach for `scale`. Fixed; with `normalize` available it now emits `normalize: true` on the first attempt.
+
+**A third, separate agent error, now caught at load.** A later draft wrote two selections for a `contacts` observable — one per hairpin strand. `contacts` forms native pairs *within* one group. Arity is pure schema and needs no topology, so it moved from `cv_designer` (which only finds out after a structure has been fetched and solvated) into `ObservableSpec.__post_init__`, with a message that explains the specific mistake.
+
+**What the pre-flight checks are actually worth.** `check_residue_count` did fire on this campaign — the description said 10 residues, the built structure had 20. It caught a real inconsistency at round zero. What it could not tell anyone is *why*, and the obvious reading — "the agent picked the wrong PDB" — was the wrong one. A check that compares two artifacts tells you they disagree; it does not tell you which is at fault, and the first explanation that fits is not evidence.
+
+### F13 — A bounded CV trapped the walker anyway, and the cumulative range hid it (2026-08-26)
+`campaigns/ui_campaign_chignolin`, biased on native-contact count. The walker left the folded state in round 2 and never returned:
+
+| round | observable this round | folded | unfolded | fes_depth |
+|---|---|---|---|---|
+| 2 | [0.110, 0.781] | 10.8% | 25.9% | 51 kJ/mol |
+| 3 | [0.038, 0.436] | 0.0% | 92.5% | 92 kJ/mol |
+| 4 | [0.030, 0.126] | 0.0% | 100% | 116 kJ/mol |
+
+`recrossings` stuck at 1 against a criterion of 2. 116 kJ/mol over the *sampled* range is an order of magnitude past chignolin's real folding free energy.
+
+**Bounded is not reversible.** `cv_vocabulary.md` claimed `torsion` and `contacts` "do not have that failure mode" — true for *range*, false for *return*. A contact count maps every disordered conformation onto roughly the same value, so once the chain is disordered the coordinate cannot separate those states and the bias fills one degenerate bin forever. Guidance corrected.
+
+**The scientist could not see it.** Its round-4 reasoning quoted `cv_min=0.39 to cv_max=10.01` and concluded "the full CV range is being explored" — correct, but cumulative: COLVAR appends across the whole biased phase under RESTART, so those fields keep reporting the widest excursion the campaign ever made long after the walker stopped. Nothing gave a per-round view.
+
+**Fixed with computed signals rather than more prose.** `observable_min_this_round` / `observable_max_this_round`, plus `confined_to_state` and `rounds_confined` from `_confinement`, which walks back through the per-round observable files and stops at the first round that was not confined (or was confined to the other state). Replayed on the real campaign it reports `('low', 1)` at round 4 — a threshold of 2 fires at round 5. `cv_switches_used` / `cv_switches_remaining` are in the report too, so a switch can be weighed against what is left instead of the action simply vanishing.
+
+**Escape verified against the live model.** Given the trapped report it chose `switch_cv` to `rmsd` on `name CA`, citing `rounds_confined=2`, the per-round range "entirely in [0.03, 0.126]", and the 131 kJ/mol depth. Given a healthy unconverged round it chose `extend` — the check does not over-trigger.
+
+**And the escape exposed one more gap.** The model justified RMSD as "bounded", which it is not (F6), and `cln025_contacts.yaml` carried no `cv_upper_wall_nm` — so the escape would have landed straight back in the runaway F6 came from. A campaign that allows a CV switch must carry a wall in case the replacement is length-dimensioned; `design_upper_wall` ignores it for types that do not need one. Wall added, guidance corrected to say what actually makes `rmsd` usable is the wall, not the coordinate.
+
+**Also fixed:** the viewer plotted the raw `sum_hills` grid, which extends a few SIGMA past the outermost hill — so the axis ran to *negative contacts* and the frozen extrapolated shelf inflated the apparent depth (139 vs 116 kJ/mol). `metad_report` had always cropped; the plot now does too, using the round's own COLVAR snapshot.
 
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
@@ -179,6 +300,177 @@ Two distinct defects, both rooted in the band being re-derived from the current 
 ---
 
 ## 2. Session journal
+
+### 2026-08-26 (end) — Continuous integration
+Branch `test`. `.github/workflows/ci.yml`: three jobs on push and PR.
+
+**lint** — `ruff check --select F,E9,B`, kept separate from the test job so a typo fails in seconds rather than after an OpenMM install. Correctness rules only: the same run with `E,W,I` reports 98 issues, 79 of them line-length, against 6 real ones. Enforcing style here would mean reformatting a codebase whose long explanatory comments are deliberate — the churn CLAUDE.md's "surgical changes" rule exists to prevent. The same selection lives in `[tool.ruff.lint]` so a local `ruff check` and CI cannot disagree.
+
+**test** — unit suite on Python **3.10 and 3.12**. The floor is what `requires-python` claims and was never verified; parsing every module with `ast.parse(feature_version=(3, 10))` finds nothing incompatible, but that only covers syntax. `tests/integration` is excluded deliberately rather than left to skip.
+
+**package** — builds a wheel and asserts `mdpilot/knowledge/*.md` is inside it. That regression is invisible to every other job, because they all run an editable install; without the `package-data` line a wheel ships the code and none of the prose and every `decide()` fails on its first chunk read.
+
+**The six lint findings, all fixed**: an f-string with no placeholders, an unused import, a blind `pytest.raises(Exception)` on a frozen dataclass (now `FrozenInstanceError`), and three `zip()` calls without `strict=`. The last were worth the attention — two are same-length by construction (`strict=True`), one is the pairwise `zip(xs, xs[1:])` idiom where the shorter second argument is the point (`strict=False`, stated).
+
+401 unit tests pass; `ruff check` clean.
+
+### 2026-08-26 (very late) — Contacts CVs are fractions; viewer aligned; headless runner
+Branch `test`. Three fixes from reading a real campaign's free-energy plot.
+
+**`ContactsCV` now renders a fraction, always.** The raw `CONTACTMAP ... SUM` is an intermediate (`<label>_count`) and the CV exposed under the label is that count divided by the pair count, via `COMBINE`. A campaign was judging its states on a normalised fraction (0.3 / 0.7) while biasing the raw count, with both carrying the name `native_contacts_fraction` — so the free-energy axis ran to 10 where every threshold in the campaign lived below 1. A count and a fraction of the same contacts are the same coordinate scaled; only one of them can be compared with the rest of the campaign. `cv_series` divides to match, and the contacts SIGMA floor/ceiling are still stated in *contacts* but divided by the pair count, so "half a contact" keeps meaning that whatever the map size.
+
+**The viewer superposes and centres.** `trajectory_pdb` now calls `superpose(traj, 0)` and `center_coordinates()`. Centre-of-mass drift across frames is 0.0000 nm where it was free to wander, and the residual RMSD (0-0.544 nm on a real round) is conformational change rather than tumbling.
+
+**`python -m mdpilot.run <task.yaml> <work_dir>`** — the headless counterpart to the app, and the piece missing for server use: the only campaign CLI was `run_cln025.py`, hardcoded to one task file. Unlike the app, omitting `--biased-cap-ns` keeps the budget the file asked for rather than overriding it.
+
+401 unit tests pass (4 new).
+
+### 2026-08-26 (night, last) — The upper wall is measured from the simulation
+Branch `test`. `bias_designer.box_limited_wall` fits the solute's widest extent against the CV over the source trajectory and solves for the extent at which only the nonbonded cutoff of solvent would remain between the solute and its periodic image. `design_upper_wall` uses it as the position when the campaign configured none, and records it either way so a configured wall beyond what the box can hold is flagged rather than silently honoured.
+
+**It reproduces F11 as a pre-run check.** On `cln025_metad`'s own trajectory the derived limit is 0.55 nm; that campaign ran with a hand-chosen 0.8 nm wall. On `ui_campaign_chignolin` the limit is 0.38 nm. Both would have been refused-with-warning before a single biased round.
+
+**It declines rather than guessing.** A 0.05 ns folded vanilla round has too little extent variation to extrapolate from, and returns None — the caller then emits the F6 warning ("no wall could be set") instead of inventing a ceiling.
+
+**Three warnings, routed to the ledger** rather than only into plumed.dat, which the scientist never reads: an unbounded CV with no wall (F6), a wall beyond the box limit (F11), and a wall the campaign did not choose (say so, and note that if the task's unfolded state lies beyond it the box is too small for the question).
+
+**Measured along the way, worth recording:** padding is applied correctly but not as `span + 2*padding`. Building CLN025 with equilibration disabled gives L = 3.76 / 4.26 / 4.78 nm for padding 1.0 / 1.5 / 2.0, i.e. clearances of 0.88 / 1.10 / 1.38 nm around the *folded* structure. The box grows by roughly the padding increment, not twice it. This is exactly why the wall is better measured than derived from the padding a campaign asked for.
+
+399 unit tests pass (8 new).
+
+### 2026-08-26 (night, later) — CV-switch escape hatch for trapped walkers
+Branch `test`. Recorded as F13. Trap detection is computed, not inferred: `_confinement` reports `confined_to_state` and `rounds_confined` from the per-round observable files, alongside `observable_min/max_this_round` and the remaining CV-switch allowance. `action_switch_cv.md` names `rounds_confined >= 2` with a growing `fes_depth_kj_per_mol` as the clearest trap signal, and says why the cumulative `cv_min`/`cv_max` cannot show it.
+
+`max_cv_switches` is now a task-file field (`sampling.max_cv_switches`) and is reported to the scientist as used/remaining.
+
+Tested three ways: `_confinement` replayed against the real campaign's data; an end-to-end fake-adapter campaign that replays the trap and asserts the loop offers the switch only while the allowance lasts, honours it, and rebuilds on a different coordinate; and two live tests against the real model — one that must escape a trap, one that must *not* mistake a healthy unconverged round for one.
+
+391 unit tests pass (4 new), plus 2 live.
+
+### 2026-08-26 (latest) — Correcting F12: the app was dropping the system spec
+Branch `test`. Traced the "wrong molecule" campaign properly instead of accepting the first explanation that fit. `2RVD` is chignolin; the agent was right. `app.py` called `run_campaign` without an adapter, so the default `SystemSpec.trpcage()` (1L2Y) was used and the task file's whole `system:`/`integrator:` block — PDB, force field, padding, 340 K — was discarded silently. F12 rewritten.
+
+`TaskFile.build_adapter` now owns that construction so it cannot be forgotten; `app.py` and `benchmarks/run_cln025.py` both use it. Two other real defects fixed in the same pass: `observable_normalize` was missing from the setup agent's tool schema (so the agent literally could not express a fraction, which is why it kept emitting raw counts), and observable arity moved into `ObservableSpec.__post_init__` where it needs no topology — a `contacts` observable with one selection per strand now fails at load with a message explaining that contacts form pairs within a single group.
+
+375 unit tests pass (4 new).
+
+### 2026-08-26 (late) — Pre-flight checks, after a campaign ran 40 minutes toward an unreachable criterion
+Branch `test`. Recorded as F12. `mdpilot/preflight.py` runs after `adapter.start()` and before the first step: `check_residue_count` compares the description's claim against the fetched structure, `check_observable_scale` compares the observable's value on the starting structure against its own state thresholds. Both raise; a `preflight_ok` event carries the numbers into the UI log.
+
+`ObservableSpec.normalize` (contacts only) divides by the native-pair count, so a task file can say "fraction" and mean it. `description` is threaded into `run_campaign` for the check and deliberately kept *out* of the locked config — editing prose must not stop a resume.
+
+`_FakeAdapter` now writes a real four-residue PDB rather than the string "PDB", so every loop test exercises the pre-flight path a real adapter takes. Two loop tests assert MD never started: `adapter.run_calls == []`.
+
+Test data is the real thing — the drifted description, `2061.0`, and `(0.3, 0.7)` are the values from `campaigns/ui_campaign`. Parametrised cases pin the cases that must *not* fire: a folded start above its band, an unfolded start below it, CA-RMSD reading exactly 0 against its own reference, and an ambiguous description ("a 10-residue core inside a 30-residue construct") which is not treated as a claim at all.
+
+371 unit tests pass (22 new).
+
+### 2026-08-26 (night) — Streamlit control surface (`app.py`)
+Branch `test`. **This overrides a stated scope decision**: `ROADMAP.md` lists a web UI under *Deliberately out of scope* — "Terminal + notebooks only until at least Milestone 6". Recorded here rather than left implicit. The justification is that the thing MDPilot is *about* — the scientist deciding, mid-campaign, whether to extend, stop or pivot — reads poorly as a terminal transcript, and a three-column view makes the reasoning legible next to the trajectory and surface it was taken on. It is a view over the existing backend and adds no science: every number it shows is read from `campaigns/<name>/`.
+
+**One core change, deliberately small.** `run_campaign(on_event=...)` — an observer called with `(name, payload)` at `campaign_start`, `round_start`, `simulated`, `report`, `decision`, `override`, `pivot`, `campaign_end`. It cannot influence the run and `_emit` swallows anything it raises: a multi-hour biased run must not die because something watching it threw. Verified by running a campaign with an observer that raises on every event — it completes normally. Every `return` now goes through `_finish`, so the outcome is always reported. This is not a UI-specific seam; a CLI progress bar or M5's HPC monitor wants the same thing, which is why it is a callback rather than the app monkeypatching the loop.
+
+**Structure.** Left: objective → setup agent → editable `task.yaml` → validate → *Lock & Run* (a worker thread; Streamlit forbids `st.*` off the main thread, so the worker only fills a queue the script drains on rerun). Middle: the formatted event stream, plus per-call token accounting from a recording Anthropic client so the setup agent's cache behaviour is visible. Right: campaign and round selectors defaulting to "Latest (agent-driven)", with py3Dmol structure, the free-energy surface, and the raw report.
+
+**Two bugs the build surfaced**, both fixed:
+- `mdtraj.save_pdb` takes a path, not a file object. Handing it a `StringIO` wrote the model to *stdout* and killed the calling script.
+- The viewer reloaded the full trajectory on every rerun — and the app reruns every 1.5 s while a campaign is running. Round 12 of `cln025_metad_run3` is a 59 MB DCD, so the UI was unusable during exactly the runs it exists to watch. Now strided at load (`md.open` for the frame count first) and memoised on `(path, mtime, size)`: 0.15 s instead of seconds.
+
+Verified headlessly with `streamlit.testing.v1.AppTest` — no exception, all three columns render, both selectboxes populate from real campaigns on disk. `streamlit`, `py3Dmol` and `matplotlib` are a `[ui]` extra, not dependencies; nothing under `src/mdpilot/` imports them. 349 unit tests pass (17 new).
+
+### 2026-08-26 (evening) — Force-field selection: vocabulary, guide, and it is now the agent's to choose
+Branch `test`. Recorded as D9. Before this the force field was not chosen by anything: `system.forcefield` sat in the loader's verified-but-fixed table and `setup_role.md` told the agent it was not adjustable. It is now a `SystemSpec` field, a task-file key, and an enum on the setup agent's tool schema generated from the vocabulary so the two cannot drift.
+
+`knowledge/forcefield_guide.md` is the selection guidance — water-model tradeoffs, ff14SB vs ff19SB (and why `amber19/tip3p` is a documented compromise, ff19SB having been parameterised with OPC), CHARMM36 as an independent family for cross-checking, the cross-engine constraint, and the gaps. It ends with "do not change the force field to change a result", which is the failure mode a system that can pick its own parameters invites.
+
+**Verified live on three requests, each with a different correct answer:** a cross-engine comparison chose `amber99sbildn/tip3p` and said why in its own description; a solvent-dynamics question chose `amber14/spce`; an ice-nucleation request chose the closest listed 4-site water and flagged that the campaign "cannot currently be honoured in full", naming the missing surface force field rather than inventing a key.
+
+Also: `padding_nm` joined the setup agent's schema in the same pass, so the F11 box lesson is something it can act on rather than something only a human can set. 332 unit tests pass (13 new).
+
+### 2026-08-26 (later still) — Dry run green; observable generalized; setup agent lands
+Branch `test`. Items 1, 2, 3 and 5 of the agreed plan. 312 unit tests pass.
+
+**1. Dry run (`campaigns/cln025_dryrun2`), exit 0.** First end-to-end exercise of the rewired entry path — task file -> `Ensemble` -> both adapters -> `run_campaign` -> OpenMM -> PLUMED -> `sum_hills` -> `decide`. Pivoted, 2 biased rounds, rendered `task_expectation` reached the scientist (its reason quotes "RMSD>4 Å"), new state-named `done_criterion.json` written, no warnings. `passed: false` is correct for a 0.1 ns shakedown.
+
+**3. `mdrun` no longer runs under a wall-clock ceiling.** `_GMX_TIMEOUT_SECONDS = 1800` bounded every `gmx` call including production dynamics; a 2 ns CPU round plausibly exceeds it and would have died mid-round leaving a partial `.gro`/`.cpt`. Setup subcommands keep the ceiling (a hang there means something is stuck on stdin); all four `mdrun` sites pass `timeout=_NO_TIMEOUT`, pinned by a call-site test. Walltime planning is M5's job, not a constant here. The finite-size half of item 3 is recorded separately as F11.
+
+**2. Observable generalized** — see D8. The test that documented the blocker (`test_a_non_protein_observable_is_refused_until_it_is_tunable`) became the test that proves it gone. Verified on real trajectory data: CA-RMSD, an end-to-end distance, Rg and native contacts all compute from `campaigns/cln025_metad/rounds/round_011.dcd`, and `make_report` produces a full bundle on a distance observable. Locked in the campaign config, omitted when it is the default so nothing already on disk is stranded.
+
+**5. Setup agent** — see D8. Two defects surfaced by running it live on "I want to learn about the chignolin folding and unfolding", both now fixed:
+- *The model wrote `characteristic_timescale_ns: 1.0` while its own source said "~1 µs".* A unit slip in the one decision-driving number with no second copy, and it inverts the pivot decision — the scientist would read 1 ns, conclude unbiased MD reaches the transition easily, and never switch. `_check_timescale_units` now refuses a timescale more than an order of magnitude from the unit its source names. Tolerance is one order of magnitude either way, so 0.6 µs stated as 600 ns still passes; the first version was tighter and rejected `cln025_folding.yaml` itself.
+- *The retry loop was malformed and 400'd on its first retry.* It answered a refused `tool_use` with a bare user turn; the API requires a matching `tool_result` immediately after. So the loop never actually retried, and the failure escaped the `except ValueError`, leaving an invalid task file at `out_path`. Unit tests missed it because the fake client does not enforce the API protocol — confirmed against the real API before fixing. Candidates are now validated from a scratch path so `out_path` only ever holds an accepted file.
+
+With both fixed the agent self-corrects: it now emits `1000` and spells the conversion out in the source ("~1 µs (≈1000 ns)"). It still needs human review — the citation it produced named Shaw as first author where Lindorff-Larsen is correct.
+
+### 2026-08-26 (later) — Campaign config compares by meaning, not by bytes
+Branch `test`. `store.init_campaign` compared the serialized config JSON byte-for-byte, so *adding* a config key stranded every campaign already on disk — their stored config could not contain a key that did not exist when they started. This had already happened: all four campaigns under `campaigns/` were unresumable, stranded by the commits that added `state_thresholds` and `min_recrossings`. Nothing surfaced it because all four had finished.
+
+**Fix.** `_LEGACY_CONFIG_DEFAULTS` maps each later-added key to the behaviour in force *before* it existed — deliberately not to the parameter's current default, which is a different thing and would be wrong the moment a default changes. Both configs are normalized through it before comparison. A campaign that predates a key resumes when the requested value matches what it actually ran under, and is still refused when it does not. Read-time only; the stored config is never rewritten, so a campaign's record keeps saying what was actually recorded.
+
+**Verified against the real databases** (copies, not the originals): all four now resume under their own parameters. `cln025_metad` still refuses against the current task file, correctly — it ran with `min_recrossings=1` and no task states, so recrossings came from the F9 surface-basin fallback, and reopening it under task-state counting would change when it is allowed to end for rounds already judged. Rendering `task_expectation` also changed that locked string, which is a genuine value change and not something a compatibility table should paper over.
+
+**Forget-proofing.** `test_every_config_key_is_covered_by_the_compatibility_table` runs a campaign with every optional parameter set and asserts each recorded key is either in `_ORIGINAL_CONFIG_KEYS` or has a compatibility entry. Adding a config key without one now fails a test instead of silently stranding in-flight campaigns; confirmed by removing an entry and watching it fire.
+
+**Also:** the refusal now names the differing fields instead of printing two JSON blobs, and marks values that were inferred rather than recorded (`stored=1 (not recorded; the behaviour before this key existed)`).
+
+288 unit tests pass (9 new).
+
+### 2026-08-26 — Task file becomes the campaign contract; `task_expectation` rendered
+Branch `test`. Recorded as D7. `src/mdpilot/task_file.py` + `tests/unit/test_task_file.py` (20 tests); `run_cln025.py` rewired to load the file instead of hand-assembling kwargs, producing byte-identical `run_campaign` arguments in both dry-run and full mode.
+
+**Two things found by doing it.** `trpcage_convergence.yaml` never parsed — its `diagnostics:` block mixed a sequence and a mapping key, invalid YAML since it was written, and nothing had ever loaded it. Fixed. And the `observable.name` verification refused a ligand-distance test case, which is correct and surfaced the protein-CA blocker as a tested fact.
+
+**Pre-existing, not caused by this work:** all four on-disk campaigns are already unresumable. `min_recrossings` and `state_thresholds` were added to the config lock after they were created (`git show HEAD` confirms both keys predate this session), so their stored configs are missing keys the loop now computes. `store.py` has migration machinery for the `rounds` *schema* but none for the campaign *config*, so every added key strands every in-flight campaign. Impact today is nil — all four finished — but a 20 ns run interrupted after a future key lands would be lost. Rendering `task_expectation` also changes that locked string, so campaigns started under the authored prose cannot resume under the rendered one either.
+
+279 unit tests pass (9 new here, on top of the day's earlier `Ensemble` work).
+
+### 2026-08-25 (later) — `Ensemble` on the spec: temperature and timestep become campaign parameters
+Branch `test`. First slice of making setup tunable. `_TEMPERATURE_K` and `_TIMESTEP_FS` / `_TIMESTEP_PS` were adapter class constants — in the GROMACS case interpolated into the mdp templates *at import*, so no campaign could reach them. They now live on `SystemSpec.ensemble`.
+
+**Why the spec and not an adapter keyword argument.** `run_campaign` already locks `adapter.spec.to_dict()` into the campaign config, so every field added to the spec is covered by the resume guard for free. An adapter keyword would need its own config key, and `run_campaign`'s docstring had been asserting that temperature and timestep were "covered by the engine lock" — true only while they were immutable class constants. That coverage would have vanished silently the moment they became settable, and a campaign could have been resumed at a different temperature with the guard none the wiser. Test: `test_ensemble_mismatch_on_resume_is_rejected`.
+
+**Backward compatibility.** `SystemSpec.to_dict()` emits `ensemble` only when it differs from the default, because `store.init_campaign` compares config JSON byte-for-byte. Verified against the real `campaigns/cln025_metad` and `_run3` databases: both still rebuild an identical `system_spec`. The same rule is used for the new `bias_pace` / `bias_factor` config keys.
+
+**Scope, deliberately two fields.** Water model, force field, padding, ionic strength and pressure stay hardcoded per adapter; they get fields when a campaign needs them, per the rule `SystemSpec` already follows. `timestep_fs > 2.5` raises rather than silently integrating unstably — neither adapter implements HMR and both constrain h-bonds only.
+
+**Also landed:** `bias_pace` / `bias_factor` pass-through on `run_campaign`. `design_bias` already accepted both; the loop never passed them, so no campaign could change the shape of its own bias. `None` means "let `bias_designer` decide", so its defaults stay the single definition. Worth exercising: γ=10 flattens barriers to ~γ·kT ≈ 25 kJ/mol, and the CLN025 surface reached `fes_depth ≈ 41 kJ/mol`.
+
+259 unit tests pass (7 new).
+
+### 2026-08-25 — Prompt knowledge base: the scientist retrieves its rules per round
+Branch `test`. `scientist.py` held one static system prompt covering both phases and the whole CV vocabulary, sent unchanged every round: 10,835 chars / ~2,900 tokens, of which roughly half described actions the round could not take. Split into six Markdown chunks under `src/mdpilot/knowledge/`, assembled per round by `build_system_prompt`.
+
+**Retrieval is by key, not similarity.** The keys are the facts that already select the tool schema — phase, whether the tool carries a `metad_proposal` field, whether `switch_cv` is offered. `can_propose_cv` is read off the selected schema rather than re-derived from `(phase, task_expectation, allow_cv_switch)`, so the vocabulary is present exactly when the field that consumes it is and the two cannot drift.
+
+| round type | ~tokens | vs before |
+|---|---|---|
+| vanilla, pivot possible | 1,650 | −44% |
+| vanilla, pure convergence | 1,030 | −65% |
+| metad, no switch left | 1,470 | −50% |
+| metad, switch offered | 2,455 | −16% |
+
+**No retrieval *within* `cv_vocabulary`, deliberately.** The obvious next filter is "show only the relevant CV types", and it is wrong: the scientist is choosing among them. `cln025_folding.yaml` already says pre-selecting a CV "would decide the science the agent exists to decide", and runs 1 and 3 differed only in the model picking `contacts` over `rmsd` unprompted. The chunk is retrieved whole or not at all.
+
+**Two latent prompt defects surfaced by the split**, both from text that assumed every round saw everything:
+- `reason` instructed the model to cite `plateau_reached`, `ess`, `exploring`, `n_basins`, `bimodality_coefficient` — all vanilla-only fields that `phase_metad` explicitly says are absent. Every biased round since the phase split was being asked for numbers it had been told it would not get. Now phase-neutral.
+- `role` said the report was "Phase-dependent; see below" and described a two-phase prompt. Reworded to say the round carries one phase's rules only.
+
+**Caching.** Four assemblies, constant within a campaign phase, so each caches after its first round; the pivot invalidates the prefix on the one round the assembly changes anyway. All four clear Sonnet 4.6's 1024-token minimum, including the smallest: `cache_control` sits on the system block but the cached prefix is tools → system, so the ~715-token tool schema counts toward it. A pure-convergence vanilla round measures a 1,014-token system block and a 1,729-token prefix, and caches (`cache_read_input_tokens` 1,413 on the second call, measured 2026-08-25). Retrieval cannot trim a round out of the cache — an earlier draft of this entry said it could, having compared the system block against the minimum rather than the prefix.
+
+Content moved verbatim: each chunk was verified whitespace-normalised-identical to the section it replaced before any edit was applied. `[tool.setuptools.package-data]` added — without it a non-editable install ships the code and none of the prose, and every `decide()` fails on the first chunk read; verified by building a wheel and loading a chunk from a clean install. 247 unit tests pass (8 new).
+
+### 2026-08-24 — External review pass: two convergence-path defects, and the loop stops guessing at physics constants
+Branch `test`. A full read of the tree surfaced two defects on the path that decides when a campaign is allowed to end, plus three structural gaps. No campaign was re-run; everything here is unit-covered.
+
+- **F10 — drift was identically 0.0 at exactly two FES estimates.** The one that mattered: it could hand `fes_converged=true` to `_refuse_premature_stop`, which is the single mechanism standing between the scientist and declaring victory against the diagnostic. Reproduced, fixed, and covered. Full write-up in F10.
+- **F9's "no longer reachable by accident" was half true.** `decide()` picked its tool by phase alone, so `switch_to_metad` was offered on every vanilla round regardless of whether a `task_expectation` existed to judge it against — and a campaign with neither key passed the entry guard and could still pivot into the F9 fallback. A `_CONVERGENCE_TOOL` (`extend | stop`) now covers that case. Note the shape of the miss: the guard was placed at `run_campaign`'s entry, where the *arguments* are, while the thing that needed guarding was the *action space*, two modules away. The test that should have caught it asserted the false premise in its docstring instead.
+- **The loop no longer hardcodes the timestep or the thermostat.** `_TIMESTEP_FS = 2.0` and `_METAD_TEMPERATURE_K = 300.0` sat in `loop.py` as values that merely happened to match both adapters, with nothing connecting them. `MDAdapter` gains `timestep_fs` and `temperature_k`; the loop reads both off the adapter once and threads them through `_extend_steps`, the biased-step budget, `metad_report` and `design_bias`. This is an M3 gap, not a tidiness one — the whole point of the Protocol is that the loop does not know which engine it has, and it was quietly assuming two physics constants of one. A wrong dt makes `extra_ns` stop meaning nanoseconds; a wrong T makes PLUMED compute its well-tempered scaling against a temperature the thermostat is not running at, with no error anywhere. New `tests/unit/test_adapter_contract.py` pins both adapters and their agreement.
+- **`min_recrossings` joined the locked config** — see the F9 addendum.
+- **`architecture.md`'s file structure now distinguishes what exists from what is planned.** It listed `reasoning/`, `ensemble/`, `execution/`, `tools/`, `configs/`, `notebooks/`, three diagnostics modules and three memory modules that have never existed, alongside benchmark task names that were never used. CLAUDE.md §1 sends coding sessions to that file to verify load-bearing decisions, so the drift was self-inflicted. Every path in the "exists" block was checked against the tree.
+- **In-flight contacts-CV work landed first**, as its own commit: PBC-aware native-pair selection, the `MM == 2*NN` import-time invariant, and `MetadProposal.cv_type` catching up to `_CV_TYPES` with a test that pins all three copies of the vocabulary together.
+- Tests: **239 unit + 1 skipped** (was 223), ~14 s.
+- **Known residual:** `run_campaign` still *accepts* a `switch_to_metad` decision from a campaign with no `task_expectation`. The model can no longer produce one, but a caller stubbing `decide` can — which is exactly how the pivot orchestration tests drive that branch, so closing it would mean reworking fourteen of them. Left open deliberately; the reachable path is closed.
+- **Open / next:** unchanged from the previous entry (warm-start handoff across a pivot or switch; `switch_cv` unexercised by a live campaign), plus: `scipy` is declared in `pyproject.toml` and imported nowhere.
 
 ### 2026-08-21 (later) — Run 3: M4 done-criterion **met**
 `campaigns/cln025_metad_run3/`, `biased_budget_exhausted` at exactly 20.0 ns over 11 biased rounds. `done_criterion.json`: **`passed: true`**, `rmsd_recrossings = 3` against 2 required, CA-RMSD spanning 0.024-8.00 A, both states reached.

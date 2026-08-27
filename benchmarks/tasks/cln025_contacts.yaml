@@ -1,0 +1,100 @@
+# CLN025 folding judged on the fraction of native contacts.
+#
+# The companion to `cln025_folding.yaml`, which judges the same system on
+# CA-RMSD. Two things make this one worth having separately:
+#
+#   * `contacts` is bounded on both sides, where RMSD-to-native is unbounded
+#     above. F6 and F11 are both consequences of that: the RMSD campaign drove
+#     the chain into an ever-larger unfolded space, and then into contact with
+#     its own periodic image.
+#   * It states its thresholds as a *fraction*, which is only expressible
+#     because the observable declares `normalize: true`. A task file cannot
+#     otherwise know the native-pair count, which depends on a topology it has
+#     not seen — and hard-coding a guess is exactly how a campaign came to
+#     measure 938-2140 under the name `native_contacts_fraction`.
+
+name: cln025_contacts
+description: |
+  Chignolin variant CLN025 (PDB 5AWL, sequence YYDPETGTWY), a 10-residue
+  beta-hairpin, in TIP3P water at 300 K. Sample the folding/unfolding
+  transition and recover the free-energy surface along the slow coordinate.
+  The campaign is judged on the fraction of native CA-CA contacts formed,
+  which runs from ~1 in the folded hairpin to ~0 when extended.
+
+# Reproducibility. Covers the integrator, the barostat's Monte Carlo moves and
+# the initial velocities — but NOT solvation: `Modeller.addSolvent` takes no
+# seed, so two campaigns at the same seed differ by a handful of waters (F8).
+seed: 42
+
+# How the system reaches the target state before production. Picoseconds, not
+# steps, so changing the timestep does not silently change how long it was
+# equilibrated for.
+equilibration:
+  nvt_ps: 100.0          # staged heating at constant volume
+  npt_ps: 100.0          # density relaxation at the target pressure
+  heat_start_k: 50.0     # bottom of the ramp
+  heat_stages: 6
+
+system:
+  starting_pdb: "5AWL"
+  forcefield: amber14/tip3p
+  padding_nm: 1.5              # post-F11; sized for the unfolded ensemble, not the folded start
+  ionic_strength_M: 0.15
+  nonbonded_cutoff_nm: 1.0     # declared and checked against the adapter
+  electrostatics: PME
+
+integrator:
+  # Thermodynamic state — real parameters.
+  temperature_K: 300.0
+  pressure_bar: 1.0
+  timestep_fs: 2.0
+  # Coupling algorithms and nonbonded treatment: declared here and checked
+  # against what the engine actually does, so the file cannot drift from the
+  # run. Not yet choosable — OpenMM's LangevinMiddle / MonteCarloBarostat are
+  # idiomatic equivalents of GROMACS's sd / C-rescale, not interchangeable.
+  type: LangevinMiddle
+  friction_per_ps: 1.0
+  barostat: MonteCarloBarostat
+  barostat_interval_steps: 25
+  constraints: HBonds
+
+# CA-level contacts, matching the 0.75 nm cutoff `cv_designer` uses. An
+# all-atom selection here would apply a CA cutoff to hydrogens and inflate the
+# count by two orders of magnitude.
+observable:
+  cv_type: contacts
+  selections: ["name CA"]
+  name: native_contacts_fraction
+  normalize: true              # divide by the native-pair count -> a real fraction on [0, 1]
+  reference: campaign_topology
+
+expectation:
+  objective: |
+    Sample the folding/unfolding transition in both directions and recover the
+    free-energy surface along the slow coordinate.
+  characteristic_timescale_ns: 800.0
+  timescale_source: "CLN025 folding time 0.6-1.0 us; Lindorff-Larsen et al. 2011, Science 334:517"
+
+sampling:
+  # How many times the scientist may replace the biased coordinate. A contact
+  # count cannot lead a disordered chain back to folded (F13), so one revision
+  # is the escape hatch out of that trap.
+  max_cv_switches: 1
+  # Insurance for that switch, not for the starting CV. `contacts` is bounded
+  # and needs no wall, but the natural replacement is a length-dimensioned
+  # coordinate — the model reaches for `rmsd` — and RMSD-to-native is unbounded
+  # above (F6). A campaign that allows a CV switch should carry a wall in case
+  # the replacement needs one; `design_upper_wall` ignores it for CV types that
+  # do not.
+  cv_upper_wall_nm: 0.8
+
+done_criterion:
+  pivot_required: true
+  # Positions on the contact fraction: most native contacts formed vs mostly
+  # broken. Unlike the RMSD task these bands sit inside a bounded coordinate,
+  # so neither side can run away.
+  states:
+    low:  { name: "unfolded",             threshold: 0.3 }
+    high: { name: "native beta-hairpin",  threshold: 0.7 }
+  min_recrossings: 2
+  max_biased_ns: 20.0

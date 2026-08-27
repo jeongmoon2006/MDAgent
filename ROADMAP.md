@@ -43,15 +43,21 @@ For architecture context, see `docs/architecture.md`.
 
 *Scope amended from the original roadmap:* MDCrow integration deferred indefinitely. Integrating an LLM-orchestrated setup agent would conflict with the "no multi-agent natural-language dialogue" anti-goal; calling the underlying setup libraries deterministically from adapters honors the spirit of "don't rebuild MDCrow." Revisit only when a campaign needs natural-language setup the scientist itself can't generate structured. Recorded as D5 in `docs/activity-log.md`.
 
+*Revisited 2026-08-26 (D8):* setup-from-natural-language now exists as `setup_agent.py`, but not as an orchestrator — it emits a reviewable task file and deterministic Python builds from it, so no LLM ever drives a setup tool and there is no dialogue. MDCrow integration remains deferred.
+
 ## Milestone 4 — Sampling strategy decisions
 
 **Goal:** the scientist knows when vanilla MD isn't enough.
 
-- `sampling/strategy_selector.py` (vanilla / REMD / metaD / umbrella)
+- ~~`sampling/strategy_selector.py`~~ — not built. With only vanilla and metaD
+  implemented the choice is binary and lives in the scientist's action space;
+  a selector module would have been a dispatch table with two entries.
 - `sampling/cv_designer.py` for metadynamics
 - `adapters/plumed_writer.py`
 
 **Done when:** on a benchmark designed to require enhanced sampling (e.g., a small protein with a known slow conformational transition), the scientist (a) detects that vanilla MD is inadequate, (b) selects metadynamics with a reasonable CV, and (c) the resulting run actually crosses the barrier.
+
+**Met 2026-08-21** on CLN025 (run 3): the scientist pivoted from a pinned vanilla round, proposed a native-contacts CV unprompted, and the biased run recrossed. Two guardrails came out of the campaigns that failed first — F6 (RMSD-to-native is one-way) and F11 (the box was too small for the unfolded ensemble it sampled). See `docs/activity-log.md`.
 
 ## Milestone 5 — HPC execution
 
@@ -78,7 +84,7 @@ For architecture context, see `docs/architecture.md`.
 
 These are not in the roadmap, on purpose. Add only with strong justification.
 
-- **Web UI.** Terminal + notebooks only until at least Milestone 6.
+- ~~**Web UI.** Terminal + notebooks only until at least Milestone 6.~~ **Overridden 2026-08-26** — `app.py` is a Streamlit control surface over the existing backend. The justification is that the thing MDPilot is *about* — the scientist deciding mid-campaign whether to extend, stop or pivot — reads poorly as a terminal transcript. It adds no science; every number it shows is read from `campaigns/`. Recorded in `docs/activity-log.md`.
 - **Free energy methods beyond MM/PB(GB)SA.** Out of scope until enhanced sampling is solid.
 - **ML potentials (MACE, Allegro, ANI).** Future work; classical force fields are sufficient to validate the closed-loop reasoning, which is the actual contribution.
 - **Multi-user / shared deployment.** Single-researcher tool until adoption justifies the complexity.

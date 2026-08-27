@@ -39,6 +39,8 @@ This is **not** a multi-agent design pattern. There are no multiple persistent a
 
 The test for spawning a subagent: does the subtask have a clean input and a structured output? If yes, subagent. If it needs the campaign narrative to make sense, it stays with the scientist.
 
+`setup_agent.py` is the worked example: bounded input (a sentence plus a fixed corpus), structured output (a task file), no need for campaign narrative, and it dies when the file is written. It runs *before* the loop, so the scientist still sees exactly one LLM call per round.
+
 ### Externalized state
 
 The hypothesis ledger, findings log, and trajectory store live on disk (SQLite + filesystem) — not in the agent's context window. The scientist reads what it needs each round and writes back what it learned. Context is for active reasoning, not memory.
@@ -61,6 +63,12 @@ Full traces stay on disk for provenance and reproducibility.
 
 ## File structure
 
+Two things are shown together below: what exists today, and the shape the
+roadmap is heading toward. **Lines marked `[planned]` are not in the tree** —
+they are milestones, not modules. Check the repository before assuming a path
+here is importable; this section has drifted from reality before, and
+`CLAUDE.md` sends coding sessions here to verify load-bearing decisions.
+
 ```
 mdpilot/
 ├── README.md
@@ -69,100 +77,113 @@ mdpilot/
 ├── pyproject.toml
 ├── .env.example
 │
+├── .github/workflows/ci.yml           # lint + unit tests (3.10, 3.12) + wheel check
+├── app.py                             # Streamlit control surface (optional extra)
+│
 ├── src/mdpilot/
 │   │
-│   ├── orchestrator/                  # outer loop: plan → run → analyze → decide
-│   │   ├── scientist.py               # top-level LLM agent (THE agent)
-│   │   ├── planner.py                 # initial campaign plan
-│   │   ├── replanner.py               # revises plan after each round
-│   │   └── state.py                   # campaign state machine
+│   ├── task_file.py                   # task YAML -> SystemSpec + run_campaign kwargs
+│   │                                  #   (checks declared-but-fixed fields)
+│   ├── run.py                         # headless campaign runner (server-side)
+│   ├── forcefields.py                 # validated protein+water pairs, per engine
+│   ├── preflight.py                   # checks run on the built structure, before MD
+│   ├── observables.py                 # the coordinate every round is judged on,
+│   │                                  #   declared as a CV (default: CA-RMSD)
+│   ├── setup_agent.py                 # request -> reviewable task file (the one
+│   │                                  #   LLM call outside the round loop)
 │   │
-│   ├── reasoning/                     # the scientific judgment core
-│   │   ├── hypothesis.py              # open hypotheses + evidence ledger
-│   │   ├── decision_policy.py         # extend? switch method? add replicas? stop?
-│   │   ├── rubrics.py                 # structured criteria per decision type
-│   │   └── prompts/
-│   │       ├── convergence_judge.txt
-│   │       ├── sampling_judge.txt
-│   │       └── followup_planner.txt
+│   ├── orchestrator/                  # outer loop: plan → run → analyze → decide
+│   │   ├── scientist.py               # the single LLM call per round
+│   │   └── loop.py                    # the mechanical campaign state machine
+│   │
+│   ├── knowledge/                     # the scientist's prompt, as retrievable prose
+│   │   ├── role.md                    # who it is + the four structured inputs
+│   │   ├── phase_vanilla.md           # equilibrium rubric + pivot rule
+│   │   ├── phase_metad.md             # free-energy rubric
+│   │   ├── action_switch_cv.md        # when to revise the biased coordinate
+│   │   ├── cv_vocabulary.md           # CV types, arities, bounded-vs-unbounded
+│   │   ├── output_contract.md         # extra_ns / ledger_note / reason
+│   │   ├── setup_role.md              # [setup agent] what it emits, and for whom
+│   │   └── forcefield_guide.md        # [setup agent] how to choose a force field
 │   │
 │   ├── diagnostics/                   # mechanical convergence + adequacy (no LLM)
-│   │   ├── block_averaging.py
-│   │   ├── autocorrelation.py
-│   │   ├── effective_sample_size.py
-│   │   ├── pca_drift.py               # is the system still exploring?
-│   │   ├── replica_agreement.py       # cross-replica convergence
+│   │   ├── block_averaging.py         # Flyvbjerg-Petersen SEM plateau
+│   │   ├── autocorrelation.py         # Geyer IMPS tau_int + ESS
+│   │   ├── exploration.py             # pinned in one basin, or visiting several?
+│   │   ├── free_energy.py             # HILLS -> FES, well-tempered convergence
 │   │   └── report.py                  # structured diagnostic bundle
 │   │
 │   ├── sampling/                      # enhanced sampling decisions
-│   │   ├── strategy_selector.py       # vanilla / REMD / metaD / umbrella
-│   │   ├── cv_designer.py             # propose collective variables
-│   │   ├── ladder_designer.py         # REMD temperature ladder
-│   │   ├── window_designer.py         # umbrella sampling windows
-│   │   └── metad_config.py            # bias height, width, deposition rate
-│   │
-│   ├── ensemble/                      # multi-trajectory reasoning
-│   │   ├── replica_manager.py
-│   │   ├── cross_replica_stats.py
-│   │   ├── markov_state.py            # MSM construction from ensemble
-│   │   └── pose_clustering.py
+│   │   ├── cv_designer.py             # CV proposal -> resolved atom indices
+│   │   └── bias_designer.py           # SIGMA / HEIGHT / PACE from the trajectory
 │   │
 │   ├── adapters/                      # MD engines behind the MDAdapter Protocol
 │   │   ├── base.py                    # MDAdapter Protocol (engine contract)
+│   │   ├── system_spec.py             # engine-agnostic "what to simulate"
 │   │   ├── openmm_adapter.py          # OpenMM implementation
 │   │   ├── gromacs_adapter.py         # GROMACS implementation (M3)
-│   │   ├── mdcrow_adapter.py          # optional natural-language setup (deferred)
 │   │   └── plumed_writer.py           # generate PLUMED input files (M4)
 │   │
-│   ├── execution/                     # HPC-aware run management
-│   │   ├── slurm.py
-│   │   ├── job_monitor.py             # async polling, partial failures
-│   │   ├── checkpoint.py
-│   │   └── walltime_planner.py
-│   │
-│   ├── memory/                        # campaign-level persistence
-│   │   ├── trajectory_store.py        # what was run, where, with what params
-│   │   ├── findings_log.py            # what we learned per round
-│   │   └── provenance.py              # reproducibility metadata
-│   │
-│   └── tools/                         # exposed to the LLM as tool calls
-│       ├── analyze_trajectory.py
-│       ├── propose_followup.py
-│       ├── extend_simulation.py
-│       ├── switch_method.py
-│       └── stop_campaign.py
-│
-├── configs/
-│   ├── defaults.yaml
-│   ├── policies/
-│   │   ├── conservative.yaml          # extend before switching methods
-│   │   └── exploratory.yaml           # try enhanced sampling sooner
-│   └── budgets/
-│       └── gpu_hours.yaml
+│   └── memory/                        # campaign-level persistence
+│       └── store.py                   # SQLite: campaign / rounds / ledger
 │
 ├── benchmarks/
 │   ├── tasks/
-│   │   ├── villin_convergence.yaml
-│   │   ├── trpcage_folding.yaml
-│   │   └── alchemical_fep_check.yaml
-│   ├── runners.py
-│   └── scoring.py
+│   │   ├── trpcage_convergence.yaml   # M1 convergence-judgment task
+│   │   └── cln025_folding.yaml        # M4 done-criterion task
+│   ├── generate_trpcage_planted.py    # planted reference trajectories
+│   └── run_cln025.py                  # M4 campaign runner + done-criterion check
 │
 ├── tests/
 │   ├── unit/
 │   └── integration/
 │
-├── notebooks/
-│   ├── 01_diagnostics_demo.ipynb
-│   ├── 02_sampling_decisions.ipynb
-│   └── 03_full_campaign.ipynb
-│
 └── docs/
     ├── architecture.md                # this file
-    ├── related_work.md
-    ├── decision_policies.md
-    └── extending.md
+    ├── activity-log.md                # decisions, findings, session journal
+    └── related_work.md
 ```
+
+Planned, per `ROADMAP.md` — none of these exist yet:
+
+```
+src/mdpilot/
+├── reasoning/                         # [planned] judgment core split out of scientist.py
+│   ├── hypothesis.py                  # [planned] ledger currently lives in memory/store.py
+│   ├── decision_policy.py             # [planned] currently the prompt + loop branches
+│   └── rubrics.py                     # [planned]
+│
+├── sampling/
+│   ├── strategy_selector.py           # [planned] vanilla / REMD / metaD / umbrella
+│   ├── ladder_designer.py             # [planned] REMD temperature ladder
+│   └── window_designer.py             # [planned] umbrella sampling windows
+│
+├── ensemble/                          # [planned] M6-era multi-trajectory reasoning
+│   ├── replica_manager.py             # [planned]
+│   ├── cross_replica_stats.py         # [planned]
+│   └── markov_state.py                # [planned]
+│
+├── execution/                         # [planned] M5 HPC-aware run management
+│   ├── slurm.py                       # [planned]
+│   ├── job_monitor.py                 # [planned]
+│   └── walltime_planner.py            # [planned]
+│
+└── adapters/
+    └── mdcrow_adapter.py              # [planned, deferred indefinitely — see D5]
+
+configs/                               # [planned] policy + budget YAML
+notebooks/                             # [planned] demo notebooks
+```
+
+**Deliberately not built, though earlier drafts of this file listed them.**
+`tools/` — the scientist has no tool-dispatch layer; the loop calls
+`decide()` directly and everything else is deterministic Python. That is what
+"the LLM is called once per round" means in practice — plus one call per
+*campaign*, in `setup_agent.py`, before the loop starts.
+`diagnostics/effective_sample_size.py` — ESS is returned by
+`autocorrelation.py` rather than living alone. `orchestrator/planner.py`,
+`replanner.py` and `state.py` — `loop.py` is the state machine and there is no
+separate plan artifact yet.
 
 ---
 
