@@ -290,6 +290,26 @@ First campaign launched from the Streamlit UI. The task file said chignolin, `st
 
 **Also fixed:** the viewer plotted the raw `sum_hills` grid, which extends a few SIGMA past the outermost hill — so the axis ran to *negative contacts* and the frozen extrapolated shelf inflated the apparent depth (139 vs 116 kJ/mol). `metad_report` had always cropped; the plot now does too, using the round's own COLVAR snapshot.
 
+### F14 — A `contacts` observable was normalized twice, and pre-flight cannot see that direction (2026-08-28, landed on `main` 2026-09-03 as `6a56fe3`)
+`bias_designer.cv_series` divides a contact sum by the pair count, deliberately: the bias acts on the fraction PLUMED's `COMBINE` builds, so SIGMA has to be sized in fractions too (the 2026-08-26 contacts-are-fractions change). `observables._series` then divided by the pair count *again* whenever `normalize: true` was set.
+
+The flag was not merely wrong on one branch — it was inverted in effect:
+
+| declared | asked for | actually returned |
+|---|---|---|
+| `normalize: true` | fraction on [0, 1] | fraction / n_pairs |
+| `normalize: false` | count on [0, n_pairs] | fraction on [0, 1] |
+
+On CLN025 that put the campaign observable at **3e-4 against state thresholds of 0.3 and 0.7**. Every frame read as the same state, so `recrossings` was pinned at 0 for the life of the campaign, `fes_converged` could never be true, `_refuse_premature_stop` converted every `stop` into an `extend`, and the scientist read a working CV as a trapped walker. Same shape as F12: an observable that cannot reach its own done criterion.
+
+**Pre-flight could not have caught this, and F12 should not be read as covering it.** `check_observable_scale` fires when the observable is off by more than `_SCALE_TOLERANCE_BANDS = 10.0` band-widths. With a 0.4-wide band that accepts anything in [-3.7, 4.7], and 3e-4 sits comfortably inside. The tolerance is generous on purpose — a campaign legitimately starts wholly on one side of its bands — so the check only fires on a mismatch of *kind*, and a count reported where a fraction was intended is hundreds of band-widths out. Dividing by the pair count moves a value the other way, *toward* zero, and zero is inside the band for any threshold pair straddling it. The too-small direction is structurally invisible to that check, whatever the tolerance. The error message still names only the too-large cause.
+
+**Fix.** The branch is inverted: `cv_series` is the single computation, `normalize: true` takes its result unchanged, and only the raw-count case multiplies back by `len(cv.pairs)`.
+
+**The invariant that was missing.** `observables.py` routes both uses of the coordinate — size the bias, judge the campaign — through `cv_series` precisely so the two cannot disagree, and its module docstring says so. A second division at the call site reintroduced the disagreement anyway, and nothing compared the two results. Sharing an engine is not the same as sharing a result; the invariant needs a test, not an architecture. Three now exist: a normalized observable is >= 0.5 on its own reference, an unnormalized one is a count rather than a value on [0, 1], and `campaign_observable` agrees with `cv_series` exactly (`rtol=1e-6`) when `normalize: true`.
+
+**Verified on a real campaign, not only in tests.** `campaigns/ui_campaign_chignolin3` ran after the fix: round 1 (vanilla) mean Q = 0.788, and the biased rounds spanned 0.026-0.811, crossing both the 0.3 and 0.7 bands. Under the old code every one of those numbers would have read ~1/n_pairs of its true value. That validates the observable's *scale*; the campaign itself ended one recrossing short of its criterion on an 8 ns budget, which is a separate matter.
+
 ### D3 — Anti-goals (from CLAUDE.md, recorded here for searchability)
 - Do not rebuild MDCrow setup tooling — delegate via `adapters/`.
 - Do not build a persistent multi-agent system; subagents are ephemeral function calls returning structured artifacts, not prose.
@@ -300,6 +320,21 @@ First campaign launched from the Streamlit UI. The task file said chignolin, `st
 ---
 
 ## 2. Session journal
+
+### 2026-09-03 — `test` merged to `main`; CI's first real catch; F14 lands
+Branch `test` merged as PR #1 (`828ef7c`). All work since is on `main`, which is in sync with `origin/main`; `test` is 4 behind and no longer the working branch.
+
+**CI caught something no local run could (`cd6d163`).** `test_the_viewer_starts_idle` asserted the Campaign selectbox exists. That holds only when `campaigns/` has something in it — and `campaigns/` is gitignored, so on a fresh checkout there is nothing to pick and the viewer returns one step earlier, before the selectbox is created. The test passed on every developer machine and failed on every CI run. The app behaviour was right (an empty dropdown is worse than none), so the assertion moved to the invariant that holds either way: no round picker, no tabs, nothing rendered unasked. Verified against a clean clone, which is what CI sees: 400 passed, 2 skipped.
+
+This is the class of defect CI was added for, and it is worth naming: a test that reads gitignored state is not flaky, it is *locally unfalsifiable*. The rule is now in `CLAUDE.md` — `tests/unit` must not depend on anything gitignored — alongside the `generate_trpcage_planted` commands, since the M1 reference trajectories live under the same gitignored `benchmarks/data/`.
+
+**Docs consolidated (`0737814`).** README lost 120 lines and gained 30: environment setup, the two-environment conda/venv split and the test commands moved into `CLAUDE.md`, where coding sessions actually read them, leaving the README to say what MDPilot is and how to run one campaign. `architecture.md` gained **"The task file is the campaign contract"** — the three field modes, with the point that `verified` is the load-bearing one, because a file that declares a 1.0 nm cutoff against a run that uses 1.2 is otherwise undetectable and the file decays into documentation nobody trusts.
+
+**F14 landed (`6a56fe3`).** The `contacts` double-normalization — see the finding above rather than a second copy here. Found and fixed 2026-08-28 and validated the same day by `campaigns/ui_campaign_chignolin3`; committed 2026-09-03.
+
+404 unit tests pass, 1 skipped (no PLUMED runtime on this machine); `ruff check` clean.
+
+- **Open / next:** `test_remote` carries unmerged M5 work — `src/mdpilot/execution/slurm.py` (301 lines), `execution/worker.py`, `tests/unit/test_slurm_adapter.py` (284 lines), `scripts/pull_campaign.sh`, plus changes to `run.py` and `task_file.py`. It branched before the CI merge, so `main` needs merging into it first, and it adds its own activity-log entry that will want reconciling against F14. Two things to settle when picking it up. **Scope:** the roadmap lists `slurm.py` + `job_monitor.py` + `walltime_planner.py`; building all three before one job has been submitted is the speculative-abstraction trap M3 sidestepped by discovering `MDAdapter` from two real engines. The walltime planner in particular should wait until a real campaign has hit a wall. **What the first campaign is for:** the M4 done-criterion still rests on a single run (CLN025 run 3, 20 ns). `ui_campaign_chignolin3` ended at `recrossings=1` against a criterion of 2 with `fes_drift` at 24.6 kJ/mol on an 8 ns budget — underfunding, not a science defect, and compute budget is exactly what M5 buys. So the first unattended Slurm campaign can be the second M4 data point, and M5's own done-criterion (survive a node failure, a walltime overrun, an autonomously-decided extension) needs a long real campaign to exercise anyway. One campaign, two milestones.
 
 ### 2026-08-26 (end) — Continuous integration
 Branch `test`. `.github/workflows/ci.yml`: three jobs on push and PR.
