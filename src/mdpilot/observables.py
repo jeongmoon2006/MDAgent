@@ -55,12 +55,13 @@ class ObservableSpec:
     selections: tuple[str, ...]
     name: str
     scale: float = 1.0
-    # `contacts` only. Divides by the number of native pairs, which is known
-    # when the CV is resolved and not before — so without this a task file
-    # wanting a *fraction* of native contacts has to hard-code a constant tied
-    # to a topology it has not seen. That is exactly how a campaign came to
-    # measure 938-2140 under the name `native_contacts_fraction` against
-    # thresholds of 0.3 and 0.7.
+    # `contacts` only. True means the coordinate is the *fraction* of native
+    # pairs formed, on [0, 1]; False means the raw count, on [0, n_pairs]. The
+    # pair count is known only once the CV is resolved, so without this flag a
+    # task file wanting a fraction has to hard-code a constant tied to a
+    # topology it has not seen — which is how a campaign came to measure
+    # 938-2140 under the name `native_contacts_fraction` against thresholds of
+    # 0.3 and 0.7.
     normalize: bool = False
 
     # How many selections each type takes. Pure schema — knowable without a
@@ -181,10 +182,18 @@ def _series(
         reference=reference,
     )
     values = cv_series(cv, traj)
-    if spec.normalize:
-        # `design_cv` already refuses a contacts CV with no native pairs, so
-        # the denominator cannot be zero here.
-        values = values / len(cv.pairs)
+    if spec.cv_type == "contacts" and not spec.normalize:
+        # `cv_series` already returns the *fraction* — deliberately, because it
+        # is also what sizes SIGMA, and the bias acts on the fraction PLUMED's
+        # COMBINE builds. So `normalize: true` takes it unchanged and only the
+        # raw-count case multiplies back.
+        #
+        # This used to divide by the pair count again when `normalize` was set,
+        # which made a declared fraction read 1/n_pairs of its true value: on
+        # CLN025, 3e-4 against state thresholds of 0.3 and 0.7. `recrossings`
+        # was then pinned at 0 for the life of the campaign and the scientist
+        # read a working CV as a trapped walker.
+        values = values * len(cv.pairs)
     return values * spec.scale
 
 
